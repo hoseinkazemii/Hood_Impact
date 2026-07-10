@@ -4,8 +4,7 @@ batch_generate.py
 Production driver for the 600-sample dataset: solve the generated
 HoodImpact_<run>.inp decks with Abaqus/Explicit, extract the headform
 acceleration, SAE1000-filter it, compute HIC15, and keep only the small
-result files. Adapted from the verified batch_verify_60.py, minus the
-reference comparison (there is no reference for the new runs).
+result files. There is no reference comparison for the new runs.
 
 Parallelisation: N concurrent SINGLE-CORE solves (--lanes). On Delta the
 constraint is the FlexNet license pool (65 "abaqus" tokens; one cpus=1 job
@@ -13,7 +12,7 @@ checks out 5 tokens -> 13 lanes max; default 12 leaves headroom for other
 license users) and the CPU-hour budget (single-core solves are the most
 core-hour-efficient way to produce samples).
 
-Robustness (inherited from batch_verify_60):
+Robustness:
     * success detected from artefacts, not exit codes: .sta must contain
       "THE ANALYSIS HAS COMPLETED SUCCESSFULLY" and the extraction must
       produce the raw csv
