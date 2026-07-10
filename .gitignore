@@ -1,0 +1,78 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Local/editor state
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs and job output
+*.log
+*.out
+*.err
+slurm-*.out
+slurm-*.err
+
+# Archives and generated reports
+*.tar.gz
+*.zip
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.svg
+*.pdf
+
+# ML/model artifacts
+*.pkl
+*.pt
+*.pth
+*.ckpt
+wandb/
+
+# Training and EDA outputs
+runs/
+eda_outputs/
+figures/
+mesh_displacement/
+
+# Abaqus transient/generated files
+abaqus_scripts/work/
+*.odb
+*.abq
+*.pac
+*.stt
+*.mdl
+*.res
+*.sel
+*.lck
+*.prt
+*.sim
+*.dat
+*.com
+*.sta
+*.msg
+*.023
+
+# Large/raw hood-impact datasets
+Data/HoodImpact_60_IndustryLike/_parsed_hood_meshes.pkl
+Data/HoodImpact_60_IndustryLike/inp_files/
+Data/HoodImpact_60_IndustryLike/output_field_disp/
+Data/HoodImpact_60_IndustryLike/output_history_acc/
+Data/HoodImpact_600_EuroNCAP/inp_files/
+Data/HoodImpact_600_EuroNCAP/output_history_acc/
+Data/mesh_geometry/
+
+# Generated acceleration-history media/data dumps
+Data/acceleration_history/*.csv
+Data/acceleration_history/*.png
+Data/acceleration_history/*.svg
