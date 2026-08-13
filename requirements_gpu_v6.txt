@@ -1,0 +1,6 @@
+# Install these into an aarch64 DeltaAI environment layered on top of
+# python/miniforge3_pytorch. PyTorch itself is supplied by the system module.
+numpy>=1.26
+pandas>=2.0
+matplotlib>=3.7
+wandb>=0.17

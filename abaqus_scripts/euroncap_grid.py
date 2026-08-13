@@ -1,10 +1,9 @@
 """
 euroncap_grid.py
 ================
-Define the 50 shared headform impact locations for the 600-sample dataset
-(12 designs x 50 locations), following the Euro NCAP pedestrian headform
-GRID method (Euro NCAP Pedestrian/VRU Testing Protocol, TB 024) adapted to a
-standalone hood model:
+Define the shared headform impact grid following the Euro NCAP pedestrian
+headform GRID method (Euro NCAP Pedestrian/VRU Testing Protocol, TB 024),
+adapted to a standalone hood model:
 
   * Euro NCAP marks the bonnet with grid points on 100 mm spacing: rows along
     Wrap Around Distance (WAD) lines 100 mm apart, columns 100 mm apart
@@ -17,10 +16,11 @@ standalone hood model:
     kept >= INSET (100 mm > 82.5 mm radius) inside the outer-panel boundary
     in plan view. This stands in for the protocol's bonnet side/rear
     reference-line bounds, which need the full vehicle to construct.
-  * The full 100 mm grid has more points than the 50-per-design budget, so
-    the 50 are chosen from the grid by FARTHEST-POINT (maximin) sampling,
-    seeded with the 5 original impact locations of the 60-sample dataset so
-    the new points spread away from data we already have. Deterministic.
+  * The full 100 mm grid has 142 valid points on this geometry. The original
+    600-sample dataset used the first 50 points from a deterministic
+    FARTHEST-POINT (maximin) ordering, seeded with the 5 IndustryLike impact
+    locations. The remaining 92 points complete the Euro NCAP grid; the 5
+    IndustryLike seed locations are not included in either Euro NCAP set.
 
 The grid geometry is built on design 0 (run 1); all 12 designs share the same
 hood outline (verified: identical bounding boxes across all 60 decks), and
@@ -29,10 +29,13 @@ sub-mm level.
 
 Run from the Code/ directory (or anywhere -- paths are script-relative):
     python abaqus_scripts/euroncap_grid.py
+Validates the immutable original mapping:
+    Data/HoodImpact_600_EuroNCAP/impact_locations_50.csv
 Outputs:
-    Data/HoodImpact_600_EuroNCAP/impact_locations_50.csv   (the 50 targets)
+    Data/HoodImpact_600_EuroNCAP/impact_locations_all_142.csv
+    Data/HoodImpact_1104_EuroNCAP_Remaining/impact_locations_remaining_92.csv
     Data/HoodImpact_600_EuroNCAP/impact_grid_candidates.csv (full 100mm grid)
-    figures/hood600/impact_grid_50.png                      (overview figure)
+    figures/hood600/impact_grid_50.png                       (overview figure)
 """
 import os
 import csv
@@ -49,13 +52,15 @@ from inp_geom import Deck, OuterSurface, points_inside, dist_to_polyline, polygo
 BASE_DECK = os.path.join(CODE_ROOT, "Data", "HoodImpact_60_IndustryLike",
                          "inp_files", "HoodImpact_1.inp")
 OUT_DIR = os.path.join(CODE_ROOT, "Data", "HoodImpact_600_EuroNCAP")
+REMAINING_OUT_DIR = os.path.join(
+    CODE_ROOT, "Data", "HoodImpact_1104_EuroNCAP_Remaining")
 FIG_DIR = os.path.join(CODE_ROOT, "figures", "hood600")
 
 PITCH = 100.0          # mm, Euro NCAP grid spacing (rows and columns)
 INSET = 100.0          # mm, min plan-view distance of a point to the hood edge
 CENTERLINE_Y = 155.3432  # vehicle centreline (exactly L1/L3's X2; = outline mid-Y)
 FINE_STEP = 2.0        # mm, x-step for the surface arc-length integration
-N_SELECT = 50
+N_INITIAL = 50
 
 # the 5 original locations of the 60-sample dataset (seeds for maximin sampling)
 ORIGINAL_5 = np.array([
@@ -110,20 +115,65 @@ def build_candidates(surface):
 def farthest_point_select(cands_xy, seeds_xy, n_select):
     """Greedy maximin selection of n_select points from cands, seeded with
     seeds (which are 'already chosen' but not part of the returned set)."""
+    if not 0 <= n_select <= len(cands_xy):
+        raise ValueError("n_select must be between 0 and the candidate count")
+
     chosen = []
+    available = np.ones(len(cands_xy), dtype=bool)
     # distance of every candidate to the closest already-chosen point
     dmin = np.min(
         np.linalg.norm(cands_xy[:, None, :] - seeds_xy[None, :, :], axis=2), axis=1)
     for _ in range(n_select):
+        dmin[~available] = -np.inf
         i = int(np.argmax(dmin))
         chosen.append(i)
+        available[i] = False
         d_new = np.linalg.norm(cands_xy - cands_xy[i], axis=1)
         dmin = np.minimum(dmin, d_new)
     return chosen
 
 
+def write_locations(path, locations, start_loc=1, grid_rank_start=1,
+                    include_grid_rank=False):
+    """Write a deterministic location list consumable by the deck generator."""
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        header = ["loc", "X1", "X2", "wadh_mm", "col_k"]
+        if include_grid_rank:
+            header.append("grid_rank")
+        w.writerow(header)
+        for offset, (x, y, wadh, k) in enumerate(locations):
+            row = [start_loc + offset, "%.4f" % x, "%.4f" % y,
+                   "%.1f" % wadh, int(k)]
+            if include_grid_rank:
+                row.append(grid_rank_start + offset)
+            w.writerow(row)
+    print("wrote %s (%d locations)" % (path, len(locations)))
+
+
+def location_key(row):
+    """Identify a Euro NCAP grid cell without relying on rounded X/Y values."""
+    return int(round(float(row[3]))), round(float(row[2]), 6)
+
+
+def load_used_locations(path):
+    with open(path, newline="") as f:
+        rows = list(csv.DictReader(f))
+    expected_locs = list(range(1, len(rows) + 1))
+    got_locs = [int(row["loc"]) for row in rows]
+    if got_locs != expected_locs:
+        raise SystemExit("unexpected loc numbering in %s" % path)
+    keys = [(int(row["col_k"]), round(float(row["wadh_mm"]), 6))
+            for row in rows]
+    if len(set(keys)) != len(rows):
+        raise SystemExit("duplicate semantic grid cells in %s" % path)
+    xy = np.array([(float(row["X1"]), float(row["X2"])) for row in rows])
+    return keys, xy
+
+
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
+    os.makedirs(REMAINING_OUT_DIR, exist_ok=True)
     os.makedirs(FIG_DIR, exist_ok=True)
 
     print("parsing %s ..." % BASE_DECK)
@@ -131,8 +181,26 @@ def main():
     surface = OuterSurface(deck)
 
     cands = build_candidates(surface)
-    order = farthest_point_select(cands[:, :2], ORIGINAL_5, N_SELECT)
-    sel = cands[order]
+    order = farthest_point_select(cands[:, :2], ORIGINAL_5, len(cands))
+    ranked = cands[order]
+    sel = ranked[:N_INITIAL]
+
+    # Exclude the committed 50 by their stable grid identity (column + WAD),
+    # not by rounded floating-point X/Y coordinates.
+    loc_csv = os.path.join(OUT_DIR, "impact_locations_50.csv")
+    used_order, used_xy = load_used_locations(loc_csv)
+    selected_order = [location_key(row) for row in sel]
+    if len(used_order) != N_INITIAL or selected_order != used_order:
+        raise SystemExit(
+            "the committed run-to-location order no longer matches the FPS ranks")
+    if not np.allclose(sel[:, :2], used_xy, rtol=0.0, atol=5e-5):
+        raise SystemExit(
+            "the regenerated X/Y values no longer match the committed 50")
+    used_keys = set(used_order)
+    remaining = np.array(
+        [row for row in ranked if location_key(row) not in used_keys], float)
+    if len(remaining) != len(cands) - len(used_keys):
+        raise SystemExit("failed to construct the exact candidate complement")
 
     # selection quality: min pairwise distance among the 50 (+ 5 originals)
     all_pts = np.vstack([sel[:, :2], ORIGINAL_5])
@@ -142,13 +210,17 @@ def main():
           "(incl. the 5 originals)" % (len(sel), dm.min()))
 
     # -- write CSVs ----------------------------------------------------------
-    loc_csv = os.path.join(OUT_DIR, "impact_locations_50.csv")
-    with open(loc_csv, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["loc", "X1", "X2", "wadh_mm", "col_k"])
-        for i, (x, y, wadh, k) in enumerate(sel, start=1):
-            w.writerow([i, "%.4f" % x, "%.4f" % y, "%.1f" % wadh, int(k)])
-    print("wrote %s" % loc_csv)
+    print("validated immutable %s (unchanged)" % loc_csv)
+
+    all_csv = os.path.join(
+        OUT_DIR, "impact_locations_all_%d.csv" % len(ranked))
+    write_locations(all_csv, ranked)
+
+    remaining_csv = os.path.join(
+        REMAINING_OUT_DIR,
+        "impact_locations_remaining_%d.csv" % len(remaining))
+    write_locations(remaining_csv, remaining, grid_rank_start=N_INITIAL + 1,
+                    include_grid_rank=True)
 
     cand_csv = os.path.join(OUT_DIR, "impact_grid_candidates.csv")
     with open(cand_csv, "w", newline="") as f:

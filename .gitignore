@@ -70,6 +70,8 @@ Data/HoodImpact_60_IndustryLike/output_field_disp/
 Data/HoodImpact_60_IndustryLike/output_history_acc/
 Data/HoodImpact_600_EuroNCAP/inp_files/
 Data/HoodImpact_600_EuroNCAP/output_history_acc/
+Data/HoodImpact_1104_EuroNCAP_Remaining/inp_files/
+Data/HoodImpact_1104_EuroNCAP_Remaining/output_history_acc/
 Data/mesh_geometry/
 
 # Generated acceleration-history media/data dumps
