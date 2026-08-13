@@ -192,6 +192,24 @@ class SplitAndNormalizationTests(unittest.TestCase):
             )
 
 class ModelTests(unittest.TestCase):
+    def test_wandb_metric_flattening_preserves_namespaces(self):
+        flattened = v6.flatten_numeric_metrics(
+            {
+                "combined": {
+                    "hic_direct": {"n": 55, "r2": np.float64(0.95)},
+                    "label": "ignored",
+                }
+            },
+            "evaluation/validation",
+        )
+        self.assertEqual(
+            flattened,
+            {
+                "evaluation/validation/combined/hic_direct/n": 55.0,
+                "evaluation/validation/combined/hic_direct/r2": 0.95,
+            },
+        )
+
     def test_forward_backward_and_checkpoint_parity(self):
         torch.manual_seed(8)
         model = v6.MultiScaleHoodImpactNet()

@@ -76,9 +76,10 @@ additional runs.
 
 ## DeltaAI environment and submission
 
-DeltaAI is aarch64. Do not reuse a Delta x86 environment. Load the system
-PyTorch stack and activate a DeltaAI-native environment before `sbatch`; the
-batch job deliberately inherits that environment:
+DeltaAI is aarch64. Do not reuse a Delta x86 environment. Create a
+DeltaAI-native overlay once. The launcher now loads the system PyTorch module
+inside the allocation and then reactivates the environment inherited by
+`sbatch` (or the path supplied through `HOOD_V6_VENV`):
 
 ```bash
 module reset
@@ -87,16 +88,29 @@ conda activate base
 
 # The shared environment is read-only. Create this once, or activate your
 # existing DeltaAI-native environment. Replace <account> with your allocation.
-python -m venv --system-site-packages /work/nvme/<account>/$USER/hood-v6
+python3 -m venv --system-site-packages /work/nvme/<account>/$USER/hood-v6
 source /work/nvme/<account>/$USER/hood-v6/bin/activate
-python -m pip install -r requirements_gpu_v6.txt
+python3 -m pip install -r requirements_gpu_v6.txt
 
 sbatch run_gpu_multiscale_hic_v6.sbatch
 ```
 
+If the environment is not active when submitting, pass its path explicitly:
+
+```bash
+HOOD_V6_VENV=/work/nvme/<account>/$USER/hood-v6 \
+sbatch run_gpu_multiscale_hic_v6.sbatch
+```
+
+If that overlay was built against a pinned system-module version, also submit
+with the same version, for example
+`HOOD_V6_PYTORCH_MODULE=python/miniforge3_pytorch/2.11.0`.
+
 The launcher requests one GH200 allocation from `ghx4`, 16 CPU cores, and 64 GB
 host memory. It fails before training if CUDA, data, geometry, or a model
-forward/backward check is invalid. Defaults can be overridden without editing:
+forward/backward check is invalid. It also prints the resolved `python3` path
+before the import check, preventing a missing-Python failure from being
+mistaken for a completed run. Defaults can be overridden without editing:
 
 ```bash
 HOOD_V6_EPOCHS=250 HOOD_V6_BATCH_SIZE=24 \
@@ -121,6 +135,48 @@ The main reported quantities are:
 - pointwise acceleration metrics;
 - separate IndustryLike-5 and EuroNCAP-50 scores; and
 - a training-only location-mean baseline.
+
+## Weights & Biases and monitoring
+
+The supplied launcher enables the `hood-impact` W&B project. It records
+per-epoch training/validation scalars, the training-curve image, validation and
+both reference-test HIC scatter plots, prediction tables, final summary
+metrics, and a versioned result artifact containing checkpoints, normalizers,
+reports, tables, and plots. Local copies remain authoritative in the unique run
+directory even if W&B logging is interrupted.
+
+The default is offline logging so cluster connectivity cannot stop training.
+Use either mode at submission time:
+
+```bash
+# Live dashboard (run `wandb login` once in the V6 environment first)
+WANDB_MODE=online sbatch run_gpu_multiscale_hic_v6.sbatch
+
+# Default offline mode; upload after the job
+WANDB_MODE=offline sbatch run_gpu_multiscale_hic_v6.sbatch
+wandb sync runs/<run_directory>/wandb/offline-run-*
+```
+
+Capture the submitted job ID and follow both streams while it runs:
+
+```bash
+JOBID=$(sbatch --parsable run_gpu_multiscale_hic_v6.sbatch)
+echo "$JOBID"
+tail -F "hood_gpu_v6_${JOBID}.out"
+# In another terminal:
+tail -F "hood_gpu_v6_${JOBID}.err"
+```
+
+Check scheduler state/resources during or after the job with:
+
+```bash
+squeue -j "$JOBID" -o "%.18i %.2t %.10M %.20R"
+sstat -j "${JOBID}.batch" --format=JobID,AveCPU,MaxRSS,AveRSS
+sacct -j "$JOBID" --format=JobID,JobName%25,State,ExitCode,Elapsed,Start,End,MaxRSS
+```
+
+`COMPLETED` with exit code `0:0` is success. Exit code `127:0` means the batch
+shell could not find a command; inspect the `.err` file for the exact line.
 
 ## Local checks
 

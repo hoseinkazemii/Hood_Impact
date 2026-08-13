@@ -1561,6 +1561,147 @@ def initialize_wandb(args: argparse.Namespace, output_dir: Path, config: Mapping
     )
 
 
+def flatten_numeric_metrics(
+    payload: Mapping, prefix: str = ""
+) -> Dict[str, float]:
+    """Flatten nested metric dictionaries into W&B-friendly scalar keys."""
+
+    flattened: Dict[str, float] = {}
+    for key, value in payload.items():
+        name = f"{prefix}/{key}" if prefix else str(key)
+        if isinstance(value, Mapping):
+            flattened.update(flatten_numeric_metrics(value, name))
+        elif isinstance(value, (int, float, np.integer, np.floating)):
+            flattened[name] = float(value)
+    return flattened
+
+
+def safe_wandb_log(
+    wandb_run,
+    payload: Mapping,
+    logger: logging.Logger,
+    step: Optional[int] = None,
+) -> None:
+    """Keep a transient tracking failure from killing an expensive GPU run."""
+
+    if wandb_run is None:
+        return
+    try:
+        wandb_run.log(dict(payload), step=step)
+    except Exception as error:  # W&B is observability, not the training result.
+        logger.warning("W&B logging failed; continuing training: %s", error)
+
+
+def safe_wandb_summary_update(
+    wandb_run,
+    payload: Mapping[str, float],
+    logger: logging.Logger,
+) -> None:
+    if wandb_run is None:
+        return
+    try:
+        for key, value in payload.items():
+            wandb_run.summary[key] = value
+    except Exception as error:
+        logger.warning("W&B summary update failed; continuing: %s", error)
+
+
+def log_training_diagnostics_to_wandb(
+    wandb_run,
+    output_dir: Path,
+    history: pd.DataFrame,
+    logger: logging.Logger,
+) -> None:
+    if wandb_run is None:
+        return
+    try:
+        import wandb
+
+        safe_wandb_log(
+            wandb_run,
+            {
+                "diagnostics/training_curves": wandb.Image(
+                    str(output_dir / "training_history.png")
+                ),
+                "diagnostics/training_history": wandb.Table(dataframe=history),
+            },
+            logger,
+        )
+    except Exception as error:
+        logger.warning("W&B training-diagnostic upload failed; continuing: %s", error)
+
+
+def log_evaluation_to_wandb(
+    wandb_run,
+    output_dir: Path,
+    split_name: str,
+    metric_sets: Mapping,
+    logger: logging.Logger,
+) -> None:
+    """Upload scalar metrics, the HIC plot, and the prediction table."""
+
+    if wandb_run is None:
+        return
+    try:
+        import wandb
+
+        prefix = f"evaluation/{split_name}"
+        metrics = flatten_numeric_metrics(metric_sets, prefix)
+        plot_path = output_dir / f"{split_name}_hic_predictions.png"
+        predictions_path = output_dir / f"{split_name}_predictions.csv"
+        payload: Dict[str, object] = dict(metrics)
+        if plot_path.is_file():
+            payload[f"{prefix}/hic_plot"] = wandb.Image(str(plot_path))
+        if predictions_path.is_file():
+            payload[f"{prefix}/predictions"] = wandb.Table(
+                dataframe=pd.read_csv(predictions_path)
+            )
+        safe_wandb_log(wandb_run, payload, logger)
+        safe_wandb_summary_update(wandb_run, metrics, logger)
+    except Exception as error:
+        logger.warning("W&B %s upload failed; continuing: %s", split_name, error)
+
+
+def log_results_artifact_to_wandb(
+    wandb_run,
+    output_dir: Path,
+    logger: logging.Logger,
+) -> None:
+    """Version checkpoints, normalizers, reports, tables, and plots together."""
+
+    if wandb_run is None:
+        return
+    try:
+        import wandb
+
+        artifact = wandb.Artifact(
+            name="gpu-multiscale-hic-v6-results",
+            type="model",
+            metadata={
+                "model_version": MODEL_VERSION,
+                "run_directory": output_dir.name,
+            },
+        )
+        patterns = (
+            "*.json",
+            "*.csv",
+            "*.png",
+            "*.pt",
+            "*.npz",
+            "model_architecture.txt",
+            "train.log",
+        )
+        files = sorted(
+            {path for pattern in patterns for path in output_dir.glob(pattern)}
+        )
+        for path in files:
+            artifact.add_file(str(path), name=path.name)
+        wandb_run.log_artifact(artifact, aliases=["latest"])
+        logger.info("Queued %d result files as a W&B model artifact", len(files))
+    except Exception as error:
+        logger.warning("W&B artifact upload failed; local outputs are intact: %s", error)
+
+
 def run(args: argparse.Namespace) -> Path:
     validate_training_args(args)
     seed_everything(args.seed)
@@ -1752,8 +1893,12 @@ def run(args: argparse.Namespace) -> Path:
                 validation_metrics["acceleration"]["r2"],
                 elapsed,
             )
-            if wandb_run is not None:
-                wandb_run.log(history_row, step=epoch)
+            safe_wandb_log(
+                wandb_run,
+                {f"selection/{key}": value for key, value in history_row.items()},
+                logger,
+                step=epoch,
+            )
 
             if validation_rmse < best_rmse - 1e-6:
                 best_rmse = validation_rmse
@@ -1790,6 +1935,7 @@ def run(args: argparse.Namespace) -> Path:
         logger.info("Restored epoch %d selected by validation HIC RMSE %.2f", best_epoch, best_rmse)
         history = pd.DataFrame(history_rows)
         save_training_plot(output_dir / "training_history.png", history)
+        log_training_diagnostics_to_wandb(wandb_run, output_dir, history, logger)
 
         validation_prediction = predict_loader(
             model, validation_loader, data, normalizer, device, amp_enabled
@@ -1831,6 +1977,13 @@ def run(args: argparse.Namespace) -> Path:
             validation_prediction["hic_direct"],
             validation_wave_hic,
             f"Validation design {args.validation_design}",
+        )
+        log_evaluation_to_wandb(
+            wandb_run,
+            output_dir,
+            "validation",
+            validation_metric_sets,
+            logger,
         )
         logger.info(
             "VALIDATION | direct HIC R2 %.4f RMSE %.2f | waveform HIC R2 %.4f",
@@ -1941,6 +2094,20 @@ def run(args: argparse.Namespace) -> Path:
                 selection_test_wave_hic,
                 selection_test_baseline,
             )
+            save_prediction_plot(
+                output_dir / "test_selection_hic_predictions.png",
+                data.hic15[test_indices],
+                selection_test_prediction["hic_direct"],
+                selection_test_wave_hic,
+                f"Pre-refit historical reference design {args.test_design}",
+            )
+            log_evaluation_to_wandb(
+                wandb_run,
+                output_dir,
+                "test_selection",
+                selection_test_metric_sets,
+                logger,
+            )
 
             test_loader = make_loader(
                 data,
@@ -1993,6 +2160,13 @@ def run(args: argparse.Namespace) -> Path:
                 test_wave_hic,
                 f"Historical reference design {args.test_design}",
             )
+            log_evaluation_to_wandb(
+                wandb_run,
+                output_dir,
+                "test",
+                test_metric_sets,
+                logger,
+            )
             logger.info(
                 "REFERENCE TEST | direct HIC R2 %.4f RMSE %.2f MAE %.2f | "
                 "waveform HIC R2 %.4f | acceleration R2 %.4f",
@@ -2015,11 +2189,28 @@ def run(args: argparse.Namespace) -> Path:
                 "Peak allocated GPU memory: %.2f GiB",
                 torch.cuda.max_memory_allocated(device) / 1024**3,
             )
+        safe_wandb_summary_update(
+            wandb_run,
+            {
+                "selection/best_epoch": float(best_epoch),
+                "selection/best_validation_hic_rmse": best_rmse,
+                "runtime/peak_gpu_memory_gib": (
+                    torch.cuda.max_memory_allocated(device) / 1024**3
+                    if device.type == "cuda"
+                    else 0.0
+                ),
+            },
+            logger,
+        )
+        log_results_artifact_to_wandb(wandb_run, output_dir, logger)
         logger.info("Finished. Outputs: %s", output_dir)
         return output_dir
     finally:
         if wandb_run is not None:
-            wandb_run.finish()
+            try:
+                wandb_run.finish()
+            except Exception as error:
+                logger.warning("W&B finish failed; local outputs are intact: %s", error)
         close_logger(logger)
 
 
