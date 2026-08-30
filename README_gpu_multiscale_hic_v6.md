@@ -1,6 +1,6 @@
 # GPU multi-scale HIC model (V6)
 
-V6 is a new PyTorch experiment for the combined 660-sample dataset. It is
+V6 is a PyTorch experiment for the merged 1,704-sample EuroNCAP dataset. It is
 additive: it does not import or modify `temporal_deeponet.py`, `utils/utils.py`,
 their launchers, or previous checkpoints.
 
@@ -16,8 +16,8 @@ used acceleration MSE rather than the requested HIC metric.
 V6 instead uses a conventional, compact GPU convolutional model:
 
 1. It removes the rigid headform through the Abaqus rigid-body element set and
-   verifies that the two source corpora contain identical static geometry for
-   each design.
+   verifies that locations 1 and 51 in the merged corpus contain identical
+   static hood geometry for each design.
 2. It parses one hood per design and creates three impact-centered 48x48 maps
    covering local (±175 mm), regional (±400 mm), and whole-hood (±1,800 mm)
    structure. Each map retains occupancy, node density, minimum/maximum/mean
@@ -43,19 +43,19 @@ checkpoint is selected by validation HIC RMSE—not acceleration loss.
 
 ## Dataset and split
 
-The default experiment uses all 660 simulations:
+The default experiment uses exactly the merged EuroNCAP corpus:
 
-- `HoodImpact_60_IndustryLike`: 12 designs × 5 locations
-- `HoodImpact_600_EuroNCAP`: 12 designs × 50 locations
+- `HoodImpact_1704_EuroNCAP`: 12 designs × 142 locations = 1,704 simulations
 
-Both complete directories must exist directly under `Data/`; transferring only
-the 600-sample directory used by V5 is insufficient. V6 needs each directory's
-`inp_files`, `output_history_acc`, and tracked coordinate/manifest CSV files.
+The non-EuroNCAP `HoodImpact_60_IndustryLike` samples are intentionally
+excluded. The complete merged directory must exist directly under `Data/`,
+including `inp_files`, `output_history_acc`, and `manifest_1704.csv`.
 
 It uses designs 0–9 for training, design 10 for validation, and design 11 as the
 historical reference test. Samples are never randomly split. Normalization is
-fitted only on training designs. Every export carries explicit design, source,
-source-run, and location metadata, avoiding the old combined-run ID bug.
+fitted only on training designs. This gives 1,420 training samples, 142
+validation samples, and 142 reference-test samples. Every export carries the
+canonical run/design/location plus the original 600/1,104 source provenance.
 
 After validation chooses the epoch, V6 fits a fresh model and fresh normalizer
 on designs 0–10 for exactly that many epochs. The original selection checkpoint
@@ -65,14 +65,12 @@ post-refit design-11 results are reported so the effect of adding design 10 is
 visible.
 
 The residual target is specifically for same-grid, unseen-design prediction:
-inference requires a known source and location from these 55 shared impact
-locations. It must not be described as an arbitrary/off-grid HIC predictor.
+inference requires one of the 142 shared EuroNCAP impact locations. It must not
+be described as an arbitrary/off-grid HIC predictor.
 
 Design 11 has been examined in previous experiments and is unusually close to
-design 10, so it is not a statistically untouched test. The separate
-IndustryLike-5 and EuroNCAP-50 metrics should be read alongside the pooled
-score. For publication-level uncertainty, rotate the held-out design in
-additional runs.
+design 10, so it is not a statistically untouched test. For publication-level
+uncertainty, rotate the held-out design in additional runs.
 
 ## DeltaAI environment and submission
 
@@ -92,8 +90,14 @@ python3 -m venv --system-site-packages /work/nvme/<account>/$USER/hood-v6
 source /work/nvme/<account>/$USER/hood-v6/bin/activate
 python3 -m pip install -r requirements_gpu_v6.txt
 
-sbatch run_gpu_multiscale_hic_v6.sbatch
+bash submit_gpu_multiscale_hic_v6.sh
 ```
+
+The submission wrapper checks that the manifest, all 1,704 input decks, and all
+1,704 acceleration histories are present before calling `sbatch`. The raw decks
+and histories are intentionally ignored by Git and must be synced to DeltaAI
+separately. To submit the Slurm file directly, run
+`sbatch run_gpu_multiscale_hic_v6.sbatch` from the repository root.
 
 If the environment is not active when submitting, pass its path explicitly:
 
@@ -106,16 +110,21 @@ If that overlay was built against a pinned system-module version, also submit
 with the same version, for example
 `HOOD_V6_PYTORCH_MODULE=python/miniforge3_pytorch/2.11.0`.
 
-The launcher requests one GH200 allocation from `ghx4`, 16 CPU cores, and 64 GB
-host memory. It fails before training if CUDA, data, geometry, or a model
-forward/backward check is invalid. It also prints the resolved `python3` path
-before the import check, preventing a missing-Python failure from being
-mistaken for a completed run. Defaults can be overridden without editing:
+The launcher requests one GH200 allocation from `ghx4`, 16 CPU cores, 64 GB
+host memory, and 12 hours for the larger corpus. It fails before training if
+CUDA, data, geometry, or a model forward/backward check is invalid. It also
+prints the resolved `python3` path before the import check, preventing a
+missing-Python failure from being mistaken for a completed run. Defaults can
+be overridden without editing:
 
 ```bash
 HOOD_V6_EPOCHS=250 HOOD_V6_BATCH_SIZE=24 \
-sbatch run_gpu_multiscale_hic_v6.sbatch
+bash submit_gpu_multiscale_hic_v6.sh
 ```
+
+If the merged `Data` directory lives elsewhere on DeltaAI, set
+`HOOD_V6_DATA_ROOT=/absolute/path/to/Data`. The prepared-data cache can likewise
+be relocated with `HOOD_V6_CACHE_DIR=/path/to/cache`.
 
 ## Outputs
 
@@ -133,7 +142,7 @@ The main reported quantities are:
 - direct-head canonical HIC15 R2/RMSE/MAE;
 - HIC15 recomputed from the predicted 1,000-point history;
 - pointwise acceleration metrics;
-- separate IndustryLike-5 and EuroNCAP-50 scores; and
+- EuroNCAP-142 and pooled scores (identical for this single-source corpus); and
 - a training-only location-mean baseline.
 
 ## Weights & Biases and monitoring
@@ -162,9 +171,9 @@ Capture the submitted job ID and follow both streams while it runs:
 ```bash
 JOBID=$(sbatch --parsable run_gpu_multiscale_hic_v6.sbatch)
 echo "$JOBID"
-tail -F "hood_gpu_v6_${JOBID}.out"
+tail -F "hood_gpu_v6_1704_${JOBID}.out"
 # In another terminal:
-tail -F "hood_gpu_v6_${JOBID}.err"
+tail -F "hood_gpu_v6_1704_${JOBID}.err"
 ```
 
 Check scheduler state/resources during or after the job with:

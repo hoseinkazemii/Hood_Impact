@@ -120,21 +120,91 @@ class GeometryTests(unittest.TestCase):
             np.testing.assert_array_equal(v6.connector_node_ids(deck), [1, 2, 3])
 
 
+class MetadataTests(unittest.TestCase):
+    @staticmethod
+    def write_manifest(root: Path) -> Path:
+        folder = root / v6.EURONCAP_DATASET
+        folder.mkdir(parents=True)
+        rows = []
+        for run in range(1, v6.EXPECTED_SAMPLES + 1):
+            design = (run - 1) // v6.EURONCAP_LOCATIONS
+            location = (run - 1) % v6.EURONCAP_LOCATIONS + 1
+            if location <= v6.ORIGINAL_EURONCAP_LOCATIONS:
+                origin_dataset = "HoodImpact_600_EuroNCAP"
+                origin_location = location
+                origin_run = design * v6.ORIGINAL_EURONCAP_LOCATIONS + location
+                subset = "selected_50"
+            else:
+                origin_dataset = "HoodImpact_1104_EuroNCAP_Remaining"
+                origin_location = location - v6.ORIGINAL_EURONCAP_LOCATIONS
+                origin_run = design * 92 + origin_location
+                subset = "remaining_92"
+            rows.append(
+                {
+                    "run": run,
+                    "design": design,
+                    "loc": location,
+                    "X1": float(location),
+                    "X2": float(-location),
+                    "X3": float(500 + design),
+                    "source_dataset": origin_dataset,
+                    "source_run": origin_run,
+                    "source_loc": origin_location,
+                    "source_subset": subset,
+                }
+            )
+        path = folder / v6.EURONCAP_MANIFEST
+        pd.DataFrame(rows).to_csv(path, index=False)
+        return path
+
+    def test_merged_manifest_boundaries_and_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_manifest(root)
+            metadata = v6.build_metadata(root)
+            self.assertEqual(len(metadata), 1704)
+            for run, design, location in (
+                (1, 0, 1),
+                (142, 0, 142),
+                (143, 1, 1),
+                (1704, 11, 142),
+            ):
+                row = metadata.iloc[run - 1]
+                self.assertEqual((row.global_run, row.design, row.location),
+                                 (run, design, location))
+                self.assertEqual(row.source, v6.EURONCAP_SOURCE)
+            self.assertEqual(metadata.iloc[49].origin_subset, "selected_50")
+            self.assertEqual(metadata.iloc[50].origin_subset, "remaining_92")
+
+    def test_merged_manifest_rejects_wrong_design_location_formula(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = self.write_manifest(root)
+            frame = pd.read_csv(path)
+            frame.loc[142, "loc"] = 2
+            frame.to_csv(path, index=False)
+            with self.assertRaisesRegex(ValueError, "run = 142"):
+                v6.build_metadata(root)
+
+
 class SplitAndNormalizationTests(unittest.TestCase):
     @staticmethod
     def metadata():
         return pd.DataFrame(
             [
-                {"design": design, "source": source, "location": location}
+                {
+                    "design": design,
+                    "source": v6.EURONCAP_SOURCE,
+                    "location": location,
+                }
                 for design in range(12)
-                for source, count in (("industry5", 5), ("euroncap50", 50))
-                for location in range(1, count + 1)
+                for location in range(1, v6.EURONCAP_LOCATIONS + 1)
             ]
         )
 
     def test_design_split_is_exact_and_rejects_aliases(self):
         train, validation, test = v6.split_indices(self.metadata(), 10, 11)
-        self.assertEqual((len(train), len(validation), len(test)), (550, 55, 55))
+        self.assertEqual((len(train), len(validation), len(test)), (1420, 142, 142))
         self.assertFalse(set(train) & set(validation))
         self.assertFalse(set(train) & set(test))
         for validation_design, test_design in ((-1, 11), (10, -1), (12, 11), (10, 12), (5, 5)):
@@ -146,10 +216,13 @@ class SplitAndNormalizationTests(unittest.TestCase):
         rng = np.random.default_rng(4)
         metadata = pd.DataFrame(
             [
-                {"design": design, "source": source, "location": location}
+                {
+                    "design": design,
+                    "source": v6.EURONCAP_SOURCE,
+                    "location": location,
+                }
                 for design in range(3)
-                for source, count in (("industry5", 5), ("euroncap50", 50))
-                for location in range(1, count + 1)
+                for location in range(1, v6.EURONCAP_LOCATIONS + 1)
             ]
         )
         samples = len(metadata)
@@ -159,11 +232,7 @@ class SplitAndNormalizationTests(unittest.TestCase):
         scalars = rng.normal(size=(samples, len(v6.SCALAR_FEATURES))).astype(np.float32)
         times = np.tile(np.linspace(0.0, 0.025, 10), (samples, 1)).astype(np.float32)
         acceleration = np.full((samples, 10), 10.0, dtype=np.float32)
-        base = np.where(
-            metadata["source"].to_numpy() == "industry5",
-            100.0 + metadata["location"].to_numpy(),
-            1000.0 + 2.0 * metadata["location"].to_numpy(),
-        )
+        base = 1000.0 + 2.0 * metadata["location"].to_numpy()
         hic = (base + 10.0 * metadata["design"].to_numpy()).astype(np.float32)
         hic[metadata["design"].to_numpy() == 2] += 1.0e9
         data = v6.PreparedData(metadata, maps, scalars, times, acceleration, hic, "test")
@@ -182,13 +251,13 @@ class SplitAndNormalizationTests(unittest.TestCase):
             metadata.iloc[shuffled],
         )
         np.testing.assert_allclose(round_trip, hic[shuffled], atol=1e-5)
-        self.assertLess(float(normalizer.euroncap_hic_mean.max()), 1200.0)
+        self.assertLess(float(normalizer.euroncap_hic_mean.max()), 1300.0)
 
         with self.assertRaisesRegex(ValueError, "unknown HIC-baseline source"):
             normalizer.hic_baseline(pd.DataFrame([{"source": "bad", "location": 1}]))
-        with self.assertRaisesRegex(ValueError, "location 51 is invalid"):
+        with self.assertRaisesRegex(ValueError, "location 143 is invalid"):
             normalizer.hic_baseline(
-                pd.DataFrame([{"source": "euroncap50", "location": 51}])
+                pd.DataFrame([{"source": v6.EURONCAP_SOURCE, "location": 143}])
             )
 
 class ModelTests(unittest.TestCase):
@@ -196,7 +265,7 @@ class ModelTests(unittest.TestCase):
         flattened = v6.flatten_numeric_metrics(
             {
                 "combined": {
-                    "hic_direct": {"n": 55, "r2": np.float64(0.95)},
+                    "hic_direct": {"n": 142, "r2": np.float64(0.95)},
                     "label": "ignored",
                 }
             },
@@ -205,7 +274,7 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(
             flattened,
             {
-                "evaluation/validation/combined/hic_direct/n": 55.0,
+                "evaluation/validation/combined/hic_direct/n": 142.0,
                 "evaluation/validation/combined/hic_direct/r2": 0.95,
             },
         )
@@ -238,8 +307,7 @@ class ModelTests(unittest.TestCase):
 
     def test_parameter_budget_and_schedule(self):
         parameters = v6.model_parameter_count(v6.MultiScaleHoodImpactNet())
-        self.assertGreater(parameters, 1_000_000)
-        self.assertLess(parameters, 2_500_000)
+        self.assertEqual(parameters, 1_900_514)
         self.assertTrue(math.isclose(v6.scheduler_multiplier(0, 10, 200), 0.1))
         self.assertLess(v6.scheduler_multiplier(199, 10, 200), 0.02)
 

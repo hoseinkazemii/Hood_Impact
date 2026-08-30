@@ -1,4 +1,4 @@
-"""GPU multi-scale geometry CNN for the 660-sample hood-impact corpus.
+"""GPU multi-scale geometry CNN for the 1,704-sample EuroNCAP corpus.
 
 This experiment is intentionally self-contained and does not import the legacy
 ``temporal_deeponet.py`` or ``utils/utils.py`` training paths.  It predicts
@@ -35,13 +35,16 @@ from torch.utils.data import DataLoader, Dataset
 from abaqus_scripts.inp_geom import Deck, HOOD_OUTER_ELSET
 
 
-MODEL_VERSION = "gpu-multiscale-hic-v6.0"
-PREPROCESS_VERSION = "impact-raster-v5-inner-connectors"
+MODEL_VERSION = "gpu-multiscale-hic-v6.1-euroncap1704"
+PREPROCESS_VERSION = "impact-raster-v6-euroncap142"
 EXPECTED_DESIGNS = 12
-INDUSTRY_LOCATIONS = 5
-EURONCAP_LOCATIONS = 50
-EXPECTED_SAMPLES = EXPECTED_DESIGNS * (INDUSTRY_LOCATIONS + EURONCAP_LOCATIONS)
+EURONCAP_LOCATIONS = 142
+ORIGINAL_EURONCAP_LOCATIONS = 50
+EXPECTED_SAMPLES = EXPECTED_DESIGNS * EURONCAP_LOCATIONS
 EXPECTED_TIME_POINTS = 1000
+EURONCAP_DATASET = "HoodImpact_1704_EuroNCAP"
+EURONCAP_MANIFEST = "manifest_1704.csv"
+EURONCAP_SOURCE = "euroncap142"
 HEADFORM_RADIUS_MM = 82.5
 HOOD_INNER_ELSET = "Hood_Inner-1-2"
 GRID_SIZE = 48
@@ -275,59 +278,60 @@ def atomic_torch_save(payload: Mapping, path: Path) -> None:
 
 
 def history_path(root: Path, source: str, source_run: int) -> Path:
-    folder = (
-        root / "HoodImpact_60_IndustryLike" / "output_history_acc"
-        if source == "industry5"
-        else root / "HoodImpact_600_EuroNCAP" / "output_history_acc"
-    )
+    if source != EURONCAP_SOURCE:
+        raise ValueError(f"unknown history source: {source!r}")
+    folder = root / EURONCAP_DATASET / "output_history_acc"
     return folder / f"HoodImpact_{source_run}_SAE1000_interp1000.csv"
 
 
 def build_metadata(data_root: Path) -> pd.DataFrame:
-    industry_coords_path = data_root / "HoodImpact_60_IndustryLike" / "ImpactCoords_60.csv"
-    manifest_path = data_root / "HoodImpact_600_EuroNCAP" / "manifest_600.csv"
-    industry = pd.read_csv(industry_coords_path)
-    industry.columns = [column.strip() for column in industry.columns]
-    if len(industry) != EXPECTED_DESIGNS * INDUSTRY_LOCATIONS:
-        raise ValueError(f"expected 60 IndustryLike coordinates, found {len(industry)}")
-    for column in ("X1", "X2", "X3"):
-        industry[column] = pd.to_numeric(industry[column], errors="coerce")
-    if not np.isfinite(industry[["X1", "X2", "X3"]].to_numpy(np.float64)).all():
-        raise ValueError("IndustryLike coordinates contain non-finite values")
-    industry["source"] = "industry5"
-    industry["source_run"] = np.arange(1, len(industry) + 1)
-    industry["global_run"] = industry["source_run"]
-    industry["design"] = (industry["source_run"] - 1) // INDUSTRY_LOCATIONS
-    industry["location"] = (industry["source_run"] - 1) % INDUSTRY_LOCATIONS + 1
-
+    manifest_path = data_root / EURONCAP_DATASET / EURONCAP_MANIFEST
     euro = pd.read_csv(manifest_path)
     euro.columns = [column.strip() for column in euro.columns]
-    required = {"run", "design", "loc", "X1", "X2", "X3"}
+    required = {
+        "run", "design", "loc", "X1", "X2", "X3", "source_dataset",
+        "source_run", "source_loc", "source_subset",
+    }
     missing = required.difference(euro.columns)
     if missing:
-        raise ValueError(f"manifest_600.csv is missing columns {sorted(missing)}")
-    numeric = euro[list(required)].apply(pd.to_numeric, errors="coerce")
+        raise ValueError(f"{EURONCAP_MANIFEST} is missing columns {sorted(missing)}")
+    numeric_fields = ["run", "design", "loc", "X1", "X2", "X3"]
+    numeric = euro[numeric_fields].apply(pd.to_numeric, errors="coerce")
     if not np.isfinite(numeric.to_numpy(np.float64)).all():
-        raise ValueError("manifest_600.csv contains non-finite required values")
-    euro[list(required)] = numeric
+        raise ValueError(f"{EURONCAP_MANIFEST} contains non-finite required values")
+    euro[numeric_fields] = numeric
     euro = euro.sort_values("run").reset_index(drop=True)
-    if len(euro) != EXPECTED_DESIGNS * EURONCAP_LOCATIONS:
-        raise ValueError(f"expected 600 EuroNCAP rows, found {len(euro)}")
+    if len(euro) != EXPECTED_SAMPLES:
+        raise ValueError(f"expected {EXPECTED_SAMPLES} EuroNCAP rows, found {len(euro)}")
     if not np.array_equal(euro["run"].to_numpy(), np.arange(1, len(euro) + 1)):
-        raise ValueError("EuroNCAP manifest run IDs must be exactly 1..600")
+        raise ValueError(f"EuroNCAP manifest run IDs must be exactly 1..{EXPECTED_SAMPLES}")
+    expected_design = (euro["run"].astype(int).to_numpy() - 1) // EURONCAP_LOCATIONS
+    expected_location = (euro["run"].astype(int).to_numpy() - 1) % EURONCAP_LOCATIONS + 1
+    if not np.array_equal(euro["design"].astype(int).to_numpy(), expected_design) \
+            or not np.array_equal(euro["loc"].astype(int).to_numpy(), expected_location):
+        raise ValueError("EuroNCAP manifest must satisfy run = 142 * design + loc")
     for design, group in euro.groupby("design"):
         if int(design) not in range(EXPECTED_DESIGNS) or not np.array_equal(
-            np.sort(group["loc"].astype(int).to_numpy()), np.arange(1, 51)
+            np.sort(group["loc"].astype(int).to_numpy()),
+            np.arange(1, EURONCAP_LOCATIONS + 1),
         ):
             raise ValueError(f"invalid EuroNCAP location mapping for design {design}")
-    euro = euro.rename(columns={"run": "source_run", "loc": "location"})
-    euro["source"] = "euroncap50"
-    euro["global_run"] = euro["source_run"].astype(int) + 60
-    euro["design"] = euro["design"].astype(int)
-    euro["location"] = euro["location"].astype(int)
-
-    columns = ["global_run", "source", "source_run", "design", "location", "X1", "X2", "X3"]
-    metadata = pd.concat([industry[columns], euro[columns]], ignore_index=True)
+    metadata = pd.DataFrame(
+        {
+            "global_run": euro["run"].astype(int),
+            "source": EURONCAP_SOURCE,
+            "source_run": euro["run"].astype(int),
+            "design": euro["design"].astype(int),
+            "location": euro["loc"].astype(int),
+            "X1": euro["X1"].astype(float),
+            "X2": euro["X2"].astype(float),
+            "X3": euro["X3"].astype(float),
+            "origin_dataset": euro["source_dataset"].astype(str),
+            "origin_run": pd.to_numeric(euro["source_run"], errors="raise").astype(int),
+            "origin_location": pd.to_numeric(euro["source_loc"], errors="raise").astype(int),
+            "origin_subset": euro["source_subset"].astype(str),
+        }
+    )
     metadata.insert(0, "sample_index", np.arange(len(metadata), dtype=np.int64))
     metadata["sample_key"] = metadata["source"] + ":" + metadata["source_run"].astype(str)
     if len(metadata) != EXPECTED_SAMPLES or metadata["sample_key"].duplicated().any():
@@ -408,29 +412,27 @@ def shell_geometry(
     return hood_ids, hood_xyz, outer_xyz, inner_xyz, connector_xyz
 
 
-def representative_deck(data_root: Path, design: int, source: str = "industry5") -> Path:
-    if source == "industry5":
-        run = design * INDUSTRY_LOCATIONS + 1
-        folder = data_root / "HoodImpact_60_IndustryLike" / "inp_files"
-    else:
-        run = design * EURONCAP_LOCATIONS + 1
-        folder = data_root / "HoodImpact_600_EuroNCAP" / "inp_files"
+def representative_deck(data_root: Path, design: int, location: int = 1) -> Path:
+    if design not in range(EXPECTED_DESIGNS):
+        raise ValueError(f"invalid design: {design}")
+    if location not in range(1, EURONCAP_LOCATIONS + 1):
+        raise ValueError(f"invalid EuroNCAP location: {location}")
+    run = design * EURONCAP_LOCATIONS + location
+    folder = data_root / EURONCAP_DATASET / "inp_files"
     return folder / f"HoodImpact_{run}.inp"
 
 
 def preflight(data_root: Path) -> Dict[str, object]:
     metadata = build_metadata(data_root)
     expected_counts = {
-        "industry_inp": (data_root / "HoodImpact_60_IndustryLike" / "inp_files", 60, "*.inp"),
-        "industry_history": (
-            data_root / "HoodImpact_60_IndustryLike" / "output_history_acc",
-            60,
-            "*.csv",
+        "euroncap_inp": (
+            data_root / EURONCAP_DATASET / "inp_files",
+            EXPECTED_SAMPLES,
+            "*.inp",
         ),
-        "euroncap_inp": (data_root / "HoodImpact_600_EuroNCAP" / "inp_files", 600, "*.inp"),
         "euroncap_history": (
-            data_root / "HoodImpact_600_EuroNCAP" / "output_history_acc",
-            600,
+            data_root / EURONCAP_DATASET / "output_history_acc",
+            EXPECTED_SAMPLES,
             "*.csv",
         ),
     }
@@ -446,23 +448,29 @@ def preflight(data_root: Path) -> Dict[str, object]:
     inner_counts: Dict[int, int] = {}
     connector_counts: Dict[int, int] = {}
     for design in range(EXPECTED_DESIGNS):
-        ids_60, xyz_60, outer_60, inner_60, connector_60 = shell_geometry(
+        ids_first, hood_xyz, outer_xyz, inner_xyz, connector_xyz = shell_geometry(
             representative_deck(data_root, design)
         )
-        ids_600, xyz_600, _, inner_600, connector_600 = shell_geometry(
-            representative_deck(data_root, design, source="euroncap50")
+        ids_remaining, hood_remaining, outer_remaining, inner_remaining, connectors_remaining = (
+            shell_geometry(
+                representative_deck(data_root, design, ORIGINAL_EURONCAP_LOCATIONS + 1)
+            )
         )
         if (
-            not np.array_equal(ids_60, ids_600)
-            or not np.array_equal(xyz_60, xyz_600)
-            or not np.array_equal(inner_60, inner_600)
-            or not np.array_equal(connector_60, connector_600)
+            not np.array_equal(ids_first, ids_remaining)
+            or not np.array_equal(hood_xyz, hood_remaining)
+            or not np.array_equal(outer_xyz, outer_remaining)
+            or not np.array_equal(inner_xyz, inner_remaining)
+            or not np.array_equal(connector_xyz, connectors_remaining)
         ):
-            raise ValueError(f"source geometries disagree for design {design}")
-        hood_counts[design] = len(xyz_60)
-        outer_counts[design] = len(outer_60)
-        inner_counts[design] = len(inner_60)
-        connector_counts[design] = len(connector_60)
+            raise ValueError(
+                f"static hood geometry disagrees between merged locations 1 and 51 "
+                f"for design {design}"
+            )
+        hood_counts[design] = len(hood_xyz)
+        outer_counts[design] = len(outer_xyz)
+        inner_counts[design] = len(inner_xyz)
+        connector_counts[design] = len(connector_xyz)
 
     for row in (metadata.iloc[0], metadata.iloc[-1]):
         frame = pd.read_csv(
@@ -633,8 +641,7 @@ def rasterize_geometry(
 
 def dataset_fingerprint(data_root: Path, metadata: pd.DataFrame, max_window_s: float) -> str:
     paths: List[Path] = [
-        data_root / "HoodImpact_60_IndustryLike" / "ImpactCoords_60.csv",
-        data_root / "HoodImpact_600_EuroNCAP" / "manifest_600.csv",
+        data_root / EURONCAP_DATASET / EURONCAP_MANIFEST,
     ]
     paths.extend(representative_deck(data_root, design) for design in range(EXPECTED_DESIGNS))
     paths.extend(
@@ -747,7 +754,6 @@ class TrainingNormalizer:
         self.map_std: Optional[np.ndarray] = None
         self.scalar_mean: Optional[np.ndarray] = None
         self.scalar_std: Optional[np.ndarray] = None
-        self.industry_hic_mean: Optional[np.ndarray] = None
         self.euroncap_hic_mean: Optional[np.ndarray] = None
         self.hic_residual_std: Optional[float] = None
         self.accel_log_mean: Optional[float] = None
@@ -767,12 +773,11 @@ class TrainingNormalizer:
         train_metadata = data.metadata.iloc[train_indices].copy()
         train_metadata["hic15"] = data.hic15[train_indices]
         location_means = train_metadata.groupby(["source", "location"])["hic15"].mean()
-        self.industry_hic_mean = np.asarray(
-            [location_means.loc[("industry5", location)] for location in range(1, 6)],
-            dtype=np.float32,
-        )
         self.euroncap_hic_mean = np.asarray(
-            [location_means.loc[("euroncap50", location)] for location in range(1, 51)],
+            [
+                location_means.loc[(EURONCAP_SOURCE, location)]
+                for location in range(1, EURONCAP_LOCATIONS + 1)
+            ],
             dtype=np.float32,
         )
         baseline = self.hic_baseline(train_metadata)
@@ -792,7 +797,6 @@ class TrainingNormalizer:
                 self.map_std,
                 self.scalar_mean,
                 self.scalar_std,
-                self.industry_hic_mean,
                 self.euroncap_hic_mean,
                 self.hic_residual_std,
                 self.accel_log_mean,
@@ -810,22 +814,18 @@ class TrainingNormalizer:
         return ((values - self.scalar_mean) / self.scalar_std).astype(np.float32)
 
     def hic_baseline(self, metadata: pd.DataFrame) -> np.ndarray:
-        if self.industry_hic_mean is None or self.euroncap_hic_mean is None:
+        if self.euroncap_hic_mean is None:
             raise RuntimeError("normalizer HIC baseline is not fitted")
         baseline = np.empty(len(metadata), dtype=np.float64)
         for index, row in enumerate(metadata.itertuples(index=False)):
-            if row.source == "industry5":
-                table = self.industry_hic_mean
-            elif row.source == "euroncap50":
-                table = self.euroncap_hic_mean
-            else:
+            if row.source != EURONCAP_SOURCE:
                 raise ValueError(f"unknown HIC-baseline source: {row.source!r}")
             location = int(row.location)
-            if location < 1 or location > len(table):
+            if location < 1 or location > len(self.euroncap_hic_mean):
                 raise ValueError(
                     f"location {location} is invalid for HIC-baseline source {row.source!r}"
                 )
-            baseline[index] = table[location - 1]
+            baseline[index] = self.euroncap_hic_mean[location - 1]
         return baseline
 
     def transform_hic(self, values: np.ndarray, metadata: pd.DataFrame) -> np.ndarray:
@@ -862,7 +862,6 @@ class TrainingNormalizer:
             "map_std": self.map_std,
             "scalar_mean": self.scalar_mean,
             "scalar_std": self.scalar_std,
-            "industry_hic_mean": self.industry_hic_mean,
             "euroncap_hic_mean": self.euroncap_hic_mean,
             "hic_residual_std": self.hic_residual_std,
             "accel_log_mean": self.accel_log_mean,
@@ -1077,7 +1076,11 @@ def split_indices(
     train = np.flatnonzero((design != validation_design) & (design != test_design))
     validation = np.flatnonzero(design == validation_design)
     test = np.flatnonzero(design == test_design)
-    expected = (550, 55, 55)
+    expected = (
+        (EXPECTED_DESIGNS - 2) * EURONCAP_LOCATIONS,
+        EURONCAP_LOCATIONS,
+        EURONCAP_LOCATIONS,
+    )
     if (len(train), len(validation), len(test)) != expected:
         raise ValueError(
             f"expected design split sizes {expected}, found {(len(train), len(validation), len(test))}"
@@ -1234,7 +1237,7 @@ def detailed_metrics(
             ),
         }
     }
-    for source in ("industry5", "euroncap50"):
+    for source in (EURONCAP_SOURCE,):
         mask = frame["source"].to_numpy() == source
         metrics[source] = {
             "hic_direct": asdict(
@@ -1400,7 +1403,7 @@ def add_baseline_metrics(
         regression_metrics(data.hic15[indices], baseline)
     )
     frame = data.metadata.iloc[indices].reset_index(drop=True)
-    for source in ("industry5", "euroncap50"):
+    for source in (EURONCAP_SOURCE,):
         mask = frame["source"].to_numpy() == source
         metric_sets[source]["location_mean_baseline"] = asdict(
             regression_metrics(data.hic15[indices][mask], baseline[mask])
@@ -1914,7 +1917,7 @@ def run(args: argparse.Namespace) -> Path:
                         "training_designs": sorted(
                             data.metadata.iloc[train_indices]["design"].unique().tolist()
                         ),
-                        "target": "standardized residual from training-only source/location mean",
+                        "target": "standardized residual from training-only location mean",
                         "normalizer_file": "normalization.npz",
                     },
                     best_path,
@@ -2031,7 +2034,7 @@ def run(args: argparse.Namespace) -> Path:
                     "training_designs": sorted(
                         data.metadata.iloc[development_indices]["design"].unique().tolist()
                     ),
-                    "target": "standardized residual from development-only source/location mean",
+                    "target": "standardized residual from development-only location mean",
                     "normalizer_file": "final_normalization.npz",
                     "seed": args.seed,
                     "scheduler_horizon_epochs": args.epochs,
