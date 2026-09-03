@@ -1,4 +1,5 @@
 import os
+import argparse
 import wandb
 import math
 import torch
@@ -7,7 +8,7 @@ import torch.nn.functional as F
 from typing import List
 import warnings
 warnings.filterwarnings('ignore')
-from utils.utils import log_config, set_seed, setup_logging, Config, DataPreprocessor, create_data_loaders, Trainer, Evaluator, log_model_architecture, export_hic_test_predictions
+from utils.utils import log_config, set_seed, setup_logging, Config, DataPreprocessor, create_data_loaders, Trainer, Evaluator, log_model_architecture, export_hic_test_predictions, HIC_DIRECT_BEST_ARCH
 
 
 # MODEL ARCHITECTURE
@@ -649,16 +650,71 @@ class HoodImpactNeuralOperator(nn.Module):
         return out
 
 
-def main():
-    config = Config()
+def parse_args(argv=None):
+    """Command line overrides. With no flags the historical defaults are used."""
+    p = argparse.ArgumentParser(
+        description="Train the temporal DeepONet + PointNet++ hood-impact operator.",
+    )
+    # dataset
+    p.add_argument("--data-format", default=None,
+                   choices=["legacy", "industrylike", "euroncap1704"])
+    p.add_argument("--prediction-target", default=None, choices=["hic", "acceleration"])
+    p.add_argument("--num-samples", type=int, default=None)
+    p.add_argument("--samples-per-design", type=int, default=None)
+    # design-wise split (0-indexed design ids)
+    p.add_argument("--test-designs", type=int, nargs="+", default=[2])
+    p.add_argument("--val-designs", type=int, nargs="+", default=[10])
+    # architecture
+    p.add_argument("--arch", default=None, choices=["hic_direct_best"],
+                   help="Architecture preset applied before any other override; "
+                        "hic_direct_best = runs/hic_target_value/20260123_113525_best.")
+    p.add_argument("--local-radius", type=float, default=None)
+    # optimisation
+    p.add_argument("--epochs", type=int, default=None)
+    p.add_argument("--batch-size", type=int, default=None)
+    p.add_argument("--lr", type=float, default=None)
+    p.add_argument("--weight-decay", type=float, default=None)
+    p.add_argument("--seed", type=int, default=None)
+    # bookkeeping
+    p.add_argument("--output-dir", default=None)
+    p.add_argument("--run-name", default=None)
+    p.add_argument("--wandb-project", default="hood-impact")
+    return p.parse_args(argv)
+
+
+def build_config(args) -> Config:
+    """Config() with the preset applied first, then the explicit CLI overrides."""
+    overrides = dict(HIC_DIRECT_BEST_ARCH) if args.arch == "hic_direct_best" else {}
+    for key, value in (
+        ("data_format", args.data_format),
+        ("prediction_target", args.prediction_target),
+        ("num_samples", args.num_samples),
+        ("samples_per_design", args.samples_per_design),
+        ("local_radius", args.local_radius),
+        ("num_epochs", args.epochs),
+        ("batch_size", args.batch_size),
+        ("learning_rate", args.lr),
+        ("weight_decay", args.weight_decay),
+        ("seed", args.seed),
+        ("output_dir", args.output_dir),
+    ):
+        if value is not None:
+            overrides[key] = value
+    return Config(**overrides)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    config = build_config(args)
     set_seed(config.seed)
     log_path = os.path.join(config.output_dir, "log.log")
     logger = setup_logging(log_path)
     logger.info(f"Output directory: {config.output_dir}")
     log_config(config, logger)
+    run_name = args.run_name or f"run_{config.stamp}"
     wandb.init(
-        project="hood-impact",
-        name=f"run_{config.stamp}",
+        project=args.wandb_project,
+        name=run_name,
         config=vars(config),
         dir=config.output_dir,
     )
@@ -671,12 +727,32 @@ def main():
     logger.info("\n" + "=" * 60)
     logger.info("Loading and Preprocessing Data")
     logger.info("=" * 60)
+    TEST_DESIGNS = sorted(set(args.test_designs))
+    VAL_DESIGN = sorted(set(args.val_designs))
+    overlap = set(TEST_DESIGNS) & set(VAL_DESIGN)
+    if overlap:
+        raise ValueError(f"test and validation designs overlap: {sorted(overlap)}")
+    num_designs = -(-config.num_samples // config.samples_per_design)
+    out_of_range = [d for d in TEST_DESIGNS + VAL_DESIGN if not 0 <= d < num_designs]
+    if out_of_range:
+        raise ValueError(
+            f"design ids {out_of_range} are outside 0..{num_designs - 1} "
+            f"({config.num_samples} samples / {config.samples_per_design} per design)"
+        )
+    train_designs = [d for d in range(num_designs)
+                     if d not in TEST_DESIGNS and d not in VAL_DESIGN]
+    logger.info(
+        f"Design split -> train {train_designs} | val {VAL_DESIGN} | test {TEST_DESIGNS}"
+    )
+
     preprocessor = DataPreprocessor(config)
     data_dict = preprocessor.load_all_data()
-    # TEST_DESIGNS = [1, 2, 6, 7, 8, 9, 11, 15, 17, 19]
-    # VAL_DESIGN = 12
-    TEST_DESIGNS = [2]
-    VAL_DESIGN = 10
+    num_loaded = len(data_dict["run_numbers"])
+    if num_loaded != config.num_samples:
+        logger.warning(
+            f"loaded {num_loaded} of {config.num_samples} runs -- some runs were "
+            "skipped, see the [WARN] lines above"
+        )
     train_loader, val_loader, test_loader, test_dataset = create_data_loaders(
         data_dict,
         preprocessor,
@@ -746,7 +822,7 @@ def main():
             data_dict=data_dict,
             config=config,
             test_design_ids=TEST_DESIGNS,
-            samples_per_design=50
+            samples_per_design=config.samples_per_design,
         )
     logger.info("\n" + "=" * 60)
     logger.info("Pipeline Complete!")
