@@ -24,11 +24,18 @@ from pathlib import Path
 # CONFIGURATION for acceleration prediction
 # ============================================================================
 
+# Dataset formats whose mesh comes from an Abaqus .inp *NODE block (rather than
+# the legacy HoodImpactor_<run>_COORD.csv files) and whose acceleration files use
+# the HoodImpact_<run>_SAE1000_interp1000.csv naming.
+INP_MESH_FORMATS = {"industrylike", "euroncap1704"}
+
+
 class Config:
     # Dataset selection: "legacy" (1000 samples, 20 designs x 50)
-    #                    "industrylike" (60 designs x 1, new HoodImpact_60_IndustryLike)
+    #                    "industrylike" (60 designs x 1, HoodImpact_60_IndustryLike)
+    #                    "euroncap1704" (12 designs x 142 locations, HoodImpact_1704_EuroNCAP)
     data_format = "industrylike"
-    samples_per_design = 50  # overridden to 1 for industrylike in __init__
+    samples_per_design = 50  # overridden per data_format in __init__
 
     # Data paths (legacy dataset)
     mesh_geometry_dir = "./Data/mesh_geometry/"
@@ -88,6 +95,16 @@ class Config:
             self.samples_per_design = 1
             self.acceleration_dir = "./Data/HoodImpact_60_IndustryLike/output_history_acc/"
             self.hic_path = "./Data/HoodImpact_60_IndustryLike/output_scalar_HIC.csv"
+        elif fmt == "euroncap1704":
+            # 12 designs x 142 Euro-NCAP grid locations, run = 142 * design + loc
+            self.num_samples = 1704
+            self.samples_per_design = 142
+            self.inp_dir = "./Data/HoodImpact_1704_EuroNCAP/inp_files/"
+            self.impact_coords_path = "./Data/HoodImpact_1704_EuroNCAP/ImpactCoords_1704.csv"
+            self.acceleration_dir = "./Data/HoodImpact_1704_EuroNCAP/output_history_acc/"
+            # This folder ships no standalone HIC table; generation_metrics.csv
+            # carries the per-run HIC15 under `run` / `hic15` (see load_hic).
+            self.hic_path = "./Data/HoodImpact_1704_EuroNCAP/generation_metrics.csv"
 
         for key, value in kwargs.items():
             setattr(self, key, value)
@@ -150,6 +167,56 @@ class Config:
 #             setattr(self, key, value)
         
 #         os.makedirs(self.output_dir, exist_ok=True)
+
+# ============================================================================
+# ARCHITECTURE PRESET: direct-HIC best model
+# ============================================================================
+# Exact hyper-parameters of runs/hic_target_value/20260123_113525_best, the best
+# direct-HIC (no acceleration integration) model, trained with
+# temporal_deeponet_pointnetpp.py on the legacy 1000-sample set.
+# Verified: HoodImpactNeuralOperator(Config(**HIC_DIRECT_BEST_ARCH)) reproduces
+# that checkpoint exactly -- 87 state_dict entries, 929,281 trainable params,
+# load_state_dict(strict=True) succeeds.
+HIC_DIRECT_BEST_ARCH = {
+    "prediction_target": "hic",
+    # global geometry branch
+    "pointnet_input_dim": 3,
+    "pointnet_hidden_dims": [64, 128],
+    "pointnet_output_dim": 256,
+    "geometry_encoder_hidden_dim": 128,
+    "geometry_encoder_output_dim": 128,
+    # local (indentor-centred) geometry branch
+    "local_pointnet_input_dim": 5,
+    "local_pointnet_hidden_dims": [64, 128],
+    "local_pointnet_output_dim": 256,
+    "local_radius": 0.8,
+    # FiLM conditioning (two stacked layers on the global branch)
+    "film_condition_dim": 2,
+    "film_hidden_dim": 64,
+    "film_feature_dim": 128,
+    # trunk (unused in HIC mode, but part of the module and the checkpoint)
+    "trunk_hidden_dims": [64, 128, 128],
+    "trunk_output_dim": 256,
+    "num_fourier_frequencies": 8,
+    "num_tcn_layers": 5,
+    "time_subsample_stride": 16,
+    # output head
+    "operator_head_feature_dim": 384,
+    "operator_head_hidden_dims": [256],
+    # attention knobs carried by Config (unused by this model)
+    "num_heads": 16,
+    "head_dim": 64,
+    "num_tokens": 128,
+    "num_attn_blocks": 2,
+    # optimisation
+    "batch_size": 16,
+    "learning_rate": 3e-4,
+    "weight_decay": 1e-5,
+    "num_epochs": 200,
+    "max_train_time": None,
+    "seed": 42,
+}
+
 
 def log_config(config: Config, logger):
     logger.info("Configuration:")
@@ -243,7 +310,7 @@ class DataPreprocessor:
         Returns:
             coords: (N, 3) array of node coordinates
         """
-        if self.config.data_format == "industrylike":
+        if self.config.data_format in INP_MESH_FORMATS:
             return self._load_mesh_from_inp(run_number)
 
         filename = f"HoodImpactor_{run_number}_COORD.csv"
@@ -312,6 +379,11 @@ class DataPreprocessor:
         df = pd.read_csv(self.config.hic_path)
         # industrylike HIC csv has leading spaces in headers (" HIC Value")
         df.columns = [c.strip() for c in df.columns]
+        # HoodImpact_1704_EuroNCAP stores HIC in generation_metrics.csv under a
+        # different schema -- normalise it to the canonical Job ID / HIC Value.
+        if "status" in df.columns:
+            df = df[df["status"] == "ok"]
+        df = df.rename(columns={"run": "Job ID", "hic15": "HIC Value"})
         return df
 
     def subsample_time_series(
@@ -366,7 +438,7 @@ class DataPreprocessor:
             time: (T,) array of time points
             acceleration: (T,) array of acceleration values
         """
-        if self.config.data_format == "industrylike":
+        if self.config.data_format in INP_MESH_FORMATS:
             filename = f"HoodImpact_{run_number}_SAE1000_interp1000.csv"
         else:
             filename = f"HoodImpactor_{run_number}_SAE1000.csv"
@@ -381,7 +453,7 @@ class DataPreprocessor:
         return time, acceleration
     
     def load_all_data(self) -> Dict:
-        if self.config.data_format == "industrylike":
+        if self.config.data_format in INP_MESH_FORMATS:
             doe_df = None
             impact_df = self.load_impact_coords()
         else:
@@ -400,7 +472,7 @@ class DataPreprocessor:
             try:
                 coords = self.load_mesh_geometry(run_number)
 
-                if self.config.data_format == "industrylike":
+                if self.config.data_format in INP_MESH_FORMATS:
                     # impact coords are 0-indexed by row; drop X3 (drop/height axis),
                     # keep in-plane (X1, X2) to match the 2-D indentor convention.
                     pos_row = impact_df.iloc[run_number - 1]
