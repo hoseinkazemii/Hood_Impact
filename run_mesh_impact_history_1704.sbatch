@@ -39,7 +39,7 @@ PYTHON_BIN=$(command -v python)
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=${HOOD_MESH_OMP_THREADS:-8}
 export MKL_NUM_THREADS=${HOOD_MESH_MKL_THREADS:-8}
-export WANDB_MODE=${WANDB_MODE:-disabled}
+export WANDB_MODE=${WANDB_MODE:-online}
 export WANDB_PROJECT=${WANDB_PROJECT:-hood-impact-mesh-attention}
 
 DATA_ROOT=${HOOD_MESH_DATA_ROOT:-${PROJECT_DIR}/Data/HoodImpact_1704_EuroNCAP}
@@ -53,7 +53,7 @@ RUN_NAME=${HOOD_MESH_RUN_NAME:-mesh_history_1704_${JOB_ID}}
 printf 'Node: %s\nPython: %s\nModule: %s\n' "$(hostname)" "${PYTHON_BIN}" "${PYTORCH_MODULE}"
 printf 'Commit: %s\nDataset: %s\nOutput: %s\n' "$(git rev-parse HEAD)" "${DATA_ROOT}" "${OUTPUT_DIR}"
 printf 'Test designs: %s | Validation designs: %s\n' "${TEST_DESIGNS[*]}" "${VAL_DESIGNS[*]}"
-printf 'W&B: %s | project: %s\n' "${WANDB_MODE}" "${WANDB_PROJECT}"
+printf 'W&B: %s | project: %s | entity: %s\n' "${WANDB_MODE}" "${WANDB_PROJECT}" "${WANDB_ENTITY:-default team}"
 module list 2>&1 || true
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
 
@@ -74,6 +74,9 @@ TRAIN_ARGS=(
     --device cuda --output-dir "${OUTPUT_DIR}" --run-name "${RUN_NAME}"
     --wandb-mode "${WANDB_MODE}" --wandb-project "${WANDB_PROJECT}"
 )
+if [[ -n "${WANDB_ENTITY:-}" ]]; then
+    TRAIN_ARGS+=(--wandb-entity "${WANDB_ENTITY}")
+fi
 OPTIONS=(
     EPOCHS:epochs BATCH_SIZE:batch-size LR:lr WEIGHT_DECAY:weight-decay SEED:seed
     WIDTH:width NUM_HEADS:num-heads NUM_LATENTS:num-latents

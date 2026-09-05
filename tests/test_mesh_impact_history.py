@@ -301,6 +301,7 @@ class TrainingRoundTripTests(unittest.TestCase):
             for artifact in (
                 CHECKPOINT_NAME, "config.json", "splits.json", "scalers.joblib",
                 "prediction_times.npy", "training_history.json", "training_history.csv",
+                "training_history.png", "wandb_run.json",
                 "metrics.json", "test_acceleration_histories.csv",
             ):
                 self.assertTrue((run_dir / artifact).is_file(), artifact)

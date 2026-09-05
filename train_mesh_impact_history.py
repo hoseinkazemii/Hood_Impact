@@ -8,6 +8,7 @@ import argparse
 from datetime import datetime
 import json
 import logging
+import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -18,6 +19,7 @@ import torch
 import wandb
 
 from mesh_impact_history import MeshImpactHistoryNet
+from mesh_impact_history_reporting import export_training_history_plot
 from utils.utils import (
     Config,
     DataPreprocessor,
@@ -59,10 +61,19 @@ def parse_args(argv=None):
     for key, default in MODEL_DEFAULTS.items():
         parser.add_argument(f"--{key.replace('_', '-')}", type=type(default), default=default)
     parser.add_argument("--output-dir", help="New run directory; defaults to runs/mesh_impact_history/<timestamp>.")
-    parser.add_argument("--wandb-mode", choices=["disabled", "offline", "online"], default="disabled")
-    parser.add_argument("--wandb-project", default="hood-impact-mesh-attention")
+    parser.add_argument(
+        "--wandb-mode", choices=["disabled", "offline", "online"],
+        default=os.environ.get("WANDB_MODE") or "online",
+        help="Tracking mode; defaults to WANDB_MODE, or online when unset.",
+    )
+    parser.add_argument("--wandb-project", default=os.environ.get("WANDB_PROJECT") or "hood-impact-mesh-attention")
+    parser.add_argument("--wandb-entity", default=os.environ.get("WANDB_ENTITY") or None,
+                        help="W&B team/account; defaults to WANDB_ENTITY or your W&B default team.")
     parser.add_argument("--run-name")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.wandb_mode not in ("disabled", "offline", "online"):
+        parser.error("WANDB_MODE must be disabled, offline, or online; override it with --wandb-mode")
+    return args
 
 
 def build_config(args):
@@ -181,7 +192,10 @@ def resolved_config(config, args, model_kwargs, prediction_grid):
             "gradient_clip_norm": 1.0,
         },
         "prediction_grid": prediction_grid,
-        "wandb": {"mode": args.wandb_mode, "project": args.wandb_project, "run_name": args.run_name},
+        "wandb": {
+            "mode": args.wandb_mode, "project": args.wandb_project,
+            "entity": args.wandb_entity, "run_name": args.run_name or Path(config.output_dir).name,
+        },
         "output_dir": config.output_dir,
     }
 
@@ -199,6 +213,51 @@ def write_json(path, payload):
             return int(value)
         return value
     Path(path).write_text(json.dumps(clean(payload), indent=2, allow_nan=False) + "\n", encoding="utf-8")
+
+
+def initialize_wandb(args, initial_config, output_dir, logger):
+    """Start tracking before dataset loading and save the resolved destination."""
+    run = None
+    try:
+        logger.info("Initializing W&B: mode=%s | project=%s | entity=%s",
+                    args.wandb_mode, args.wandb_project, args.wandb_entity or "default team")
+        run = wandb.init(
+            project=args.wandb_project, entity=args.wandb_entity,
+            name=args.run_name or output_dir.name, config=initial_config,
+            dir=str(output_dir), mode=args.wandb_mode,
+        )
+        run.define_metric("epoch")
+        for metric in ("train/loss", "val/loss", "val/mae_g", "lr"):
+            run.define_metric(metric, step_metric="epoch")
+        actual_mode = run.settings.mode
+        metadata = {
+            "id": run.id, "name": run.name, "project": run.project,
+            "entity": run.entity, "mode": actual_mode,
+            "url": run.url if actual_mode == "online" else None,
+        }
+        write_json(output_dir / "wandb_run.json", metadata)
+        logger.info("W&B run: mode=%s | project=%s | entity=%s | id=%s | URL=%s",
+                    actual_mode, run.project, run.entity, run.id, metadata["url"] or "none (local tracking)")
+        if actual_mode != args.wandb_mode:
+            raise RuntimeError(f"Requested W&B mode {args.wandb_mode!r}, but initialized {actual_mode!r}")
+        if actual_mode == "offline":
+            logger.info("W&B is offline: history is saved locally and will appear online only after wandb sync.")
+        elif actual_mode == "disabled":
+            logger.info("W&B is disabled: this run will not appear on the W&B website.")
+        return run
+    except Exception as exc:
+        message = (
+            f"W&B initialization failed (mode={args.wandb_mode}, project={args.wandb_project}, "
+            f"entity={args.wandb_entity or 'default team'}). "
+            "For online logging, run `python -m wandb login` in the training environment "
+            "(on the cluster login node before submission), and check the selected team/project "
+            "and network connection. For intentional local tracking use --wandb-mode offline; "
+            "to turn tracking off use --wandb-mode disabled."
+        )
+        logger.error("%s Cause: %s", message, exc)
+        if run is not None:
+            run.finish(exit_code=1)
+        raise RuntimeError(message) from exc
 
 
 def export_predictions(path, dataset, predictions, targets):
@@ -295,6 +354,9 @@ def main(argv=None):
         model = MeshImpactHistoryNet(**model_kwargs)
         logger.info("New MeshImpactHistoryNet from scratch: %s", model_kwargs)
         logger.info("Output: %s | device: %s | configured time stride: %s", output_dir, config.device, config.time_subsample_stride)
+        run = initialize_wandb(
+            args, resolved_config(config, args, model_kwargs, prediction_grid=None), output_dir, logger,
+        )
         preprocessor = DataPreprocessor(config)
         data = preprocessor.load_all_data()
         validate_data(data)
@@ -336,10 +398,7 @@ def main(argv=None):
         preprocessor.save_scalers(str(output_dir / "scalers.joblib"))
         np.save(output_dir / "prediction_times.npy", first_times, allow_pickle=False)
         logger.info("Saved train-only scalers and sampled prediction grid (%s points); parameters: %s", len(first_times), sum(parameter.numel() for parameter in model.parameters()))
-        run = wandb.init(
-            project=args.wandb_project, name=args.run_name or output_dir.name,
-            config=saved_config, dir=str(output_dir), mode=args.wandb_mode,
-        )
+        run.config.update(saved_config, allow_val_change=True)
         trainer = Trainer(model, train_loader, val_loader, config, preprocessor)
         history = trainer.train()
         write_json(output_dir / "training_history.json", history)
@@ -348,6 +407,11 @@ def main(argv=None):
             "train_mse_normalized": history["train_losses"],
             "validation_mse_normalized": history["val_losses"],
         }).to_csv(output_dir / "training_history.csv", index=False)
+        history_plot = export_training_history_plot(history, output_dir)
+        logger.info("Saved training history plot: %s", history_plot)
+        run.summary["best_epoch"] = int(np.argmin(history["val_losses"])) + 1
+        if args.wandb_mode != "disabled":
+            run.log({"training/history": wandb.Image(str(history_plot))})
         checkpoint_path = output_dir / CHECKPOINT_NAME
         if not checkpoint_path.exists():
             raise RuntimeError("Training produced no finite best validation checkpoint; inspect losses and input data")
@@ -363,7 +427,7 @@ def main(argv=None):
         return metrics
     finally:
         if run is not None:
-            run.finish()
+            run.finish(exit_code=0 if sys.exc_info()[0] is None else 1)
         for handler in handlers:
             logger.removeHandler(handler)
             handler.close()

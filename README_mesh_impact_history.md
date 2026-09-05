@@ -27,8 +27,9 @@ aligned when computing relative geometry.
 ## Train
 
 Run from the repository root using an environment with PyTorch, NumPy, pandas,
-scikit-learn, joblib, matplotlib, and W&B installed. W&B is disabled by default;
-the shared trainer still requires the package to import.
+scikit-learn, joblib, matplotlib, and W&B installed. W&B logs online by default
+to project `hood-impact-mesh-attention`. Authenticate once in the training
+environment with `python -m wandb login` before starting an online run.
 
 Dependencies are listed in `requirements_mesh_impact_history.txt`. The local
 `.venv` was verified with PyTorch 2.8, W&B 0.22 and Protobuf 6.33.6. Its Protobuf
@@ -64,8 +65,16 @@ Additional options include `--num-samples`, `--samples-per-design`,
 `--max-train-time`, `--weight-decay`, `--seed`, `--width`, `--num-heads`,
 `--num-latents`, `--latent-layers`, `--temporal-layers`, and `--dropout`.
 Run `python train_mesh_impact_history.py --help` for all options.
-Use `--wandb-mode offline` for local W&B tracking or `--wandb-mode online`
-for explicit online logging. Each training run needs a new output directory.
+Tracking options inherit `WANDB_MODE`, `WANDB_PROJECT`, and `WANDB_ENTITY`;
+explicit `--wandb-mode`, `--wandb-project`, and `--wandb-entity` take precedence.
+Use `--wandb-mode offline` for local W&B tracking or `--wandb-mode disabled`
+for a smoke test without tracking. Each training run needs a new output directory.
+The run starts before dataset loading, so it appears promptly in the chosen
+project. `training.log` and `wandb_run.json` record its actual team, project,
+ID, mode, and online URL. Training/validation losses, validation MAE in g, and
+learning rate use epoch as their horizontal axis; test metrics are recorded
+after evaluating the best validation checkpoint. Initialization failures stop
+training with a login/destination error instead of silently disabling tracking.
 
 ## Submit the 1704 dataset on DeltaAI
 
@@ -76,6 +85,9 @@ the repository root:
 git fetch origin
 git switch agent/mesh-impact-history-1704
 bash -l setup_mesh_impact_history_env.sh
+module load "${HOOD_MESH_PYTORCH_MODULE:-python/miniforge3_pytorch/2.10.0}"
+source "${HOOD_MESH_VENV:-.venv-mesh-history}/bin/activate"
+python -m wandb login
 bash submit_mesh_impact_history_1704.sh
 ```
 
@@ -107,8 +119,20 @@ and 142 cases per design. Default test design 2 and validation design 10 give
 **1,420 training / 142 validation / 142 test** cases. Epochs, batch size, learning
 rate, and time stride inherit the current Python configuration (currently
 100 epochs, batch 8, LR 0.0003, stride 16). There is no launcher time-stride
-override. W&B defaults to disabled; set `WANDB_MODE=offline` or `online` to
-enable tracking.
+override. W&B defaults to online and uses the credentials saved by the login
+command above. To select a team/project, submit with, for example:
+
+```bash
+WANDB_ENTITY=my-team WANDB_PROJECT=hood-impact-mesh-attention \
+bash submit_mesh_impact_history_1704.sh
+```
+
+An existing `WANDB_MODE` environment setting is respected; use
+`WANDB_MODE=online bash submit_mesh_impact_history_1704.sh` to explicitly
+enable online logging, `WANDB_MODE=offline` for local tracking to sync later,
+or `WANDB_MODE=disabled` for an intentionally untracked smoke test. An offline
+run can be uploaded later using `python -m wandb sync /path/to/offline-run-*`.
+Runs created with disabled tracking have no W&B event files to sync.
 
 The 1704 dataset is excluded from Git and must already be available on the
 cluster under `Data/HoodImpact_1704_EuroNCAP`. For a different location, set
@@ -187,15 +211,44 @@ established with held-out data.
 - `hood_impact_best_model.pt`: this new network's best validation checkpoint,
   including optimizer/scheduler state (the filename follows the shared trainer).
 - `training_history.json`, `training_history.csv`: normalized train/validation MSE.
+- `training_history.png`: train/validation loss curves with the best validation
+  epoch marked; also uploaded to W&B for online/offline tracking runs.
 - `metrics.json`: test MSE in g squared, RMSE/MAE in g, and R2. Undefined metrics
   are JSON `null`.
 - `test_acceleration_histories.csv`: `run_number`, `time`,
   `acceleration_true_g`, and `acceleration_pred_g` on each test run's sampled grid.
 - `training.log`: run configuration summary, data/grid warnings, and final metrics;
   the shared trainer's epoch progress is printed to the console.
+- `wandb_run.json`: resolved W&B mode, project, entity/team, run ID/name, and URL
+  (`null` URL when tracking is offline or disabled).
 
 Training starts with fresh weights. Evaluation reloads the best validation
 checkpoint from this run using `torch.load(..., weights_only=True)`.
+
+### Recover plots and W&B metrics from a completed run
+
+The loss plot is now saved automatically after training, before test evaluation.
+For an existing results folder, generate it without retraining:
+
+```bash
+python mesh_impact_history_reporting.py runs/mesh_impact_history/<run-folder>
+```
+
+Earlier launchers defaulted W&B to disabled. A disabled run has no W&B record
+to synchronize, but its saved losses and final test metrics can be uploaded:
+
+```bash
+python mesh_impact_history_reporting.py runs/mesh_impact_history/<run-folder> --upload-wandb
+```
+
+Authenticate first using `python -m wandb login`, or provide `WANDB_API_KEY`
+in the environment. Optional destination overrides are `--wandb-project`,
+`--wandb-entity`, and `--run-name`. This creates a run labelled
+`historical_backfill` with a `_recovered` name and saves its URL to
+`wandb_backfill.json`. It uploads the original train/validation losses, final
+test metrics, and training-history plot. Historical per-epoch validation MAE,
+learning rate, and original timing were not saved and are not reconstructed.
+The original config and checkpoint remain unchanged.
 
 ## Validation
 
