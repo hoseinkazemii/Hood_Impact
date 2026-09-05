@@ -2,6 +2,9 @@
 
 Code for hood-impact acceleration-history modeling and Abaqus sample generation.
 
+For the new irregular-mesh attention network mapping hood geometry and impact
+location to acceleration history, see [Mesh impact history](README_mesh_impact_history.md).
+
 Main areas:
 
 - `abaqus_scripts/`: generate Abaqus impact decks, run Abaqus batches, extract and postprocess acceleration histories.
