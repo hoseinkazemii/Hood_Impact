@@ -11,6 +11,13 @@
 # training, and the reported score largely measured duplicate retrieval. The
 # preflight now refuses any split that leaves clones behind.
 #
+# Stricter variant -- validate outside cluster D so checkpoint selection never
+# sees a clone of the test geometry, at the cost of a noisier validation signal:
+#   HOOD_MESH_VAL_DESIGNS="5" HOOD_MESH_TEST_DESIGNS="10 11" \
+#       bash submit_mesh_impact_history_1704_clusterD.sh
+# The preflight warns that design 4 stays in training beside validation design
+# 5, and proceeds: only a clone of a *test* design invalidates the score.
+#
 # Submit from any directory; extra arguments are forwarded to sbatch.
 #   bash submit_mesh_impact_history_1704_clusterD.sh
 #   bash submit_mesh_impact_history_1704_clusterD.sh --time=08:00:00

@@ -43,26 +43,43 @@ GEOMETRY_CLUSTERS = {"A": (0, 1, 2, 3), "B": (4, 5), "C": (6, 7, 8, 9), "D": (10
 
 
 def validate_cluster_holdout(test_designs, val_designs):
-    """Require held-out designs to take their whole geometry cluster with them."""
+    """Require the *test* designs to take their whole geometry cluster with them.
+
+    A clone of a test design left in training is fatal: the score then measures
+    duplicate retrieval. A clone of a validation design is not -- it only makes
+    checkpoint selection slightly optimistic, and holding out a validation
+    design's whole cluster would cost a second cluster of training data. That
+    case is reported as a warning and the run proceeds.
+    """
     held_out = set(test_designs) | set(val_designs)
-    leaks = []
+    test_ids, val_ids = set(test_designs), set(val_designs)
+    test_leaks, val_leaks = [], []
     for name, members in GEOMETRY_CLUSTERS.items():
-        remaining = set(members) - held_out
-        if held_out & set(members) and remaining:
-            leaks.append(
-                f"cluster {name}: {sorted(held_out & set(members))} held out while "
-                f"near-identical {sorted(remaining)} stay in training"
+        members = set(members)
+        remaining = members - held_out  # still in training
+        if not remaining:
+            continue
+        if test_ids & members:
+            test_leaks.append(
+                f"cluster {name}: test design(s) {sorted(test_ids & members)} held out "
+                f"while near-identical {sorted(remaining)} stay in training"
             )
-    if leaks:
+        elif val_ids & members:
+            val_leaks.append(
+                f"cluster {name}: validation design(s) {sorted(val_ids & members)} held "
+                f"out while near-identical {sorted(remaining)} stay in training"
+            )
+    if test_leaks:
         raise ValueError(
-            "Held-out designs leave near-clones in training, so the test score would "
-            "measure retrieval rather than geometry: " + "; ".join(leaks)
-            + ". Hold out a whole cluster "
+            "Test designs leave near-clones in training, so the test score would "
+            "measure retrieval rather than geometry: " + "; ".join(test_leaks)
+            + ". Hold out whole clusters "
             + ", ".join(f"{n}={list(m)}" for n, m in GEOMETRY_CLUSTERS.items())
             + ", or pass --allow-clone-leak to accept this deliberately."
         )
-    return sorted(name for name, members in GEOMETRY_CLUSTERS.items()
-                  if set(members) <= held_out)
+    held_clusters = sorted(name for name, members in GEOMETRY_CLUSTERS.items()
+                           if set(members) <= held_out)
+    return held_clusters, val_leaks
 
 
 def validate_splits(test_designs, val_designs):
@@ -229,10 +246,14 @@ def main(argv=None):
         validate_runtime(args.require_cuda)
         splits = validate_splits(args.test_designs, args.val_designs)
         if args.allow_clone_leak:
-            held_clusters = []
             print("Cluster check: SKIPPED (--allow-clone-leak); scores may measure retrieval")
         else:
-            held_clusters = validate_cluster_holdout(args.test_designs, args.val_designs)
+            held_clusters, val_leaks = validate_cluster_holdout(
+                args.test_designs, args.val_designs
+            )
+            for leak in val_leaks:
+                print(f"Cluster check: WARNING - {leak}. The test split is unaffected; "
+                      f"checkpoint selection is slightly optimistic.")
             print(f"Cluster check: passed | whole clusters held out: "
                   f"{held_clusters or 'none (no held-out design shares a cluster)'}")
         root, impact_xy = validate_dataset(args.data_root)
