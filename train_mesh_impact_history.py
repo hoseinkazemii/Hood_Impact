@@ -49,7 +49,11 @@ def parse_args(argv=None):
         parser.add_argument(f"--{name}")
     parser.add_argument("--num-samples", type=int)
     parser.add_argument("--samples-per-design", type=int)
-    parser.add_argument("--test-designs", type=int, nargs="+", default=[2], help="Zero-based design IDs.")
+    # Cluster-D holdout: designs 10 and 11 are the only members of their
+    # geometry cluster, so training keeps no near-clone of either. A
+    # single-design holdout leaves clones behind and scores retrieval, not
+    # physics -- see preflight_mesh_impact_history_1704.py.
+    parser.add_argument("--test-designs", type=int, nargs="+", default=[11], help="Zero-based design IDs.")
     parser.add_argument("--val-designs", type=int, nargs="+", default=[10], help="Zero-based design IDs.")
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--batch-size", type=int)

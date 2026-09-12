@@ -43,7 +43,10 @@ export WANDB_MODE=${WANDB_MODE:-online}
 export WANDB_PROJECT=${WANDB_PROJECT:-hood-impact-mesh-attention}
 
 DATA_ROOT=${HOOD_MESH_DATA_ROOT:-${PROJECT_DIR}/Data/HoodImpact_1704_EuroNCAP}
-read -r -a TEST_DESIGNS <<< "${HOOD_MESH_TEST_DESIGNS:-2}"
+# Cluster-D holdout by default: designs 10 and 11 are the whole of their
+# geometry cluster, so no near-clone of either survives in training. The
+# preflight refuses any split that leaves clones behind.
+read -r -a TEST_DESIGNS <<< "${HOOD_MESH_TEST_DESIGNS:-11}"
 read -r -a VAL_DESIGNS <<< "${HOOD_MESH_VAL_DESIGNS:-10}"
 STAMP=$(date +%Y%m%d_%H%M%S)
 JOB_ID=${SLURM_JOB_ID:-local}
@@ -59,9 +62,12 @@ nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
 
 # This validates the exact files used by acceleration training and performs a
 # new-network CUDA forward/backward check before loading all 1704 meshes.
-srun "${PYTHON_BIN}" -u preflight_mesh_impact_history_1704.py \
-    --data-root "${DATA_ROOT}" --require-cuda \
-    --test-designs "${TEST_DESIGNS[@]}" --val-designs "${VAL_DESIGNS[@]}"
+PREFLIGHT_ARGS=(--data-root "${DATA_ROOT}" --require-cuda
+    --test-designs "${TEST_DESIGNS[@]}" --val-designs "${VAL_DESIGNS[@]}")
+if [[ "${HOOD_MESH_ALLOW_CLONE_LEAK:-0}" == "1" ]]; then
+    PREFLIGHT_ARGS+=(--allow-clone-leak)
+fi
+srun "${PYTHON_BIN}" -u preflight_mesh_impact_history_1704.py "${PREFLIGHT_ARGS[@]}"
 
 # Dataset selection is explicit; time subsampling remains in utils.utils.Config.
 # Optional settings override the Python defaults only when explicitly provided.

@@ -34,6 +34,36 @@ SAMPLES_PER_DESIGN = 142
 NUM_DESIGNS = NUM_RUNS // SAMPLES_PER_DESIGN
 DEFAULT_DATA_ROOT = "Data/HoodImpact_1704_EuroNCAP"
 
+# The 12 design IDs are only 4 distinct hoods. Verified by comparing the hood
+# surfaces on a common XY grid (visualize_design_sensitivity_1704.py): inside a
+# cluster the surfaces agree to 0.06 mm, between clusters they differ by at
+# least 2.13 mm. Holding out one design while its clones stay in training makes
+# the test score measure duplicate retrieval instead of learned physics.
+GEOMETRY_CLUSTERS = {"A": (0, 1, 2, 3), "B": (4, 5), "C": (6, 7, 8, 9), "D": (10, 11)}
+
+
+def validate_cluster_holdout(test_designs, val_designs):
+    """Require held-out designs to take their whole geometry cluster with them."""
+    held_out = set(test_designs) | set(val_designs)
+    leaks = []
+    for name, members in GEOMETRY_CLUSTERS.items():
+        remaining = set(members) - held_out
+        if held_out & set(members) and remaining:
+            leaks.append(
+                f"cluster {name}: {sorted(held_out & set(members))} held out while "
+                f"near-identical {sorted(remaining)} stay in training"
+            )
+    if leaks:
+        raise ValueError(
+            "Held-out designs leave near-clones in training, so the test score would "
+            "measure retrieval rather than geometry: " + "; ".join(leaks)
+            + ". Hold out a whole cluster "
+            + ", ".join(f"{n}={list(m)}" for n, m in GEOMETRY_CLUSTERS.items())
+            + ", or pass --allow-clone-leak to accept this deliberately."
+        )
+    return sorted(name for name, members in GEOMETRY_CLUSTERS.items()
+                  if set(members) <= held_out)
+
 
 def validate_splits(test_designs, val_designs):
     """Use the training split logic with the complete, fixed 1704-run mapping."""
@@ -184,8 +214,12 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", default=DEFAULT_DATA_ROOT)
     parser.add_argument("--require-cuda", action="store_true")
-    parser.add_argument("--test-designs", type=int, nargs="+", default=[2])
+    parser.add_argument("--test-designs", type=int, nargs="+", default=[11])
     parser.add_argument("--val-designs", type=int, nargs="+", default=[10])
+    parser.add_argument("--allow-clone-leak", action="store_true",
+                        help="Permit a holdout that leaves near-clones of a held-out "
+                             "design in training. Scores from such a run measure "
+                             "retrieval, not geometry.")
     return parser.parse_args(argv)
 
 
@@ -194,6 +228,13 @@ def main(argv=None):
     try:
         validate_runtime(args.require_cuda)
         splits = validate_splits(args.test_designs, args.val_designs)
+        if args.allow_clone_leak:
+            held_clusters = []
+            print("Cluster check: SKIPPED (--allow-clone-leak); scores may measure retrieval")
+        else:
+            held_clusters = validate_cluster_holdout(args.test_designs, args.val_designs)
+            print(f"Cluster check: passed | whole clusters held out: "
+                  f"{held_clusters or 'none (no held-out design shares a cluster)'}")
         root, impact_xy = validate_dataset(args.data_root)
         data, source_count, cutoff_count = validate_first_run(root, impact_xy)
         if args.require_cuda:
