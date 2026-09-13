@@ -86,9 +86,19 @@ class SubmissionLauncherTests(unittest.TestCase):
         venv_bin.mkdir(parents=True)
         (venv_bin / "activate").write_text(":\n", encoding="utf-8")
         self.env["HOOD_MESH_VENV"] = self.shell_path(venv_bin.parent)
-        for name in ("module", "nvidia-smi", "python"):
+        for name in ("module", "nvidia-smi"):
             self.stub(name, ":\n")
-        self.stub("srun", "printf 'SRUN'; printf ' <%s>' \"$@\"; printf '\\n'\n")
+        # Reproduce job 3139891: srun cannot start a task, although the batch
+        # shell itself can execute Python on its allocated GPU.
+        self.stub("srun", "echo 'srun: error: task 0 launch failed: Error configuring interconnect' >&2\nexit 89\n")
+        self.stub("python", """printf 'PYTHON'; printf ' <%s>' "$@"
+printf ' CUDA_VISIBLE_DEVICES=%s\\n' "${CUDA_VISIBLE_DEVICES-unset}"
+case "$2" in
+    preflight_mesh_impact_history_1704.py) exit "${MESH_TEST_PREFLIGHT_STATUS:-0}" ;;
+    train_mesh_impact_history.py) exit "${MESH_TEST_TRAIN_STATUS:-0}" ;;
+esac
+""")
+        self.env.update(MESH_TEST_PREFLIGHT_STATUS="0", MESH_TEST_TRAIN_STATUS="0")
         self.stub("sbatch", """printf 'DECODER=%s\\nTEST=%s\\nVAL=%s\\nLEAK=%s\\n' \\
     "$HOOD_MESH_DECODER" "$HOOD_MESH_TEST_DESIGNS" "$HOOD_MESH_VAL_DESIGNS" "$HOOD_MESH_ALLOW_CLONE_LEAK"
 printf 'ARG=%s\\n' "$@"
@@ -104,14 +114,14 @@ printf 'ARG=%s\\n' "$@"
         path.write_text("#!/usr/bin/env bash\n" + body, encoding="utf-8", newline="\n")
         path.chmod(0o755)
 
-    def launch(self, script, extra_args=()):
+    def launch(self, script, extra_args=(), expected_returncode=0):
         result = subprocess.run(
             [self.bash, "-c", 'export PATH="$1:$PATH"; shift; bash "$@"',
              "launcher-test", self.shell_path(self.bin_dir),
              self.shell_path(self.repo / script), *extra_args],
             env=self.env, capture_output=True, text=True, timeout=30,
         )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, expected_returncode, result.stdout + result.stderr)
         return result.stdout
 
     def test_ablation_launcher_pins_hardest_split_despite_old_environment(self):
@@ -127,18 +137,38 @@ printf 'ARG=%s\\n' "$@"
         for expected in ("DECODER=mesh_only", "TEST=10 11", "VAL=5"):
             self.assertIn(expected, output)
 
-    def test_batch_forwards_same_decoder_and_split_to_preflight_and_training(self):
+    def test_batch_runs_directly_with_broken_srun_and_preserves_gpu_decoder_and_split(self):
+        self.env["CUDA_VISIBLE_DEVICES"] = "GPU-allocated-by-slurm"
         for decoder in ("", "temporal"):
             with self.subTest(decoder=decoder):
                 self.env["HOOD_MESH_DECODER"] = decoder
                 output = self.launch("run_mesh_impact_history_1704.sbatch")
-                commands = [line for line in output.splitlines() if line.startswith("SRUN")]
+                commands = [line for line in output.splitlines() if line.startswith("PYTHON")]
                 self.assertEqual(len(commands), 2, output)
                 self.assertIn("preflight_mesh_impact_history_1704.py", commands[0])
                 self.assertIn("train_mesh_impact_history.py", commands[1])
                 for command in commands:
                     self.assertIn(f"<--decoder> <{decoder or 'mesh_only'}>", command)
                     self.assertIn("<--test-designs> <10> <11> <--val-designs> <5>", command)
+                    self.assertIn("CUDA_VISIBLE_DEVICES=GPU-allocated-by-slurm", command)
+                self.assertIn("Finished. Checkpoints, metrics and acceleration histories:", output)
+
+    def test_failed_direct_preflight_stops_before_training(self):
+        self.env["MESH_TEST_PREFLIGHT_STATUS"] = "17"
+        output = self.launch("run_mesh_impact_history_1704.sbatch", expected_returncode=17)
+        commands = [line for line in output.splitlines() if line.startswith("PYTHON")]
+        self.assertEqual(len(commands), 1, output)
+        self.assertIn("preflight_mesh_impact_history_1704.py", commands[0])
+        self.assertNotIn("Training command:", output)
+        self.assertNotIn("Finished.", output)
+
+    def test_direct_training_failure_is_the_batch_job_exit_status(self):
+        self.env["MESH_TEST_TRAIN_STATUS"] = "23"
+        output = self.launch("run_mesh_impact_history_1704.sbatch", expected_returncode=23)
+        commands = [line for line in output.splitlines() if line.startswith("PYTHON")]
+        self.assertEqual(len(commands), 2, output)
+        self.assertIn("train_mesh_impact_history.py", commands[1])
+        self.assertNotIn("Finished.", output)
 
 
 class SubmissionDataTests(unittest.TestCase):

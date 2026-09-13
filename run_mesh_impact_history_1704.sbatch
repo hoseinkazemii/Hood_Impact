@@ -69,7 +69,13 @@ PREFLIGHT_ARGS=(--data-root "${DATA_ROOT}" --require-cuda
 if [[ "${HOOD_MESH_ALLOW_CLONE_LEAK:-0}" == "1" ]]; then
     PREFLIGHT_ARGS+=(--allow-clone-leak)
 fi
-srun "${PYTHON_BIN}" -u preflight_mesh_impact_history_1704.py "${PREFLIGHT_ARGS[@]}"
+# This is one Python process on one allocated GPU. Run in Slurm's existing
+# batch step: an extra srun step can fail with "Error configuring interconnect"
+# before Python starts (job 3139891). Inherit Slurm's CUDA_VISIBLE_DEVICES.
+printf 'Launch: direct Python in Slurm batch allocation | CUDA_VISIBLE_DEVICES=%s\n' \
+    "${CUDA_VISIBLE_DEVICES:-unset}"
+printf 'Starting dataset and CUDA preflight.\n'
+"${PYTHON_BIN}" -u preflight_mesh_impact_history_1704.py "${PREFLIGHT_ARGS[@]}"
 
 # Dataset selection is explicit; time subsampling remains in utils.utils.Config.
 # Optional settings override the Python defaults only when explicitly provided.
@@ -101,5 +107,5 @@ done
 printf 'Training command:'
 printf ' %q' "${PYTHON_BIN}" -u train_mesh_impact_history.py "${TRAIN_ARGS[@]}"
 printf '\n'
-srun "${PYTHON_BIN}" -u train_mesh_impact_history.py "${TRAIN_ARGS[@]}"
+"${PYTHON_BIN}" -u train_mesh_impact_history.py "${TRAIN_ARGS[@]}"
 printf 'Finished. Checkpoints, metrics and acceleration histories: %s\n' "${OUTPUT_DIR}"

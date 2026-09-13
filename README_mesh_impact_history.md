@@ -121,6 +121,24 @@ HOOD_MESH_TEST_DESIGNS="6 7 8 9" HOOD_MESH_VAL_DESIGNS="4 5" \
 bash submit_mesh_impact_history_1704.sh --time=08:00:00
 ```
 
+Preflight and training run directly as Python processes inside the allocated
+single-node Slurm batch job, inheriting its `CUDA_VISIBLE_DEVICES`. Slurm sets
+the GPU visibility for the batch script as described in its
+[GPU management documentation](https://slurm.schedmd.com/gres.html#GPU_Management).
+Both processes use the same activated environment; CUDA remains mandatory, and
+a failed preflight stops the job before training. A training failure also
+returns a nonzero batch exit status.
+
+Job `3139891` stopped at the first `srun` with
+`task 0 launch failed: Error configuring interconnect`, before Python started.
+The earlier V6 jobs `3056355` and `3063195` successfully used the same PyTorch
+module and GPU driver, so those logs do not indicate an environment version
+mismatch. Direct Python avoids the failing extra Slurm step for this
+single-process model. The `.out` file now prints `Launch: direct Python in
+Slurm batch allocation` and `Starting dataset and CUDA preflight.` before the
+Python checks. Pull the fix and resubmit with the same ablation command above;
+no environment reinstall is needed for this launcher change.
+
 The job always selects **euroncap1704**, 1,704 runs, acceleration prediction,
 and 142 cases per design. Default test designs 10 and 11 and validation design 5
 give **1,278 training / 142 validation / 284 test** cases. Epochs, batch size, learning
