@@ -13,7 +13,7 @@
 #SBATCH --error=mesh_history_1704_%j.err
 
 # Train MeshImpactHistoryNet from scratch on the 1704 acceleration histories.
-# Preferred ablation: bash submit_mesh_impact_history_1704_no_temporal.sh
+# Preferred submission: bash submit_mesh_impact_history_1704_clusterD.sh
 # Direct sbatch also works when submitted from the repository root.
 # Do not enable nounset: module/conda activation may access unset variables.
 set -eo pipefail
@@ -47,7 +47,7 @@ DATA_ROOT=${HOOD_MESH_DATA_ROOT:-${PROJECT_DIR}/Data/HoodImpact_1704_EuroNCAP}
 # design 5 belongs to cluster B. Preflight rejects test clones in training.
 read -r -a TEST_DESIGNS <<< "${HOOD_MESH_TEST_DESIGNS:-10 11}"
 read -r -a VAL_DESIGNS <<< "${HOOD_MESH_VAL_DESIGNS:-5}"
-DECODER=${HOOD_MESH_DECODER:-mesh_only}
+DECODER=${HOOD_MESH_DECODER:-temporal}
 STAMP=$(date +%Y%m%d_%H%M%S)
 JOB_ID=${SLURM_JOB_ID:-local}
 OUTPUT_DIR=${HOOD_MESH_OUTPUT_DIR:-${PROJECT_DIR}/runs/mesh_impact_history/${STAMP}_${JOB_ID}_1704}

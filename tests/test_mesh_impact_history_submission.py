@@ -16,10 +16,10 @@ import train_mesh_impact_history as training
 
 
 class SubmissionSplitTests(unittest.TestCase):
-    def test_defaults_match_hardest_existing_split_and_ablation(self):
+    def test_defaults_match_hardest_existing_split_and_temporal_model(self):
         for parse in (preflight.parse_args, training.parse_args):
             args = parse([])
-            self.assertEqual(args.decoder, "mesh_only")
+            self.assertEqual(args.decoder, "temporal")
             self.assertEqual(args.test_designs, [10, 11])
             self.assertEqual(args.val_designs, [5])
         splits = preflight.validate_splits([10, 11], [5])
@@ -132,14 +132,14 @@ printf 'ARG=%s\\n' "$@"
                          "ARG=--time=00:10:00", "run_mesh_impact_history_1704.sbatch"):
             self.assertIn(expected, output)
 
-    def test_cluster_launcher_defaults_to_hardest_ablation(self):
+    def test_cluster_launcher_defaults_to_hardest_temporal_model(self):
         output = self.launch("submit_mesh_impact_history_1704_clusterD.sh")
-        for expected in ("DECODER=mesh_only", "TEST=10 11", "VAL=5"):
+        for expected in ("DECODER=temporal", "TEST=10 11", "VAL=5"):
             self.assertIn(expected, output)
 
     def test_batch_runs_directly_with_broken_srun_and_preserves_gpu_decoder_and_split(self):
         self.env["CUDA_VISIBLE_DEVICES"] = "GPU-allocated-by-slurm"
-        for decoder in ("", "temporal"):
+        for decoder in ("", "temporal", "mesh_only"):
             with self.subTest(decoder=decoder):
                 self.env["HOOD_MESH_DECODER"] = decoder
                 output = self.launch("run_mesh_impact_history_1704.sbatch")
@@ -148,7 +148,7 @@ printf 'ARG=%s\\n' "$@"
                 self.assertIn("preflight_mesh_impact_history_1704.py", commands[0])
                 self.assertIn("train_mesh_impact_history.py", commands[1])
                 for command in commands:
-                    self.assertIn(f"<--decoder> <{decoder or 'mesh_only'}>", command)
+                    self.assertIn(f"<--decoder> <{decoder or 'temporal'}>", command)
                     self.assertIn("<--test-designs> <10> <11> <--val-designs> <5>", command)
                     self.assertIn("CUDA_VISIBLE_DEVICES=GPU-allocated-by-slurm", command)
                 self.assertIn("Finished. Checkpoints, metrics and acceleration histories:", output)

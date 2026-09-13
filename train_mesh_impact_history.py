@@ -38,9 +38,9 @@ MODEL_DEFAULTS = {
     "latent_layers": 3,
     "temporal_layers": 2,
     "dropout": 0.1,
-    # New training uses the ablation; the model constructor retains the legacy
-    # default so saved configs without a decoder still load their original net.
-    "decoder": "mesh_only",
+    # Restore temporal attention after the cluster-D ablation comparison.
+    # mesh_only remains available to reload and reproduce ablation runs.
+    "decoder": "temporal",
 }
 CHECKPOINT_NAME = "hood_impact_best_model.pt"  # Filename used by shared Trainer.
 

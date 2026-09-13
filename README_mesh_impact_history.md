@@ -11,12 +11,12 @@ The architecture projects each node's coordinates and impact-relative geometry
 into features. Impact-conditioned latent queries attend to all mesh nodes;
 global queries and queries with learned distance priors describe the whole hood
 and the impact neighborhood. Attention among the latent tokens combines their
-information. Sampled output-time queries attend to those tokens, then a scalar
-head predicts acceleration independently at each requested time. New training
-defaults to `--decoder mesh_only`, which removes temporal self-attention while
-keeping global/local mesh attention, latent-token attention, decoder
-cross-attention and position-wise feedforward layers. `--decoder temporal`
-restores the original decoder's self-attention across output times.
+information. Sampled output-time queries attend to those tokens, then temporal
+self-attention couples the requested times before a scalar acceleration head.
+Training defaults to the original `--decoder temporal` architecture, including
+global/local mesh attention, latent-token attention, decoder cross-attention,
+temporal self-attention and position-wise feedforward layers. The optional
+`--decoder mesh_only` ablation removes only temporal self-attention.
 The output times specify the fixed prediction grid; measured acceleration is
 only a training target and is never a network input. Full mesh-to-mesh attention
 is avoided by using a small latent set. Mesh node order does not define a spatial
@@ -49,12 +49,12 @@ Defaults for data format, paths, sample count, epochs, batch size, learning rate
 and time subsampling come from the current `utils.utils.Config`. The current
 default dataset is `industrylike`. Acceleration prediction is always selected.
 The new architecture defaults are width 128, 4 attention heads, 32 latent tokens,
-3 latent attention layers, 2 decoder layers, dropout 0.1, and `decoder=mesh_only`.
+3 latent attention layers, 2 decoder layers, dropout 0.1, and `decoder=temporal`.
 The depth flag remains `--temporal-layers` for checkpoint compatibility; with
 `mesh_only`, it counts mesh cross-attention blocks and adds no temporal attention.
 
 ```powershell
-python train_mesh_impact_history.py --data-format euroncap1704 --test-designs 10 11 --val-designs 5 --decoder mesh_only --epochs 100 --batch-size 8 --lr 0.0003 --device cuda --output-dir runs/mesh_impact_history/euroncap_01
+python train_mesh_impact_history.py --data-format euroncap1704 --test-designs 10 11 --val-designs 5 --decoder temporal --epochs 100 --batch-size 8 --lr 0.0003 --device cuda --output-dir runs/mesh_impact_history/euroncap_01
 ```
 
 Design IDs are **zero based**: `(run_number - 1) // samples_per_design`.
@@ -95,7 +95,7 @@ bash -l setup_mesh_impact_history_env.sh
 module load "${HOOD_MESH_PYTORCH_MODULE:-python/miniforge3_pytorch/2.10.0}"
 source "${HOOD_MESH_VENV:-.venv-mesh-history}/bin/activate"
 python -m wandb login
-bash submit_mesh_impact_history_1704_no_temporal.sh
+bash submit_mesh_impact_history_1704_clusterD.sh
 ```
 
 The setup script creates a Linux-native `.venv-mesh-history` overlay using
@@ -106,14 +106,14 @@ both setup and submission if you use a different module or environment path.
 For example, an environment on scratch can be selected with
 `export HOOD_MESH_VENV=/work/nvme/<account>/$USER/hood-mesh-history`.
 
-`submit_mesh_impact_history_1704_no_temporal.sh` creates `runs/slurm` before submitting
+`submit_mesh_impact_history_1704_clusterD.sh` creates `runs/slurm` before submitting
 `run_mesh_impact_history_1704.sbatch`. The job requests one GPU, 16 CPU cores,
 96 GB host memory, and six hours on `ghx4`, account `bbqg-dtai-gh`. Additional
 submission-script arguments go to `sbatch`, so resources can be overridden:
 
 ```bash
 # One epoch over all 1704 cases to check the complete pipeline first.
-HOOD_MESH_EPOCHS=1 bash submit_mesh_impact_history_1704_no_temporal.sh --time=00:30:00
+HOOD_MESH_EPOCHS=1 bash submit_mesh_impact_history_1704_clusterD.sh --time=00:30:00
 
 # Longer experiment with different held-out designs.
 HOOD_MESH_EPOCHS=200 HOOD_MESH_BATCH_SIZE=8 \
@@ -136,7 +136,7 @@ module and GPU driver, so those logs do not indicate an environment version
 mismatch. Direct Python avoids the failing extra Slurm step for this
 single-process model. The `.out` file now prints `Launch: direct Python in
 Slurm batch allocation` and `Starting dataset and CUDA preflight.` before the
-Python checks. Pull the fix and resubmit with the same ablation command above;
+Python checks. Pull the fix and resubmit with the submission command above;
 no environment reinstall is needed for this launcher change.
 
 The job always selects **euroncap1704**, 1,704 runs, acceleration prediction,
@@ -197,19 +197,28 @@ The saved `splits.json` and `metrics.json` identify the comparison runs:
 
 Compare the new run against the last row. Architecture dimensions, preprocessing,
 training loss, optimizer, seed and training schedule retain the baseline defaults.
-The default model has **1,131,281** parameters, versus **1,263,889** with temporal
-attention. This experiment measures the effect of removing temporal attention;
+The ablation has **1,131,281** parameters, versus **1,263,889** in the default
+temporal model. This experiment measures the effect of removing temporal attention;
 isolating the benefit of global or local attention individually would require
 separate ablations.
 
-For a new temporal baseline on this same split:
+The completed ablation `20260913_000210_3140017_1704` scored HIC15 R² **0.7360**
+against full-resolution simulations, versus **0.7603** for the temporal baseline
+`20260912_005426_3134539_1704` on the same 284 test impacts. HIC RMSE rose from
+**210.53** to **220.95**, and predictions within ±10% fell from **62.0%** to
+**56.0%**. Temporal attention is therefore restored as the training and launcher
+default. The hardest split and direct Python launch fix are retained.
+
+To submit the restored temporal model on this same split:
 
 ```bash
-HOOD_MESH_DECODER=temporal bash submit_mesh_impact_history_1704_clusterD.sh
+bash submit_mesh_impact_history_1704_clusterD.sh
 ```
 
 The generic and cluster-D launchers also default to the hardest split and
-`mesh_only`, but allow explicit environment overrides. Both preflight and
+`temporal`, but allow explicit environment overrides. The dedicated
+`submit_mesh_impact_history_1704_no_temporal.sh` still pins the ablation for
+reproduction, and saved `mesh_only` checkpoints remain loadable. Both preflight and
 training receive the same resolved decoder. The decoder is recorded in
 `config.json`, W&B configuration and training logs. Inference reloads that
 decoder automatically; old configs without this field retain the original
