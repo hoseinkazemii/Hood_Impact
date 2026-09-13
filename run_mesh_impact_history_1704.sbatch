@@ -13,7 +13,7 @@
 #SBATCH --error=mesh_history_1704_%j.err
 
 # Train MeshImpactHistoryNet from scratch on the 1704 acceleration histories.
-# Preferred submission: bash submit_mesh_impact_history_1704.sh
+# Preferred ablation: bash submit_mesh_impact_history_1704_no_temporal.sh
 # Direct sbatch also works when submitted from the repository root.
 # Do not enable nounset: module/conda activation may access unset variables.
 set -eo pipefail
@@ -43,11 +43,11 @@ export WANDB_MODE=${WANDB_MODE:-online}
 export WANDB_PROJECT=${WANDB_PROJECT:-hood-impact-mesh-attention}
 
 DATA_ROOT=${HOOD_MESH_DATA_ROOT:-${PROJECT_DIR}/Data/HoodImpact_1704_EuroNCAP}
-# Cluster-D holdout by default: designs 10 and 11 are the whole of their
-# geometry cluster, so no near-clone of either survives in training. The
-# preflight refuses any split that leaves clones behind.
-read -r -a TEST_DESIGNS <<< "${HOOD_MESH_TEST_DESIGNS:-11}"
-read -r -a VAL_DESIGNS <<< "${HOOD_MESH_VAL_DESIGNS:-10}"
+# Hardest existing split: all of cluster D stays in test, and validation
+# design 5 belongs to cluster B. Preflight rejects test clones in training.
+read -r -a TEST_DESIGNS <<< "${HOOD_MESH_TEST_DESIGNS:-10 11}"
+read -r -a VAL_DESIGNS <<< "${HOOD_MESH_VAL_DESIGNS:-5}"
+DECODER=${HOOD_MESH_DECODER:-mesh_only}
 STAMP=$(date +%Y%m%d_%H%M%S)
 JOB_ID=${SLURM_JOB_ID:-local}
 OUTPUT_DIR=${HOOD_MESH_OUTPUT_DIR:-${PROJECT_DIR}/runs/mesh_impact_history/${STAMP}_${JOB_ID}_1704}
@@ -56,6 +56,7 @@ RUN_NAME=${HOOD_MESH_RUN_NAME:-mesh_history_1704_${JOB_ID}}
 printf 'Node: %s\nPython: %s\nModule: %s\n' "$(hostname)" "${PYTHON_BIN}" "${PYTORCH_MODULE}"
 printf 'Commit: %s\nDataset: %s\nOutput: %s\n' "$(git rev-parse HEAD)" "${DATA_ROOT}" "${OUTPUT_DIR}"
 printf 'Test designs: %s | Validation designs: %s\n' "${TEST_DESIGNS[*]}" "${VAL_DESIGNS[*]}"
+printf 'Decoder arm: %s\n' "${DECODER}"
 printf 'W&B: %s | project: %s | entity: %s\n' "${WANDB_MODE}" "${WANDB_PROJECT}" "${WANDB_ENTITY:-default team}"
 module list 2>&1 || true
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
@@ -63,7 +64,8 @@ nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
 # This validates the exact files used by acceleration training and performs a
 # new-network CUDA forward/backward check before loading all 1704 meshes.
 PREFLIGHT_ARGS=(--data-root "${DATA_ROOT}" --require-cuda
-    --test-designs "${TEST_DESIGNS[@]}" --val-designs "${VAL_DESIGNS[@]}")
+    --test-designs "${TEST_DESIGNS[@]}" --val-designs "${VAL_DESIGNS[@]}"
+    --decoder "${DECODER}")
 if [[ "${HOOD_MESH_ALLOW_CLONE_LEAK:-0}" == "1" ]]; then
     PREFLIGHT_ARGS+=(--allow-clone-leak)
 fi
@@ -77,6 +79,7 @@ TRAIN_ARGS=(
     --impact-coords-path "${DATA_ROOT}/ImpactCoords_1704.csv"
     --acceleration-dir "${DATA_ROOT}/output_history_acc"
     --test-designs "${TEST_DESIGNS[@]}" --val-designs "${VAL_DESIGNS[@]}"
+    --decoder "${DECODER}"
     --device cuda --output-dir "${OUTPUT_DIR}" --run-name "${RUN_NAME}"
     --wandb-mode "${WANDB_MODE}" --wandb-project "${WANDB_PROJECT}"
 )

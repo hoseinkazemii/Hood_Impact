@@ -2,8 +2,8 @@
 
 The mesh is an unordered set of XYZ nodes; no grid or element connectivity is
 required. Every node participates in impact-conditioned attention. A compact
-latent mesh representation drives a joint temporal attention decoder. This
-module is independent of the repository's previous model implementations.
+latent mesh representation drives a decoder with optional temporal attention.
+This module is independent of the repository's previous model implementations.
 
 ``forward`` accepts the flattened batches used by the shared training utilities.
 Time contains output-grid coordinates, never measured acceleration. For the
@@ -86,14 +86,72 @@ class HistoryDecoderBlock(nn.Module):
         return queries + self.dropout(self.feedforward(self.feedforward_norm(queries)))
 
 
+class MeshOnlyDecoderBlock(nn.Module):
+    """Read mesh memory without letting the requested times talk to each other.
+
+    The ablation of :class:`HistoryDecoderBlock`: identical except that the
+    temporal self-attention stage is gone. Every output uses the mesh memory,
+    impact location and its own time, without mixing across requested times.
+    It isolates what the impact-conditioned global+local mesh attention carries
+    on its own.
+
+    Retained submodules keep their original names, so the ablated state-dict
+    keys are a strict subset of the full model's keys.
+    """
+
+    def __init__(self, width: int, num_heads: int, dropout: float):
+        super().__init__()
+        self.query_norm = nn.LayerNorm(width)
+        self.memory_norm = nn.LayerNorm(width)
+        self.cross_attention = nn.MultiheadAttention(
+            width, num_heads, dropout=dropout, batch_first=True
+        )
+        self.feedforward_norm = nn.LayerNorm(width)
+        self.feedforward = nn.Sequential(
+            nn.Linear(width, 4 * width),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(4 * width, width),
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, queries: Tensor, memory: Tensor, padding_mask: Tensor) -> Tensor:
+        # Keep the common decoder interface. All operations are independent
+        # across queries, so padded times cannot affect real predictions.
+        del padding_mask
+        normalized_memory = self.memory_norm(memory)
+        update = self.cross_attention(
+            self.query_norm(queries), normalized_memory, normalized_memory,
+            need_weights=False,
+        )[0]
+        queries = queries + self.dropout(update)
+        return queries + self.dropout(self.feedforward(self.feedforward_norm(queries)))
+
+
+# The decoder arms, selected by the ``decoder`` keyword. "temporal" is the
+# original network; "mesh_only" is the temporal-attention ablation.
+DECODER_BLOCKS = {"temporal": HistoryDecoderBlock, "mesh_only": MeshOnlyDecoderBlock}
+
+
 class MeshImpactHistoryNet(nn.Module):
-    """Impact-conditioned full-mesh attention followed by temporal attention.
+    """Impact-conditioned full-mesh attention, then a mesh-reading decoder.
 
     Half of the learned mesh queries have unrestricted global attention. The
     remaining queries learn different radial preferences around the impact XY
     location. Both banks see every node, preserving the original irregular mesh.
     Attention costs O(N * L) for N nodes and L latent tokens; an N-by-N mesh
-    attention matrix is never constructed. Temporal attention costs O(T * T).
+    attention matrix is never constructed.
+
+    ``decoder`` selects the arm:
+
+    * ``"temporal"`` (default) -- the original network. Each decoder block
+      cross-attends to the mesh memory and then runs self-attention across the
+      requested times, at O(T * T).
+    * ``"mesh_only"`` -- the temporal-attention ablation. The blocks keep the
+      cross-attention to mesh memory but never mix along time, so each time
+      point is decoded from the geometry, impact location and its own time.
+      Use it to ask what the global+local mesh attention carries without
+      temporal coupling.
 
     All trainable weights are new. Only linear layers, attention, normalization,
     activations and dropout are used; there are no convolution layers.
@@ -107,6 +165,7 @@ class MeshImpactHistoryNet(nn.Module):
         latent_layers: int = 3,
         temporal_layers: int = 2,
         dropout: float = 0.1,
+        decoder: str = "temporal",
     ):
         super().__init__()
         integer_options = {
@@ -122,7 +181,12 @@ class MeshImpactHistoryNet(nn.Module):
             raise ValueError("num_latents must be at least 2 for global and local queries")
         if not math.isfinite(dropout) or not 0 <= dropout < 1:
             raise ValueError("dropout must be in [0, 1)")
+        # isinstance first: a bare membership test on an unhashable value would
+        # raise TypeError instead of the intended ValueError.
+        if not isinstance(decoder, str) or decoder not in DECODER_BLOCKS:
+            raise ValueError(f"decoder must be one of {sorted(DECODER_BLOCKS)}")
 
+        self.decoder = decoder
         self.width = width
         self.num_heads = num_heads
         self.num_latents = num_latents
@@ -165,8 +229,12 @@ class MeshImpactHistoryNet(nn.Module):
         self.time_embedding = nn.Sequential(
             nn.Linear(5, width), nn.GELU(), nn.Linear(width, width),
         )
+        # temporal_layers is the decoder depth: how many times the time queries
+        # re-read the mesh memory. Under decoder="mesh_only" that is all it is,
+        # since those blocks carry no temporal attention. The name is kept so
+        # saved configs and existing checkpoints keep replaying by keyword.
         self.decoder_blocks = nn.ModuleList([
-            HistoryDecoderBlock(width, num_heads, dropout)
+            DECODER_BLOCKS[decoder](width, num_heads, dropout)
             for _ in range(temporal_layers)
         ])
         self.acceleration_head = nn.Sequential(

@@ -23,6 +23,8 @@ import torch
 from train_mesh_impact_history import (
     Config,
     DataPreprocessor,
+    DECODER_BLOCKS,
+    MODEL_DEFAULTS,
     MeshImpactHistoryNet,
     resolve_splits,
     validate_data,
@@ -189,8 +191,8 @@ def validate_runtime(require_cuda):
         raise ValueError("CUDA was requested but is unavailable in this Python environment")
 
 
-def validate_cuda_model(data):
-    """Exercise the new model's attention and learned spatial-bias gradients."""
+def validate_cuda_model(data, decoder=MODEL_DEFAULTS["decoder"]):
+    """Exercise the selected decoder and learned spatial-bias gradients."""
     # Standardize this one example only for numerical stability in the probe.
     # These temporary statistics never reach training or a saved checkpoint.
     mesh = np.asarray(data["mesh_geometries"][0], dtype=np.float32)
@@ -205,7 +207,7 @@ def validate_cuda_model(data):
     time = torch.as_tensor((time - time.mean()) / max(float(time.std()), 1e-6), device="cuda")
     model = MeshImpactHistoryNet(
         width=16, num_heads=2, num_latents=4, latent_layers=1,
-        temporal_layers=1, dropout=0.0,
+        temporal_layers=1, dropout=0.0, decoder=decoder,
     ).to("cuda")
     prediction = model(
         mesh=mesh,
@@ -224,15 +226,16 @@ def validate_cuda_model(data):
     ):
         raise ValueError("CUDA model probe produced missing spatial-bias or nonfinite gradients")
     torch.cuda.synchronize()
-    print(f"GPU: {torch.cuda.get_device_name(0)} | new-model forward/backward: passed")
+    print(f"GPU: {torch.cuda.get_device_name(0)} | decoder={decoder} forward/backward: passed")
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", default=DEFAULT_DATA_ROOT)
     parser.add_argument("--require-cuda", action="store_true")
-    parser.add_argument("--test-designs", type=int, nargs="+", default=[11])
-    parser.add_argument("--val-designs", type=int, nargs="+", default=[10])
+    parser.add_argument("--test-designs", type=int, nargs="+", default=[10, 11])
+    parser.add_argument("--val-designs", type=int, nargs="+", default=[5])
+    parser.add_argument("--decoder", choices=sorted(DECODER_BLOCKS), default=MODEL_DEFAULTS["decoder"])
     parser.add_argument("--allow-clone-leak", action="store_true",
                         help="Permit a holdout that leaves near-clones of a held-out "
                              "design in training. Scores from such a run measure "
@@ -259,7 +262,7 @@ def main(argv=None):
         root, impact_xy = validate_dataset(args.data_root)
         data, source_count, cutoff_count = validate_first_run(root, impact_xy)
         if args.require_cuda:
-            validate_cuda_model(data)
+            validate_cuda_model(data, decoder=args.decoder)
         print(f"Dataset: {root} | {NUM_RUNS} mesh/history pairs and impact XY rows")
         for name, split in splits.items():
             print(f"{name}: designs={split['design_ids']} | runs={len(split['run_numbers'])}")

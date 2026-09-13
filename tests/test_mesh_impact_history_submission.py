@@ -1,6 +1,9 @@
 """Checks for complete 1704-job inputs and the launcher's preflight contract."""
 
 from pathlib import Path
+import os
+import shutil
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -9,9 +12,32 @@ import numpy as np
 import pandas as pd
 
 import preflight_mesh_impact_history_1704 as preflight
+import train_mesh_impact_history as training
 
 
 class SubmissionSplitTests(unittest.TestCase):
+    def test_defaults_match_hardest_existing_split_and_ablation(self):
+        for parse in (preflight.parse_args, training.parse_args):
+            args = parse([])
+            self.assertEqual(args.decoder, "mesh_only")
+            self.assertEqual(args.test_designs, [10, 11])
+            self.assertEqual(args.val_designs, [5])
+        splits = preflight.validate_splits([10, 11], [5])
+        self.assertEqual(splits["train"]["design_ids"], [0, 1, 2, 3, 4, 6, 7, 8, 9])
+        self.assertEqual(len(splits["train"]["run_numbers"]), 1278)
+        self.assertEqual(splits["validation"]["run_numbers"], list(range(711, 853)))
+        self.assertEqual(splits["test"]["run_numbers"], list(range(1421, 1705)))
+        held_clusters, warnings = preflight.validate_cluster_holdout([10, 11], [5])
+        self.assertEqual(held_clusters, ["D"])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("cluster B", warnings[0])
+
+    def test_rejects_test_geometry_clones_in_training(self):
+        for test, validation in (([2], [10]), ([11], [5])):
+            with self.subTest(test=test, validation=validation):
+                with self.assertRaisesRegex(ValueError, "near-clones in training"):
+                    preflight.validate_cluster_holdout(test, validation)
+
     def test_complete_mapping_and_design_boundaries(self):
         splits = preflight.validate_splits([2], [10])
         self.assertEqual(len(splits["train"]["run_numbers"]), 1420)
@@ -37,6 +63,82 @@ class SubmissionSplitTests(unittest.TestCase):
             with self.subTest(test=test, validation=validation):
                 with self.assertRaises(ValueError):
                     preflight.validate_splits(test, validation)
+
+
+class SubmissionLauncherTests(unittest.TestCase):
+    """Run the real launchers with local stand-ins for Slurm and modules."""
+
+    def setUp(self):
+        git_bash = Path("C:/Program Files/Git/bin/bash.exe")
+        self.bash = str(git_bash) if git_bash.is_file() else shutil.which("bash")
+        if not self.bash:
+            self.skipTest("Bash unavailable")
+        temporary = tempfile.TemporaryDirectory(prefix="mesh_launcher_")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.repo = Path(__file__).resolve().parents[1]
+        self.bin_dir = self.root / "bin"
+        self.bin_dir.mkdir()
+        self.env = {key: value for key, value in os.environ.items()
+                    if not key.startswith("HOOD_MESH_")}
+        self.env["SLURM_SUBMIT_DIR"] = self.shell_path(self.repo)
+        venv_bin = self.root / "venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        (venv_bin / "activate").write_text(":\n", encoding="utf-8")
+        self.env["HOOD_MESH_VENV"] = self.shell_path(venv_bin.parent)
+        for name in ("module", "nvidia-smi", "python"):
+            self.stub(name, ":\n")
+        self.stub("srun", "printf 'SRUN'; printf ' <%s>' \"$@\"; printf '\\n'\n")
+        self.stub("sbatch", """printf 'DECODER=%s\\nTEST=%s\\nVAL=%s\\nLEAK=%s\\n' \\
+    "$HOOD_MESH_DECODER" "$HOOD_MESH_TEST_DESIGNS" "$HOOD_MESH_VAL_DESIGNS" "$HOOD_MESH_ALLOW_CLONE_LEAK"
+printf 'ARG=%s\\n' "$@"
+""")
+
+    @staticmethod
+    def shell_path(path):
+        text = path.as_posix()
+        return f"/{text[0].lower()}{text[2:]}" if os.name == "nt" else text
+
+    def stub(self, name, body):
+        path = self.bin_dir / name
+        path.write_text("#!/usr/bin/env bash\n" + body, encoding="utf-8", newline="\n")
+        path.chmod(0o755)
+
+    def launch(self, script, extra_args=()):
+        result = subprocess.run(
+            [self.bash, "-c", 'export PATH="$1:$PATH"; shift; bash "$@"',
+             "launcher-test", self.shell_path(self.bin_dir),
+             self.shell_path(self.repo / script), *extra_args],
+            env=self.env, capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result.stdout
+
+    def test_ablation_launcher_pins_hardest_split_despite_old_environment(self):
+        self.env.update(HOOD_MESH_DECODER="temporal", HOOD_MESH_TEST_DESIGNS="2",
+                        HOOD_MESH_VAL_DESIGNS="10", HOOD_MESH_ALLOW_CLONE_LEAK="1")
+        output = self.launch("submit_mesh_impact_history_1704_no_temporal.sh", ["--time=00:10:00"])
+        for expected in ("DECODER=mesh_only", "TEST=10 11", "VAL=5", "LEAK=0",
+                         "ARG=--time=00:10:00", "run_mesh_impact_history_1704.sbatch"):
+            self.assertIn(expected, output)
+
+    def test_cluster_launcher_defaults_to_hardest_ablation(self):
+        output = self.launch("submit_mesh_impact_history_1704_clusterD.sh")
+        for expected in ("DECODER=mesh_only", "TEST=10 11", "VAL=5"):
+            self.assertIn(expected, output)
+
+    def test_batch_forwards_same_decoder_and_split_to_preflight_and_training(self):
+        for decoder in ("", "temporal"):
+            with self.subTest(decoder=decoder):
+                self.env["HOOD_MESH_DECODER"] = decoder
+                output = self.launch("run_mesh_impact_history_1704.sbatch")
+                commands = [line for line in output.splitlines() if line.startswith("SRUN")]
+                self.assertEqual(len(commands), 2, output)
+                self.assertIn("preflight_mesh_impact_history_1704.py", commands[0])
+                self.assertIn("train_mesh_impact_history.py", commands[1])
+                for command in commands:
+                    self.assertIn(f"<--decoder> <{decoder or 'mesh_only'}>", command)
+                    self.assertIn("<--test-designs> <10> <11> <--val-designs> <5>", command)
 
 
 class SubmissionDataTests(unittest.TestCase):

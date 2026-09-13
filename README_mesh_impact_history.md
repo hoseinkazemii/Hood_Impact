@@ -11,8 +11,12 @@ The architecture projects each node's coordinates and impact-relative geometry
 into features. Impact-conditioned latent queries attend to all mesh nodes;
 global queries and queries with learned distance priors describe the whole hood
 and the impact neighborhood. Attention among the latent tokens combines their
-information. Sampled output-time queries attend to those tokens, then temporal
-self-attention couples the predicted history before a scalar output head.
+information. Sampled output-time queries attend to those tokens, then a scalar
+head predicts acceleration independently at each requested time. New training
+defaults to `--decoder mesh_only`, which removes temporal self-attention while
+keeping global/local mesh attention, latent-token attention, decoder
+cross-attention and position-wise feedforward layers. `--decoder temporal`
+restores the original decoder's self-attention across output times.
 The output times specify the fixed prediction grid; measured acceleration is
 only a training target and is never a network input. Full mesh-to-mesh attention
 is avoided by using a small latent set. Mesh node order does not define a spatial
@@ -45,14 +49,16 @@ Defaults for data format, paths, sample count, epochs, batch size, learning rate
 and time subsampling come from the current `utils.utils.Config`. The current
 default dataset is `industrylike`. Acceleration prediction is always selected.
 The new architecture defaults are width 128, 4 attention heads, 32 latent tokens,
-3 latent attention layers, 2 temporal layers, and dropout 0.1.
+3 latent attention layers, 2 decoder layers, dropout 0.1, and `decoder=mesh_only`.
+The depth flag remains `--temporal-layers` for checkpoint compatibility; with
+`mesh_only`, it counts mesh cross-attention blocks and adds no temporal attention.
 
 ```powershell
-python train_mesh_impact_history.py --data-format euroncap1704 --test-designs 2 --val-designs 10 --epochs 100 --batch-size 8 --lr 0.0003 --device cuda --output-dir runs/mesh_impact_history/euroncap_01
+python train_mesh_impact_history.py --data-format euroncap1704 --test-designs 10 11 --val-designs 5 --decoder mesh_only --epochs 100 --batch-size 8 --lr 0.0003 --device cuda --output-dir runs/mesh_impact_history/euroncap_01
 ```
 
 Design IDs are **zero based**: `(run_number - 1) // samples_per_design`.
-The defaults reserve design 2 for testing and design 10 for validation.
+The defaults reserve designs 10 and 11 for testing and design 5 for validation.
 For `industrylike`, one run is one design; for `euroncap1704`, each design has
 142 runs; for `legacy`, each design has 50 runs. All other loaded designs train
 the model. Validation/test designs must be disjoint, must have loaded runs,
@@ -63,7 +69,7 @@ Path overrides: `--inp-dir`, `--impact-coords-path`, `--acceleration-dir`,
 and, for the legacy CSV format, `--mesh-geometry-dir` and `--doe-path`.
 Additional options include `--num-samples`, `--samples-per-design`,
 `--max-train-time`, `--weight-decay`, `--seed`, `--width`, `--num-heads`,
-`--num-latents`, `--latent-layers`, `--temporal-layers`, and `--dropout`.
+`--num-latents`, `--latent-layers`, `--temporal-layers`, `--dropout`, and `--decoder`.
 Run `python train_mesh_impact_history.py --help` for all options.
 Tracking options inherit `WANDB_MODE`, `WANDB_PROJECT`, and `WANDB_ENTITY`;
 explicit `--wandb-mode`, `--wandb-project`, and `--wandb-entity` take precedence.
@@ -84,11 +90,12 @@ the repository root:
 ```bash
 git fetch origin
 git switch agent/mesh-impact-history-1704
+git pull --ff-only origin agent/mesh-impact-history-1704
 bash -l setup_mesh_impact_history_env.sh
 module load "${HOOD_MESH_PYTORCH_MODULE:-python/miniforge3_pytorch/2.10.0}"
 source "${HOOD_MESH_VENV:-.venv-mesh-history}/bin/activate"
 python -m wandb login
-bash submit_mesh_impact_history_1704.sh
+bash submit_mesh_impact_history_1704_no_temporal.sh
 ```
 
 The setup script creates a Linux-native `.venv-mesh-history` overlay using
@@ -99,24 +106,24 @@ both setup and submission if you use a different module or environment path.
 For example, an environment on scratch can be selected with
 `export HOOD_MESH_VENV=/work/nvme/<account>/$USER/hood-mesh-history`.
 
-`submit_mesh_impact_history_1704.sh` creates `runs/slurm` before submitting
+`submit_mesh_impact_history_1704_no_temporal.sh` creates `runs/slurm` before submitting
 `run_mesh_impact_history_1704.sbatch`. The job requests one GPU, 16 CPU cores,
 96 GB host memory, and six hours on `ghx4`, account `bbqg-dtai-gh`. Additional
 submission-script arguments go to `sbatch`, so resources can be overridden:
 
 ```bash
 # One epoch over all 1704 cases to check the complete pipeline first.
-HOOD_MESH_EPOCHS=1 bash submit_mesh_impact_history_1704.sh --time=00:30:00
+HOOD_MESH_EPOCHS=1 bash submit_mesh_impact_history_1704_no_temporal.sh --time=00:30:00
 
 # Longer experiment with different held-out designs.
 HOOD_MESH_EPOCHS=200 HOOD_MESH_BATCH_SIZE=8 \
-HOOD_MESH_TEST_DESIGNS=7 HOOD_MESH_VAL_DESIGNS=3 \
+HOOD_MESH_TEST_DESIGNS="6 7 8 9" HOOD_MESH_VAL_DESIGNS="4 5" \
 bash submit_mesh_impact_history_1704.sh --time=08:00:00
 ```
 
 The job always selects **euroncap1704**, 1,704 runs, acceleration prediction,
-and 142 cases per design. Default test design 2 and validation design 10 give
-**1,420 training / 142 validation / 142 test** cases. Epochs, batch size, learning
+and 142 cases per design. Default test designs 10 and 11 and validation design 5
+give **1,278 training / 142 validation / 284 test** cases. Epochs, batch size, learning
 rate, and time stride inherit the current Python configuration (currently
 100 epochs, batch 8, LR 0.0003, stride 16). There is no launcher time-stride
 override. W&B defaults to online and uses the credentials saved by the login
@@ -152,11 +159,51 @@ The existing dataset analysis identifies near-clone geometry groups
 `[0,1,2,3]`, `[4,5]`, `[6,7,8,9]`, and `[10,11]`; hold out whole groups when
 measuring generalization to different geometry.
 
+### Temporal-attention ablation on the hardest existing split
+
+The dedicated `submit_mesh_impact_history_1704_no_temporal.sh` launcher pins
+`decoder=mesh_only`, test designs **10,11** and validation design **5**, even if
+older split/decoder settings are exported in the shell. Training includes all
+142 impact locations for each of designs **0,1,2,3,4,6,7,8,9**. Cluster D appears
+only in test, so validation-based checkpoint selection does not see it.
+Validation design 5 still shares cluster B with training design 4; preflight
+reports that limitation, matching the existing baseline exactly.
+
+The saved `splits.json` and `metrics.json` identify the comparison runs:
+
+| Run | Validation | Test | Acceleration R² | RMSE (g) |
+| --- | --- | --- | --- | --- |
+| `20260904_220022_3086980_1704` (test clones in training) | 10 | 2 | 0.92749 | 11.0542 |
+| `20260912_004325_3134499_1704` | 10 | 11 | 0.83090 | 17.6786 |
+| `20260912_005426_3134539_1704` (ablation baseline) | 5 | 10,11 | 0.82170 | 18.4398 |
+
+Compare the new run against the last row. Architecture dimensions, preprocessing,
+training loss, optimizer, seed and training schedule retain the baseline defaults.
+The default model has **1,131,281** parameters, versus **1,263,889** with temporal
+attention. This experiment measures the effect of removing temporal attention;
+isolating the benefit of global or local attention individually would require
+separate ablations.
+
+For a new temporal baseline on this same split:
+
+```bash
+HOOD_MESH_DECODER=temporal bash submit_mesh_impact_history_1704_clusterD.sh
+```
+
+The generic and cluster-D launchers also default to the hardest split and
+`mesh_only`, but allow explicit environment overrides. Both preflight and
+training receive the same resolved decoder. The decoder is recorded in
+`config.json`, W&B configuration and training logs. Inference reloads that
+decoder automatically; old configs without this field retain the original
+temporal architecture and load their checkpoints strictly.
+
 Other optional environment overrides use the `HOOD_MESH_` prefix:
 `LR`, `WEIGHT_DECAY`, `SEED`, `WIDTH`, `NUM_HEADS`, `NUM_LATENTS`, `LATENT_LAYERS`,
-`TEMPORAL_LAYERS`, `DROPOUT`, `OUTPUT_DIR`, and `RUN_NAME`. Default result folders
+`TEMPORAL_LAYERS`, `DROPOUT`, `DECODER`, `OUTPUT_DIR`, and `RUN_NAME`. Default result folders
 are `runs/mesh_impact_history/<timestamp>_<jobid>_1704`; scheduler logs are
-`runs/slurm/mesh_history_1704_<jobid>.out` and `.err`. The logs include the Git
+`runs/slurm/mesh_history_1704_<jobid>.out` and `.err` for the generic launcher,
+or `mesh_history_1704_no_temporal_<jobid>.out` and `.err` for the ablation.
+The logs include the Git
 commit, resolved interpreter, dataset path, and complete training command.
 
 ## Time grid and inputs
@@ -198,8 +245,10 @@ np.savetxt("prediction.csv", np.column_stack([time, acceleration_g]),
 No measured response is needed for inference. For another run's output grid,
 pass `sampled_time_points=already_subsampled_times` to `predict`. Those values
 must already have the intended cutoff and stride; the predictor does not slice
-them again. Because the temporal decoder couples time queries, use the complete
-intended output grid together. Accuracy on new geometry or time ranges must be
+them again. For `temporal` checkpoints, use the complete intended output grid
+together because that decoder couples time queries. For `mesh_only` checkpoints,
+a time point's prediction is independent of the other requested times.
+Accuracy on new geometry or time ranges must be
 established with held-out data.
 
 ## Saved results
@@ -253,12 +302,17 @@ The original config and checkpoint remain unchanged.
 ## Validation
 
 ```powershell
-python -m pytest tests/test_mesh_impact_history.py -q
+python -m pytest tests/test_mesh_impact_history.py tests/test_mesh_impact_history_submission.py tests/test_mesh_history_reporting.py -q
 ```
 
 Tests cover node-order invariance, variable batches and history lengths,
 geometry/impact sensitivity, gradients, mixed precision, coordinate alignment,
 the existing time stride, and a complete one-epoch training/checkpoint/inference
-cycle with training-only scalers. A separate one-epoch CUDA smoke run on 12 real
-industrylike cases completed with the default architecture and stride 16. This
-checks execution; predictive accuracy still requires a full training run.
+cycle for both decoder variants with training-only scalers. Ablation checks cover
+zero coupling between distinct time queries, CUDA gradients, legacy checkpoint
+reload, the exact cluster-D split, and launchers with simulated Slurm commands.
+The ablation also passed the real 1704-dataset preflight and a CUDA
+forward/backward probe on its first 38,977-node mesh with 63 sampled times.
+A previous one-epoch CUDA smoke run on 12 real industrylike cases used the
+original temporal architecture and stride 16. These checks establish execution;
+predictive accuracy still requires a full training run.

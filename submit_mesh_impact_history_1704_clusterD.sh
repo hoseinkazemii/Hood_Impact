@@ -1,22 +1,18 @@
 #!/usr/bin/env bash
 # Cluster-D holdout run of MeshImpactHistoryNet on the 1704 EuroNCAP set.
 #
-#   train      designs 0-9   (geometry clusters A, B, C)
-#   validation design 10     (cluster D)
-#   test       design 11     (cluster D)
+#   train      designs 0,1,2,3,4,6,7,8,9   (geometry clusters A, B, C)
+#   validation design 5                    (cluster B)
+#   test       designs 10,11               (whole cluster D)
+#   decoder    mesh_only (no temporal self-attention)
 #
-# Designs 10 and 11 are the only members of their geometry cluster, so training
-# keeps no near-identical copy of either. That is the point of this run: under
-# the previous single-design holdout the test design's clones stayed in
-# training, and the reported score largely measured duplicate retrieval. The
-# preflight now refuses any split that leaves clones behind.
+# Match the hardest existing run, 20260912_005426_3134539_1704: checkpoint
+# selection never sees cluster D. Preflight rejects test clones in training
+# and warns that validation design 5 shares cluster B with training design 4.
 #
-# Stricter variant -- validate outside cluster D so checkpoint selection never
-# sees a clone of the test geometry, at the cost of a noisier validation signal:
-#   HOOD_MESH_VAL_DESIGNS="5" HOOD_MESH_TEST_DESIGNS="10 11" \
-#       bash submit_mesh_impact_history_1704_clusterD.sh
-# The preflight warns that design 4 stays in training beside validation design
-# 5, and proceeds: only a clone of a *test* design invalidates the score.
+# To repeat the temporal baseline with this same split:
+#   HOOD_MESH_DECODER=temporal bash submit_mesh_impact_history_1704_clusterD.sh
+# For the pinned ablation use submit_mesh_impact_history_1704_no_temporal.sh.
 #
 # Submit from any directory; extra arguments are forwarded to sbatch.
 #   bash submit_mesh_impact_history_1704_clusterD.sh
@@ -30,13 +26,15 @@ if ! command -v sbatch >/dev/null 2>&1; then
     exit 127
 fi
 
-export HOOD_MESH_TEST_DESIGNS="${HOOD_MESH_TEST_DESIGNS:-11}"
-export HOOD_MESH_VAL_DESIGNS="${HOOD_MESH_VAL_DESIGNS:-10}"
-export HOOD_MESH_RUN_NAME="${HOOD_MESH_RUN_NAME:-mesh_history_1704_clusterD}"
+export HOOD_MESH_TEST_DESIGNS="${HOOD_MESH_TEST_DESIGNS:-10 11}"
+export HOOD_MESH_VAL_DESIGNS="${HOOD_MESH_VAL_DESIGNS:-5}"
+export HOOD_MESH_DECODER="${HOOD_MESH_DECODER:-mesh_only}"
+export HOOD_MESH_RUN_NAME="${HOOD_MESH_RUN_NAME:-mesh_history_1704_clusterD_${HOOD_MESH_DECODER}}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_PROJECT="${WANDB_PROJECT:-hood-impact-mesh-attention}"
 
-printf 'Holdout: train designs 0-9 | validation %s | test %s\n' \
+printf 'Decoder arm: %s\n' "${HOOD_MESH_DECODER}"
+printf 'Holdout: validation %s | test %s | training uses remaining designs\n' \
     "${HOOD_MESH_VAL_DESIGNS}" "${HOOD_MESH_TEST_DESIGNS}"
 
 # Slurm opens these paths before the batch script itself starts.

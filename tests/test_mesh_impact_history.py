@@ -54,6 +54,96 @@ class MeshImpactHistoryTests(unittest.TestCase):
         arguments.update(overrides)
         return self.model(**arguments)
 
+    def _decoder_model(self, decoder):
+        torch.manual_seed(38)
+        return MeshImpactHistoryNet(
+            width=16, num_heads=2, num_latents=4, latent_layers=1,
+            temporal_layers=2, dropout=0.0, decoder=decoder,
+        ).eval()
+
+    def test_mesh_only_decoder_removes_every_path_between_time_points(self):
+        """The ablation's defining property: no time point can reach another.
+
+        A permutation test would not discriminate -- attention over a set is
+        permutation-equivariant, so both arms pass it. The gradient of one
+        output with respect to the *other* times is the honest probe, and it
+        is exactly zero rather than merely small.
+        """
+        probe = 3  # belongs to sample 0, which has five time points
+        couplings = {}
+        for decoder in ("temporal", "mesh_only"):
+            model = self._decoder_model(decoder)
+            times = self.time.clone().requires_grad_(True)
+            output = model(self.mesh, self.mesh_batch, self.impact, times,
+                           self.time_batch, batch_size=2)
+            gradient = torch.autograd.grad(output[probe], times)[0]
+            self.assertGreater(gradient[probe].abs().item(), 0.0,
+                               f"{decoder}: the output ignores its own time")
+            off_index = gradient.clone()
+            off_index[probe] = 0.0
+            couplings[decoder] = off_index.abs().max().item()
+        self.assertEqual(couplings["mesh_only"], 0.0)
+        self.assertGreater(couplings["temporal"], 0.0)
+
+    def test_mesh_only_decoder_is_a_strict_subset_of_the_temporal_weights(self):
+        temporal = self._decoder_model("temporal").state_dict()
+        mesh_only = self._decoder_model("mesh_only").state_dict()
+        self.assertEqual(set(mesh_only) - set(temporal), set())
+        removed = set(temporal) - set(mesh_only)
+        self.assertTrue(removed, "the ablation must drop the temporal weights")
+        self.assertTrue(
+            all("time_attention" in name or "time_norm" in name for name in removed),
+            f"only the temporal stage may disappear; got {sorted(removed)}",
+        )
+
+    def test_mesh_only_decoder_keeps_the_other_attentions(self):
+        model = self._decoder_model("mesh_only")
+        for name in ("latent_blocks.0.attention", "decoder_blocks.0.cross_attention"):
+            self.assertIsInstance(dict(model.named_modules())[name], nn.MultiheadAttention)
+        # the impact-conditioned global+local mesh attention is hand-rolled
+        self.assertTrue(hasattr(model, "local_log_precision"))
+        self.assertEqual(model.num_global_latents, 2)
+
+    def test_mesh_only_predictions_do_not_depend_on_other_requested_times(self):
+        model = self._decoder_model("mesh_only")
+        # Include both samples with unequal lengths to exercise time padding.
+        subset = torch.tensor([1, 3, 6])
+        with torch.no_grad():
+            full = model(self.mesh, self.mesh_batch, self.impact, self.time,
+                         self.time_batch, batch_size=2)
+            partial = model(self.mesh, self.mesh_batch, self.impact, self.time[subset],
+                            self.time_batch[subset], batch_size=2)
+        torch.testing.assert_close(partial, full[subset], atol=2e-6, rtol=2e-5)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA unavailable")
+    def test_mesh_only_cuda_backward_reaches_all_retained_parameters(self):
+        model = self._decoder_model("mesh_only").to("cuda").train()
+        prediction = model(
+            self.mesh.to("cuda"), self.mesh_batch.to("cuda"), self.impact.to("cuda"),
+            self.time.to("cuda"), self.time_batch.to("cuda"), batch_size=2,
+        )
+        self.assertTrue(torch.isfinite(prediction).all())
+        prediction.square().mean().backward()
+        for name, parameter in model.named_parameters():
+            with self.subTest(parameter=name):
+                self.assertIsNotNone(parameter.grad)
+                self.assertTrue(torch.isfinite(parameter.grad).all())
+        self.assertGreater(model.local_log_precision.grad.abs().sum().item(), 0.0)
+
+    def test_rejects_an_unknown_decoder(self):
+        for decoder in ("Mesh_Only", "meshonly", "", True, 0, None, ["temporal"], {"a": 1}):
+            with self.subTest(decoder=decoder), self.assertRaises(ValueError):
+                MeshImpactHistoryNet(width=16, num_heads=2, num_latents=4,
+                                     latent_layers=1, temporal_layers=1, decoder=decoder)
+
+    def test_decoder_defaults_to_the_temporal_arm_for_saved_configs(self):
+        """Configs written before the ablation existed must still replay."""
+        legacy = dict(width=16, num_heads=2, num_latents=4, latent_layers=1,
+                      temporal_layers=1, dropout=0.0)
+        self.assertEqual(MeshImpactHistoryNet(**legacy).decoder, "temporal")
+        self.assertIn("time_attention.in_proj_weight",
+                      " ".join(MeshImpactHistoryNet(**legacy).state_dict()))
+
     def test_mesh_node_order_does_not_change_history(self):
         permutation = torch.tensor([9, 2, 12, 0, 6, 14, 4, 7, 11, 1, 10, 5, 13, 3, 8])
         with torch.no_grad():
@@ -246,6 +336,12 @@ class ExistingTimePreprocessingTests(unittest.TestCase):
 
 class TrainingRoundTripTests(unittest.TestCase):
     def test_train_reload_and_predict_keep_sampling_units_and_training_only_scalers(self):
+        self._train_reload_and_predict("temporal")
+
+    def test_mesh_only_train_reload_and_predict(self):
+        self._train_reload_and_predict("mesh_only")
+
+    def _train_reload_and_predict(self, decoder):
         from train_mesh_impact_history import CHECKPOINT_NAME, HistoryPredictor, main
         from utils.utils import Config
 
@@ -294,6 +390,7 @@ class TrainingRoundTripTests(unittest.TestCase):
                 "--batch-size", "2", "--width", "16", "--num-heads", "2",
                 "--num-latents", "4", "--latent-layers", "1", "--temporal-layers", "1",
                 "--dropout", "0", "--device", "cpu", "--wandb-mode", "disabled",
+                "--decoder", decoder,
                 "--output-dir", str(run_dir),
             ])
             self.assertEqual(set(metrics), {"mse", "rmse", "mae", "r2"})
@@ -308,6 +405,7 @@ class TrainingRoundTripTests(unittest.TestCase):
 
             saved = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
             self.assertEqual(saved["architecture"]["name"], "MeshImpactHistoryNet")
+            self.assertEqual(saved["architecture"]["kwargs"]["decoder"], decoder)
             self.assertEqual(saved["preprocessing"]["time_subsample_stride"], Config.time_subsample_stride)
             self.assertEqual(saved["preprocessing"]["acceleration_units"], "g")
             self.assertEqual(saved["training"]["initialization"], "from_scratch")
@@ -320,6 +418,14 @@ class TrainingRoundTripTests(unittest.TestCase):
             self.assertTrue(np.isfinite(history["best_val_loss"]))
 
             predictor = HistoryPredictor.from_run(run_dir)
+            self.assertEqual(predictor.model.decoder, decoder)
+            if decoder == "temporal":
+                # Old run configs omitted the decoder. Strict checkpoint reload
+                # must still reconstruct the original temporal architecture.
+                del saved["architecture"]["kwargs"]["decoder"]
+                (run_dir / "config.json").write_text(json.dumps(saved), encoding="utf-8")
+                predictor = HistoryPredictor.from_run(run_dir)
+                self.assertEqual(predictor.model.decoder, "temporal")
             stride = Config.time_subsample_stride
             expected_times = raw_times[::stride]
             np.testing.assert_allclose(predictor.time_points, expected_times, rtol=1e-6, atol=1e-9)

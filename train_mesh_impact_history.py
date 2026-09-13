@@ -18,7 +18,7 @@ import pandas as pd
 import torch
 import wandb
 
-from mesh_impact_history import MeshImpactHistoryNet
+from mesh_impact_history import DECODER_BLOCKS, MeshImpactHistoryNet
 from mesh_impact_history_reporting import export_training_history_plot
 from utils.utils import (
     Config,
@@ -38,6 +38,9 @@ MODEL_DEFAULTS = {
     "latent_layers": 3,
     "temporal_layers": 2,
     "dropout": 0.1,
+    # New training uses the ablation; the model constructor retains the legacy
+    # default so saved configs without a decoder still load their original net.
+    "decoder": "mesh_only",
 }
 CHECKPOINT_NAME = "hood_impact_best_model.pt"  # Filename used by shared Trainer.
 
@@ -49,12 +52,10 @@ def parse_args(argv=None):
         parser.add_argument(f"--{name}")
     parser.add_argument("--num-samples", type=int)
     parser.add_argument("--samples-per-design", type=int)
-    # Cluster-D holdout: designs 10 and 11 are the only members of their
-    # geometry cluster, so training keeps no near-clone of either. A
-    # single-design holdout leaves clones behind and scores retrieval, not
-    # physics -- see preflight_mesh_impact_history_1704.py.
-    parser.add_argument("--test-designs", type=int, nargs="+", default=[11], help="Zero-based design IDs.")
-    parser.add_argument("--val-designs", type=int, nargs="+", default=[10], help="Zero-based design IDs.")
+    # Keep all of cluster D in test, including during validation-based
+    # checkpoint selection. Match the hardest existing run (validation 5).
+    parser.add_argument("--test-designs", type=int, nargs="+", default=[10, 11], help="Zero-based design IDs.")
+    parser.add_argument("--val-designs", type=int, nargs="+", default=[5], help="Zero-based design IDs.")
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--lr", type=float)
@@ -63,7 +64,12 @@ def parse_args(argv=None):
     parser.add_argument("--max-train-time", type=float, help="Optional cutoff before the configured time stride is applied.")
     parser.add_argument("--device", help="PyTorch device, e.g. cpu, cuda, or cuda:0.")
     for key, default in MODEL_DEFAULTS.items():
-        parser.add_argument(f"--{key.replace('_', '-')}", type=type(default), default=default)
+        if key != "decoder":
+            parser.add_argument(f"--{key.replace('_', '-')}", type=type(default), default=default)
+    parser.add_argument(
+        "--decoder", choices=sorted(DECODER_BLOCKS), default=MODEL_DEFAULTS["decoder"],
+        help="mesh_only removes temporal self-attention; temporal restores the original baseline.",
+    )
     parser.add_argument("--output-dir", help="New run directory; defaults to runs/mesh_impact_history/<timestamp>.")
     parser.add_argument(
         "--wandb-mode", choices=["disabled", "offline", "online"],
