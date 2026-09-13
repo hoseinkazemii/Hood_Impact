@@ -71,6 +71,20 @@ class TrainingHistoryReportingTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             reporting.load_history(self.root)
 
+    def test_combined_objective_is_preserved_but_plot_compares_acceleration_mse(self):
+        (self.root / "training_history.csv").write_text(
+            "epoch,train_mse_normalized,validation_mse_normalized,train_objective,train_design_difference_mse,train_design_pairs\n"
+            "1,0.4,0.5,0.9,0.5,575\n2,0.2,0.3,0.5,0.3,571\n", encoding="utf-8",
+        )
+        history = reporting.load_history(self.root)
+        self.assertEqual(history["train_losses"], [0.9, 0.5])
+        self.assertEqual(history["train_mse_losses"], [0.4, 0.2])
+        fig, ax = plt.subplots()
+        with mock.patch.object(reporting.plt, "subplots", return_value=(fig, ax)):
+            reporting.export_training_history_plot(history, self.root)
+        np.testing.assert_array_equal(ax.lines[0].get_ydata(), [0.4, 0.2])
+        np.testing.assert_array_equal(ax.lines[1].get_ydata(), [0.5, 0.3])
+
     def test_cli_exports_existing_run_without_uploading_by_default(self):
         (self.root / "training_history.json").write_text(json.dumps(self.history), encoding="utf-8")
         with mock.patch.object(reporting, "upload_saved_run") as upload:

@@ -41,7 +41,7 @@ DEFAULT_DATA_ROOT = "Data/HoodImpact_1704_EuroNCAP"
 # cluster the surfaces agree to 0.06 mm, between clusters they differ by at
 # least 2.13 mm. Holding out one design while its clones stay in training makes
 # the test score measure duplicate retrieval instead of learned physics.
-GEOMETRY_CLUSTERS = {"A": (0, 1, 2, 3), "B": (4, 5), "C": (6, 7, 8, 9), "D": (10, 11)}
+from mesh_design_sensitivity import GEOMETRY_CLUSTERS
 
 
 def validate_cluster_holdout(test_designs, val_designs):
@@ -191,7 +191,7 @@ def validate_runtime(require_cuda):
         raise ValueError("CUDA was requested but is unavailable in this Python environment")
 
 
-def validate_cuda_model(data, decoder=MODEL_DEFAULTS["decoder"]):
+def validate_cuda_model(data, decoder=MODEL_DEFAULTS["decoder"], **neighborhood_options):
     """Exercise the selected decoder and learned spatial-bias gradients."""
     # Standardize this one example only for numerical stability in the probe.
     # These temporary statistics never reach training or a saved checkpoint.
@@ -207,8 +207,9 @@ def validate_cuda_model(data, decoder=MODEL_DEFAULTS["decoder"]):
     time = torch.as_tensor((time - time.mean()) / max(float(time.std()), 1e-6), device="cuda")
     model = MeshImpactHistoryNet(
         width=16, num_heads=2, num_latents=4, latent_layers=1,
-        temporal_layers=1, dropout=0.0, decoder=decoder,
+        temporal_layers=1, dropout=0.0, decoder=decoder, **neighborhood_options,
     ).to("cuda")
+    model.set_coordinate_scalers(mean, scale, mean[:2], scale[:2])
     prediction = model(
         mesh=mesh,
         mesh_batch=torch.zeros(len(mesh), device="cuda", dtype=torch.long),
@@ -225,8 +226,11 @@ def validate_cuda_model(data, decoder=MODEL_DEFAULTS["decoder"]):
         torch.isfinite(gradient).all() for gradient in gradients
     ):
         raise ValueError("CUDA model probe produced missing spatial-bias or nonfinite gradients")
+    if any(parameter.grad is None for parameter in model.neighborhood_blocks.parameters()):
+        raise ValueError("CUDA model probe produced missing neighborhood gradients")
     torch.cuda.synchronize()
-    print(f"GPU: {torch.cuda.get_device_name(0)} | decoder={decoder} forward/backward: passed")
+    print(f"GPU: {torch.cuda.get_device_name(0)} | decoder={decoder} | "
+          f"neighborhood_layers={len(model.neighborhood_blocks)} forward/backward: passed")
 
 
 def parse_args(argv=None):
@@ -236,6 +240,11 @@ def parse_args(argv=None):
     parser.add_argument("--test-designs", type=int, nargs="+", default=[10, 11])
     parser.add_argument("--val-designs", type=int, nargs="+", default=[5])
     parser.add_argument("--decoder", choices=sorted(DECODER_BLOCKS), default=MODEL_DEFAULTS["decoder"])
+    for key, default in MODEL_DEFAULTS.items():
+        if key.startswith("neighborhood_"):
+            parser.add_argument(f"--{key.replace('_', '-')}", type=type(default), default=default)
+    parser.add_argument("--design-difference-weight", type=float, default=0.0)
+    parser.add_argument("--batch-size", type=int, default=Config.batch_size)
     parser.add_argument("--allow-clone-leak", action="store_true",
                         help="Permit a holdout that leaves near-clones of a held-out "
                              "design in training. Scores from such a run measure "
@@ -247,6 +256,10 @@ def main(argv=None):
     args = parse_args(argv)
     try:
         validate_runtime(args.require_cuda)
+        if not np.isfinite(args.design_difference_weight) or args.design_difference_weight < 0:
+            raise ValueError("design_difference_weight must be finite and nonnegative")
+        if args.design_difference_weight and (args.batch_size < 2 or args.batch_size % 2):
+            raise ValueError("Design sensitivity requires an even batch_size >= 2")
         splits = validate_splits(args.test_designs, args.val_designs)
         if args.allow_clone_leak:
             print("Cluster check: SKIPPED (--allow-clone-leak); scores may measure retrieval")
@@ -262,7 +275,9 @@ def main(argv=None):
         root, impact_xy = validate_dataset(args.data_root)
         data, source_count, cutoff_count = validate_first_run(root, impact_xy)
         if args.require_cuda:
-            validate_cuda_model(data, decoder=args.decoder)
+            validate_cuda_model(data, decoder=args.decoder, **{
+                key: getattr(args, key) for key in MODEL_DEFAULTS if key.startswith("neighborhood_")
+            })
         print(f"Dataset: {root} | {NUM_RUNS} mesh/history pairs and impact XY rows")
         for name, split in splits.items():
             print(f"{name}: designs={split['design_ids']} | runs={len(split['run_numbers'])}")

@@ -29,6 +29,8 @@ fi
 # Pin this experiment even when older decoder/split settings are exported in
 # the login shell. Use the generic launcher for other splits or the baseline.
 export HOOD_MESH_DECODER="mesh_only"
+export HOOD_MESH_NEIGHBORHOOD_LAYERS="0"
+export HOOD_MESH_DESIGN_DIFFERENCE_WEIGHT="0"
 export HOOD_MESH_TEST_DESIGNS="10 11"
 export HOOD_MESH_VAL_DESIGNS="5"
 export HOOD_MESH_ALLOW_CLONE_LEAK="0"

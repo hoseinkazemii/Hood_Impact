@@ -101,6 +101,7 @@ esac
         self.env.update(MESH_TEST_PREFLIGHT_STATUS="0", MESH_TEST_TRAIN_STATUS="0")
         self.stub("sbatch", """printf 'DECODER=%s\\nTEST=%s\\nVAL=%s\\nLEAK=%s\\n' \\
     "$HOOD_MESH_DECODER" "$HOOD_MESH_TEST_DESIGNS" "$HOOD_MESH_VAL_DESIGNS" "$HOOD_MESH_ALLOW_CLONE_LEAK"
+printf 'LOCAL=%s\\nK=%s\\nDIFFERENCE=%s\\n' "$HOOD_MESH_NEIGHBORHOOD_LAYERS" "$HOOD_MESH_NEIGHBORHOOD_K" "$HOOD_MESH_DESIGN_DIFFERENCE_WEIGHT"
 printf 'ARG=%s\\n' "$@"
 """)
 
@@ -136,6 +137,28 @@ printf 'ARG=%s\\n' "$@"
         output = self.launch("submit_mesh_impact_history_1704_clusterD.sh")
         for expected in ("DECODER=temporal", "TEST=10 11", "VAL=5"):
             self.assertIn(expected, output)
+
+    def test_local_sensitivity_launcher_pins_both_changes_and_hardest_split(self):
+        self.env.update(HOOD_MESH_DECODER="mesh_only", HOOD_MESH_TEST_DESIGNS="2",
+                        HOOD_MESH_VAL_DESIGNS="10", HOOD_MESH_ALLOW_CLONE_LEAK="1",
+                        HOOD_MESH_NEIGHBORHOOD_LAYERS="0", HOOD_MESH_DESIGN_DIFFERENCE_WEIGHT="0")
+        output = self.launch("submit_mesh_impact_history_1704_local_sensitivity.sh", ["--time=08:00:00"])
+        for expected in ("DECODER=temporal", "TEST=10 11", "VAL=5", "LEAK=0",
+                         "LOCAL=2", "K=16", "DIFFERENCE=1.0", "ARG=--time=08:00:00"):
+            self.assertIn(expected, output)
+
+    def test_new_options_reach_both_direct_preflight_and_training(self):
+        self.env.update(HOOD_MESH_NEIGHBORHOOD_LAYERS="2", HOOD_MESH_NEIGHBORHOOD_K="16",
+                        HOOD_MESH_DESIGN_DIFFERENCE_WEIGHT="1.0", HOOD_MESH_BATCH_SIZE="8",
+                        HOOD_MESH_NEIGHBORHOOD_SCALE_MM="20", HOOD_MESH_NEIGHBORHOOD_CHUNK_SIZE="1024")
+        output = self.launch("run_mesh_impact_history_1704.sbatch")
+        commands = [line for line in output.splitlines() if line.startswith("PYTHON")]
+        self.assertEqual(len(commands), 2)
+        for command in commands:
+            for expected in ("<--neighborhood-layers> <2>", "<--neighborhood-k> <16>",
+                             "<--design-difference-weight> <1.0>", "<--batch-size> <8>",
+                             "<--neighborhood-scale-mm> <20>", "<--neighborhood-chunk-size> <1024>"):
+                self.assertIn(expected, command)
 
     def test_batch_runs_directly_with_broken_srun_and_preserves_gpu_decoder_and_split(self):
         self.env["CUDA_VISIBLE_DEVICES"] = "GPU-allocated-by-slurm"

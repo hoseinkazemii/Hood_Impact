@@ -40,9 +40,13 @@ def load_history(run_dir):
         if not np.array_equal(frame["epoch"].to_numpy(), np.arange(1, len(frame) + 1)):
             raise ValueError("Saved epochs must be consecutive and start at 1")
         history = {
-            "train_losses": frame["train_mse_normalized"].tolist(),
+            "train_losses": frame.get("train_objective", frame["train_mse_normalized"]).tolist(),
             "val_losses": frame["validation_mse_normalized"].tolist(),
         }
+        if "train_objective" in frame:
+            history["train_mse_losses"] = frame["train_mse_normalized"].tolist()
+            history["train_difference_losses"] = frame["train_design_difference_mse"].tolist()
+            history["train_pair_counts"] = frame["train_design_pairs"].tolist()
     _loss_arrays(history)
     return history
 
@@ -50,6 +54,11 @@ def load_history(run_dir):
 def export_training_history_plot(history, output_dir):
     """Save a plot of measured train/validation MSE, marking the best epoch."""
     train, validation = _loss_arrays(history)
+    if "train_mse_losses" in history:
+        mse = np.asarray(history["train_mse_losses"], dtype=np.float64)
+        if mse.shape != train.shape or not np.isfinite(mse).all():
+            raise ValueError("Training MSE must be finite and match the epoch count")
+        train = mse
     epochs = np.arange(1, len(train) + 1)
     best = int(np.argmin(validation))
     output_dir = Path(output_dir)

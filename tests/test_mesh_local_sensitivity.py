@@ -1,0 +1,216 @@
+"""Behavioral checks for neighborhood learning and training-only differences."""
+
+import json
+from pathlib import Path
+import tempfile
+from types import SimpleNamespace
+from unittest import mock
+
+import numpy as np
+import pandas as pd
+import pytest
+import torch
+
+from mesh_design_sensitivity import (
+    MatchedDesignBatchSampler, MatchedDesignDataset, collate_matched_designs,
+    difference_loss, matched_training_loader,
+)
+from mesh_impact_history import MeshImpactHistoryNet
+from mesh_neighborhood import NeighborhoodAttentionBlock, geometric_neighbors
+
+
+@pytest.fixture(autouse=True)
+def small_cpu_thread_pool():
+    previous = torch.get_num_threads()
+    torch.set_num_threads(1)
+    yield
+    torch.set_num_threads(previous)
+
+
+def small_model(**kwargs):
+    return MeshImpactHistoryNet(width=16, num_heads=2, num_latents=4,
+                                latent_layers=1, temporal_layers=1, dropout=0,
+                                neighborhood_layers=2, neighborhood_k=3,
+                                neighborhood_chunk_size=3, **kwargs)
+
+
+def test_neighbors_use_physical_xyz_and_handle_single_nodes_and_ties():
+    # Standardized Euclidean distance would pick node 1; physical distance picks 2.
+    normalized = torch.tensor([[0., 0, 0], [.1, 0, 0], [0, .9, 0], [0, 0, 2.]])
+    neighbors = geometric_neighbors(normalized * torch.tensor([100., 1, 1]), 2)
+    assert set(neighbors[0].tolist()) == {0, 2}
+    assert geometric_neighbors(normalized[:1], 16).tolist() == [[0]]
+    # A grid creates equidistant candidates exactly at the kNN boundary.
+    points = torch.cartesian_prod(torch.arange(3.), torch.arange(3.), torch.arange(2.))
+    permutation = torch.randperm(len(points))
+    before = geometric_neighbors(points, 4)
+    after = permutation[geometric_neighbors(points[permutation], 4)]
+    torch.testing.assert_close(after, before[permutation])
+
+
+def test_local_block_reads_neighbors_and_not_unconnected_nodes():
+    torch.manual_seed(10)
+    block = NeighborhoodAttentionBlock(16, 2, 0, 20., 3).eval()
+    points = torch.tensor([[0., 0, 0], [1., 0, 0], [3., 0, 0], [100., 0, 0]])
+    nodes = torch.randn(4, 16, requires_grad=True)
+    output = block(nodes, points, geometric_neighbors(points, 2))
+    output[0].square().sum().backward()
+    assert nodes.grad[1].abs().sum() > 0
+    assert nodes.grad[2:].abs().sum() == 0
+
+
+def test_chunk_checkpointing_preserves_outputs_and_parameter_gradients():
+    torch.manual_seed(11)
+    chunked = NeighborhoodAttentionBlock(16, 2, 0, 20., 3).train()
+    full = NeighborhoodAttentionBlock(16, 2, 0, 20., 100).train()
+    full.load_state_dict(chunked.state_dict())
+    points, nodes = torch.randn(12, 3), torch.randn(12, 16)
+    neighbors = geometric_neighbors(points, 4)
+    a, b = chunked(nodes, points, neighbors), full(nodes, points, neighbors)
+    torch.testing.assert_close(a, b)
+    a.square().mean().backward()
+    b.square().mean().backward()
+    for p, q in zip(chunked.parameters(), full.parameters()):
+        assert p.grad is not None
+        torch.testing.assert_close(p.grad, q.grad, atol=1e-7, rtol=2e-5)
+
+
+def test_new_model_is_node_order_invariant_isolates_meshes_and_backpropagates():
+    torch.manual_seed(12)
+    model = small_model().eval()
+    mesh = torch.randn(17, 3)
+    membership = torch.tensor([0] * 8 + [1] * 9)
+    times = torch.tensor([-.8, 0, .8, -.5, .5])
+    time_batch = torch.tensor([0, 0, 0, 1, 1])
+    impact = torch.randn(2, 2)
+    expected = model(mesh, membership, impact, times, time_batch)
+    permutation = torch.randperm(len(mesh))
+    actual = model(mesh[permutation], membership[permutation], impact, times, time_batch)
+    torch.testing.assert_close(expected, actual, atol=1e-6, rtol=1e-5)
+    single = model(mesh[:8], membership[:8], impact[:1], times[:3], time_batch[:3])
+    torch.testing.assert_close(single, expected[:3], atol=1e-6, rtol=1e-5)
+    model.train()
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        model(mesh, membership, impact, times, time_batch).float().square().mean().backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+
+
+@pytest.mark.parametrize("options", [
+    {"neighborhood_layers": -1}, {"neighborhood_layers": True}, {"neighborhood_k": 0},
+    {"neighborhood_chunk_size": 0}, {"neighborhood_scale_mm": float("nan")}, {"neighborhood_scale_mm": 0},
+])
+def test_invalid_neighborhood_configuration_fails(options):
+    with pytest.raises(ValueError):
+        MeshImpactHistoryNet(**options)
+
+
+def training_metadata(designs=(0, 1, 2, 3, 4, 6, 7, 8, 9), locations=142):
+    return SimpleNamespace(
+        run_numbers=[d * locations + i + 1 for d in designs for i in range(locations)],
+        indentor_positions=[np.array([i, 2 * i], dtype=np.float32) for d in designs for i in range(locations)],
+        time_arrays=[np.linspace(0, .025, 5, dtype=np.float32) for d in designs for i in range(locations)],
+    )
+
+
+def test_sampler_preserves_all_1278_train_runs_once_and_keeps_cross_cluster_pairs():
+    raw = training_metadata()
+    # Dataset len is only needed by the sampler, so supply a minimal interface.
+    class Metadata:
+        def __len__(self):
+            return len(self.run_numbers)
+    dataset = Metadata()
+    dataset.__dict__.update(raw.__dict__)
+    matched = MatchedDesignDataset(dataset, 142)
+    sampler = MatchedDesignBatchSampler(matched, 8, 42)
+    batches = list(sampler)
+    assert len(batches) == len(sampler) == 160
+    flat = [i for batch in batches for i in batch]
+    assert sorted(flat) == list(range(1278))
+    assert not {5, 10, 11} & set(matched.designs)
+    # Four cross-cluster pairs at each of 142 locations; one leftover per location.
+    for offset in range(0, 1136, 2):
+        a, b = flat[offset:offset + 2]
+        assert matched.locations[a] == matched.locations[b]
+        assert matched.clusters[a] != matched.clusters[b]
+    assert batches == list(MatchedDesignBatchSampler(matched, 8, 42))
+    assert batches != list(sampler)
+
+
+def test_pairing_rejects_misalignment_and_absence_of_cross_cluster_training_data():
+    for field, replacement, message in (
+        ("indentor_positions", np.array([99., 99.]), "XY mismatch"),
+        ("time_arrays", np.linspace(0, .03, 5), "Time grids differ"),
+    ):
+        data = training_metadata(designs=(0, 4), locations=2)
+        getattr(data, field)[2] = replacement
+        with pytest.raises(ValueError, match=message):
+            MatchedDesignDataset(data, 2)
+    with pytest.raises(ValueError, match="No matched-location"):
+        MatchedDesignDataset(training_metadata(designs=(0, 1), locations=2), 2)
+    with pytest.raises(ValueError, match="even batch_size"):
+        MatchedDesignBatchSampler(None, 3, 42)
+    with pytest.raises(ValueError, match="euroncap1704"):
+        matched_training_loader(None, SimpleNamespace(data_format="legacy"))
+
+
+def test_difference_loss_detects_geometry_collapse_and_cancels_common_error():
+    target = torch.tensor([1., 3., 5., 7.])
+    time_batch = torch.tensor([0, 0, 1, 1])
+    prediction = torch.tensor([2., 4., 2., 4.], requires_grad=True)
+    loss = difference_loss(prediction, target, time_batch, [(0, 1)])
+    assert loss.item() == 16
+    loss.backward()
+    torch.testing.assert_close(prediction.grad, torch.tensor([4., 4., -4., -4.]))
+    assert difference_loss(target + 100, target, time_batch, [(0, 1)]).item() == 0
+    assert difference_loss(prediction, target, time_batch, []).item() == 0
+    # Same-cluster and different-location examples never enter the pair set.
+    items = [dict(mesh=torch.zeros(1, 3), indentor=torch.zeros(2), time=torch.zeros(2),
+                  acceleration=torch.zeros(2), location=loc, cluster=cluster)
+             for loc, cluster in [(0, "A"), (0, "A"), (0, "B"), (1, "C")]]
+    assert collate_matched_designs(items)["design_pairs"] == [(0, 2), (1, 2)]
+
+
+def test_both_additions_train_save_and_reload_with_train_only_scalers():
+    from train_mesh_impact_history import DataPreprocessor, HistoryPredictor, main
+
+    # Four locations per design; training A/B/C, validation 5, test whole D.
+    # Mock only disk loading so the real split, scalers, sampler, optimizer,
+    # checkpoint selection, exports and inference all execute.
+    rng = np.random.default_rng(14)
+    data = {key: [] for key in ("run_numbers", "mesh_geometries", "indentor_positions", "time_arrays", "accelerations")}
+    times = np.linspace(0, .025, 7, dtype=np.float32)
+    for design in (0, 4, 6, 5, 10, 11):
+        for location in range(4):
+            data["run_numbers"].append(design * 4 + location + 1)
+            data["mesh_geometries"].append((rng.normal(size=(10 + location, 3)) + design).astype(np.float32))
+            data["indentor_positions"].append([location * 10., location * 3.])
+            data["time_arrays"].append(times.copy())
+            data["accelerations"].append((20 + design * 3 + (10 + location) * np.sin(times * 100)).astype(np.float32))
+    data["indentor_positions"] = np.asarray(data["indentor_positions"], dtype=np.float32)
+    with tempfile.TemporaryDirectory() as folder, mock.patch.object(DataPreprocessor, "load_all_data", return_value=data):
+        main(["--data-format", "euroncap1704", "--num-samples", "24", "--samples-per-design", "4",
+              "--epochs", "2", "--batch-size", "4", "--width", "16", "--num-heads", "2", "--num-latents", "4",
+              "--latent-layers", "1", "--temporal-layers", "1", "--neighborhood-layers", "2", "--neighborhood-k", "3",
+              "--design-difference-weight", "1", "--device", "cpu", "--wandb-mode", "disabled", "--output-dir", folder])
+        root = Path(folder)
+        saved = json.loads((root / "config.json").read_text())
+        history = json.loads((root / "training_history.json").read_text())
+        splits = json.loads((root / "splits.json").read_text())
+        assert splits["train"]["design_ids"] == [0, 4, 6]
+        assert splits["test"]["design_ids"] == [10, 11]
+        assert saved["training"]["design_difference_weight"] == 1
+        assert saved["architecture"]["kwargs"]["neighborhood_layers"] == 2
+        assert len(history["train_difference_losses"]) == 2
+        assert min(history["train_pair_counts"]) >= 4
+        assert np.isfinite(history["train_losses"]).all()
+        predictor = HistoryPredictor.from_run(folder)
+        np.testing.assert_allclose(predictor.preprocessor.mesh_scaler.mean_,
+                                   np.concatenate(data["mesh_geometries"][:12]).astype(np.float64).mean(0))
+        exported = pd.read_csv(root / "test_acceleration_histories.csv")
+        for i in range(16, 24):
+            predicted = predictor.predict(data["mesh_geometries"][i], data["indentor_positions"][i])
+            np.testing.assert_allclose(predicted, exported.loc[exported.run_number == data["run_numbers"][i], "acceleration_pred_g"],
+                                       atol=3e-5, rtol=3e-5)
+        frame = pd.read_csv(root / "training_history.csv")
+        np.testing.assert_allclose(frame.train_mse_normalized, history["train_mse_losses"])
+        np.testing.assert_allclose(frame.train_objective, history["train_losses"])

@@ -66,6 +66,16 @@ nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
 PREFLIGHT_ARGS=(--data-root "${DATA_ROOT}" --require-cuda
     --test-designs "${TEST_DESIGNS[@]}" --val-designs "${VAL_DESIGNS[@]}"
     --decoder "${DECODER}")
+EXPERIMENT_ARGS=()
+for option in NEIGHBORHOOD_LAYERS:neighborhood-layers NEIGHBORHOOD_K:neighborhood-k \
+    NEIGHBORHOOD_SCALE_MM:neighborhood-scale-mm NEIGHBORHOOD_CHUNK_SIZE:neighborhood-chunk-size \
+    DESIGN_DIFFERENCE_WEIGHT:design-difference-weight BATCH_SIZE:batch-size; do
+    variable="HOOD_MESH_${option%%:*}"
+    if [[ -n "${!variable}" ]]; then
+        EXPERIMENT_ARGS+=("--${option#*:}" "${!variable}")
+    fi
+done
+PREFLIGHT_ARGS+=("${EXPERIMENT_ARGS[@]}")
 if [[ "${HOOD_MESH_ALLOW_CLONE_LEAK:-0}" == "1" ]]; then
     PREFLIGHT_ARGS+=(--allow-clone-leak)
 fi
@@ -88,12 +98,13 @@ TRAIN_ARGS=(
     --decoder "${DECODER}"
     --device cuda --output-dir "${OUTPUT_DIR}" --run-name "${RUN_NAME}"
     --wandb-mode "${WANDB_MODE}" --wandb-project "${WANDB_PROJECT}"
+    "${EXPERIMENT_ARGS[@]}"
 )
 if [[ -n "${WANDB_ENTITY:-}" ]]; then
     TRAIN_ARGS+=(--wandb-entity "${WANDB_ENTITY}")
 fi
 OPTIONS=(
-    EPOCHS:epochs BATCH_SIZE:batch-size LR:lr WEIGHT_DECAY:weight-decay SEED:seed
+    EPOCHS:epochs LR:lr WEIGHT_DECAY:weight-decay SEED:seed
     WIDTH:width NUM_HEADS:num-heads NUM_LATENTS:num-latents
     LATENT_LAYERS:latent-layers TEMPORAL_LAYERS:temporal-layers DROPOUT:dropout
 )

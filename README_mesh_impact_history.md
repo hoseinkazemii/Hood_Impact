@@ -1,5 +1,10 @@
 # Mesh and impact location to acceleration history
 
+For the **neighborhood encoder + design-sensitivity training** experiment on
+the same cluster-D holdout, see [the architecture and training derivation](README_mesh_local_sensitivity.md).
+Submit it with `bash submit_mesh_impact_history_1704_local_sensitivity.sh`.
+The ordinary launcher and Python defaults still reproduce the temporal baseline.
+
 `mesh_impact_history.py` defines the new `MeshImpactHistoryNet` from scratch.
 It takes the irregular hood mesh node coordinates `(N, 3)` and the in-plane
 impact location `(2,)`, and predicts a scalar acceleration history in **g**.

@@ -3,4 +3,5 @@ setup_mesh_impact_history_env.sh text eol=lf
 submit_mesh_impact_history_1704.sh text eol=lf
 submit_mesh_impact_history_1704_clusterD.sh text eol=lf
 submit_mesh_impact_history_1704_no_temporal.sh text eol=lf
+submit_mesh_impact_history_1704_local_sensitivity.sh text eol=lf
 run_mesh_impact_history_1704.sbatch text eol=lf

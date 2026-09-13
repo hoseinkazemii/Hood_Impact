@@ -341,7 +341,10 @@ class TrainingRoundTripTests(unittest.TestCase):
     def test_mesh_only_train_reload_and_predict(self):
         self._train_reload_and_predict("mesh_only")
 
-    def _train_reload_and_predict(self, decoder):
+    def test_neighborhood_train_reload_and_predict(self):
+        self._train_reload_and_predict("temporal", ["--neighborhood-layers", "2", "--neighborhood-k", "4"])
+
+    def _train_reload_and_predict(self, decoder, extra_args=()):
         from train_mesh_impact_history import CHECKPOINT_NAME, HistoryPredictor, main
         from utils.utils import Config
 
@@ -392,7 +395,7 @@ class TrainingRoundTripTests(unittest.TestCase):
                 "--dropout", "0", "--device", "cpu", "--wandb-mode", "disabled",
                 "--decoder", decoder,
                 "--output-dir", str(run_dir),
-            ])
+            ] + list(extra_args))
             self.assertEqual(set(metrics), {"mse", "rmse", "mae", "r2"})
             self.assertTrue(all(np.isfinite(value) for value in metrics.values()))
             for artifact in (

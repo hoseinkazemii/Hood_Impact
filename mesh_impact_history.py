@@ -155,6 +155,11 @@ class MeshImpactHistoryNet(nn.Module):
 
     All trainable weights are new. Only linear layers, attention, normalization,
     activations and dropout are used; there are no convolution layers.
+
+    ``neighborhood_layers > 0`` inserts sparse, physical-XYZ kNN attention
+    between the node embedding and global/local pooling. The zero default
+    preserves old checkpoints. See README_mesh_local_sensitivity.md for the
+    two-layer experiment and its training-only design-difference objective.
     """
 
     def __init__(
@@ -166,11 +171,16 @@ class MeshImpactHistoryNet(nn.Module):
         temporal_layers: int = 2,
         dropout: float = 0.1,
         decoder: str = "temporal",
+        neighborhood_layers: int = 0,
+        neighborhood_k: int = 16,
+        neighborhood_scale_mm: float = 20.0,
+        neighborhood_chunk_size: int = 1024,
     ):
         super().__init__()
         integer_options = {
             "width": width, "num_heads": num_heads, "num_latents": num_latents,
             "latent_layers": latent_layers, "temporal_layers": temporal_layers,
+            "neighborhood_k": neighborhood_k, "neighborhood_chunk_size": neighborhood_chunk_size,
         }
         for name, value in integer_options.items():
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -185,6 +195,10 @@ class MeshImpactHistoryNet(nn.Module):
         # raise TypeError instead of the intended ValueError.
         if not isinstance(decoder, str) or decoder not in DECODER_BLOCKS:
             raise ValueError(f"decoder must be one of {sorted(DECODER_BLOCKS)}")
+        if isinstance(neighborhood_layers, bool) or not isinstance(neighborhood_layers, int) or neighborhood_layers < 0:
+            raise ValueError("neighborhood_layers must be a nonnegative integer")
+        if not math.isfinite(neighborhood_scale_mm) or neighborhood_scale_mm <= 0:
+            raise ValueError("neighborhood_scale_mm must be finite and positive")
 
         self.decoder = decoder
         self.width = width
@@ -192,6 +206,7 @@ class MeshImpactHistoryNet(nn.Module):
         self.num_latents = num_latents
         self.num_global_latents = num_latents // 2
         self.attention_dropout = dropout
+        self.neighborhood_k = neighborhood_k
 
         # The shared preprocessor fits mesh and impact scalers independently.
         # Store their affine maps in the checkpoint so relative coordinates
@@ -240,6 +255,15 @@ class MeshImpactHistoryNet(nn.Module):
         self.acceleration_head = nn.Sequential(
             nn.LayerNorm(width), nn.Linear(width, width), nn.GELU(), nn.Linear(width, 1),
         )
+        # Add after the original modules: baseline initialization and old
+        # checkpoint keys stay identical when neighborhood_layers=0.
+        self.neighborhood_blocks = nn.ModuleList()
+        if neighborhood_layers:
+            from mesh_neighborhood import NeighborhoodAttentionBlock
+            self.neighborhood_blocks.extend([
+                NeighborhoodAttentionBlock(width, num_heads, dropout, neighborhood_scale_mm, neighborhood_chunk_size)
+                for _ in range(neighborhood_layers)
+            ])
 
     @torch.no_grad()
     def set_coordinate_scalers(
@@ -277,6 +301,14 @@ class MeshImpactHistoryNet(nn.Module):
     def _encode_mesh(self, mesh: Tensor, impact: Tensor, condition: Tensor) -> Tensor:
         features = self.node_features(mesh, impact)
         nodes = self.node_embedding(features)
+        if self.neighborhood_blocks:
+            from mesh_neighborhood import geometric_neighbors
+            # Undo anisotropic standardization; the omitted mean is a common
+            # translation and cannot change distances or relative positions.
+            coordinates = mesh * self.mesh_scale
+            neighbors = geometric_neighbors(coordinates, self.neighborhood_k)
+            for block in self.neighborhood_blocks:
+                nodes = block(nodes, coordinates, neighbors)
         tokens = self.latent_queries + condition.unsqueeze(0)
         head_width = self.width // self.num_heads
         query = self.mesh_query(self.query_norm(tokens))
