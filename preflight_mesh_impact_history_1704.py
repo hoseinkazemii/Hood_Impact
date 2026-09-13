@@ -43,6 +43,12 @@ DEFAULT_DATA_ROOT = "Data/HoodImpact_1704_EuroNCAP"
 # the test score measure duplicate retrieval instead of learned physics.
 from mesh_design_sensitivity import GEOMETRY_CLUSTERS
 
+# Model knobs this experiment adds on top of the baseline architecture.
+EXPERIMENT_MODEL_KEYS = tuple(
+    key for key in MODEL_DEFAULTS
+    if key.startswith("neighborhood_") or key == "impactor_nodes"
+)
+
 
 def validate_cluster_holdout(test_designs, val_designs):
     """Require the *test* designs to take their whole geometry cluster with them.
@@ -137,6 +143,38 @@ def validate_dataset(data_root):
     if not np.isfinite(xy).all():
         raise ValueError("ImpactCoords_1704.csv X1/X2 must be numeric and finite")
     return root, xy
+
+
+def validate_impactor_boundary(root, impactor_nodes):
+    """Confirm the leading nodes are the moving headform and the rest are not.
+
+    Two impacts on one design share every structural node and differ only in
+    where the headform sits. Verifying that against the files here means the
+    neighborhood graph may be cached per design, and that the node count is
+    measured rather than trusted. Runs 1 and 2 both belong to design 0.
+    """
+    config = SimpleNamespace(
+        data_format="euroncap1704", inp_dir=str(root / "inp_files"),
+        acceleration_dir=str(root / "output_history_acc"),
+        time_subsample_stride=Config.time_subsample_stride,
+        max_train_time=Config.max_train_time,
+    )
+    processor = DataPreprocessor(config)
+    first, second = processor.load_mesh_geometry(1), processor.load_mesh_geometry(2)
+    if first.shape != second.shape:
+        raise ValueError(
+            f"Runs 1 and 2 share design 0 but parsed to {first.shape} and {second.shape} nodes"
+        )
+    moved = np.flatnonzero((first != second).any(axis=1))
+    if not np.array_equal(moved, np.arange(impactor_nodes)):
+        span = f"{moved.min()}..{moved.max()}" if len(moved) else "none"
+        raise ValueError(
+            f"--impactor-nodes {impactor_nodes} does not match the data: "
+            f"{len(moved)} nodes move between runs 1 and 2, at indices {span}. "
+            f"The held-out block must be exactly the leading moving nodes."
+        )
+    print(f"Impactor holdout: nodes 0..{impactor_nodes - 1} move between impacts; "
+          f"the remaining {len(first) - impactor_nodes} structural nodes are identical")
 
 
 def validate_first_run(root, impact_xy):
@@ -240,9 +278,9 @@ def parse_args(argv=None):
     parser.add_argument("--test-designs", type=int, nargs="+", default=[10, 11])
     parser.add_argument("--val-designs", type=int, nargs="+", default=[5])
     parser.add_argument("--decoder", choices=sorted(DECODER_BLOCKS), default=MODEL_DEFAULTS["decoder"])
-    for key, default in MODEL_DEFAULTS.items():
-        if key.startswith("neighborhood_"):
-            parser.add_argument(f"--{key.replace('_', '-')}", type=type(default), default=default)
+    for key in EXPERIMENT_MODEL_KEYS:
+        parser.add_argument(f"--{key.replace('_', '-')}", type=type(MODEL_DEFAULTS[key]),
+                            default=MODEL_DEFAULTS[key])
     parser.add_argument("--design-difference-weight", type=float, default=0.0)
     parser.add_argument("--batch-size", type=int, default=Config.batch_size)
     parser.add_argument("--allow-clone-leak", action="store_true",
@@ -273,10 +311,15 @@ def main(argv=None):
             print(f"Cluster check: passed | whole clusters held out: "
                   f"{held_clusters or 'none (no held-out design shares a cluster)'}")
         root, impact_xy = validate_dataset(args.data_root)
+        if args.impactor_nodes:
+            validate_impactor_boundary(root, args.impactor_nodes)
+        elif args.neighborhood_layers:
+            print("WARNING: --impactor-nodes 0 keeps the moving headform in the local graph, "
+                  "so the neighbor graph is rebuilt for every run instead of once per design")
         data, source_count, cutoff_count = validate_first_run(root, impact_xy)
         if args.require_cuda:
             validate_cuda_model(data, decoder=args.decoder, **{
-                key: getattr(args, key) for key in MODEL_DEFAULTS if key.startswith("neighborhood_")
+                key: getattr(args, key) for key in EXPERIMENT_MODEL_KEYS
             })
         print(f"Dataset: {root} | {NUM_RUNS} mesh/history pairs and impact XY rows")
         for name, split in splits.items():

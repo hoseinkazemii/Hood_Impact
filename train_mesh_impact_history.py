@@ -45,6 +45,9 @@ MODEL_DEFAULTS = {
     "neighborhood_k": 16,
     "neighborhood_scale_mm": 20.0,
     "neighborhood_chunk_size": 1024,
+    # Leading rigid-headform nodes held out of local attention only. The
+    # 1704 .inp files put the 286 impactor nodes first; 0 disables the holdout.
+    "impactor_nodes": 0,
 }
 CHECKPOINT_NAME = "hood_impact_best_model.pt"  # Filename used by shared Trainer.
 

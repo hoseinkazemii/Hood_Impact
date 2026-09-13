@@ -16,16 +16,17 @@ git fetch origin
 git switch agent/mesh-impact-neighborhood-attention
 git pull --ff-only origin agent/mesh-impact-neighborhood-attention
 bash -l setup_mesh_impact_history_env.sh
-bash submit_mesh_impact_history_1704_local_sensitivity.sh --time=12:00:00
+bash submit_mesh_impact_history_1704_local_sensitivity.sh
 ```
 
 Setup uses the existing environment and checks the declared dependencies,
-including SciPy for sparse neighbor lookup. The longer wall-time request gives
-the additional node-level work room to finish; actual DeltaAI runtime has not
-been measured. Omit the override to use the existing six-hour allocation, or
-choose your desired scheduler limit. W&B uses the existing login and project.
+including SciPy for sparse neighbor lookup. The existing six-hour allocation
+is enough: caching the structural neighbor graph keeps the added cost near
+5% of baseline epoch time (see **Cost**), against the 36 minutes the
+reference 100-epoch run took. W&B uses the existing login and project.
 
-The new wrapper pins temporal attention, both new additions and the split:
+The new wrapper pins temporal attention, both new additions, the headform
+holdout and the split:
 
 | Split | Designs | Impacts |
 |---|---|---:|
@@ -125,9 +126,44 @@ selected nodes' features and relative coordinates. Attention work scales with
 activation recomputation bound edge memory during training.
 
 This remains a point-cloud geometry model: proximity does **not** establish
-shell connectivity, weld attachment or contact. The input parser still reads
-the existing node set, including any headform nodes in that block. No panel,
-material, thickness or boundary-condition attributes have been added.
+shell connectivity, weld attachment or contact. No panel, material, thickness
+or boundary-condition attributes have been added.
+
+#### The headform is held out of the local graph
+
+Each 1704 `*NODE` block begins with the 286 rigid headform nodes, and those
+are the only nodes that move between impacts on one design: comparing runs 1
+and 2 shows exactly indices 0-285 displaced, by up to 1400 mm, with every
+remaining node identical. `--impactor-nodes 286` keeps that block out of the
+local graph. Two reasons:
+
+- The headform is a rigid impactor, not hood structure. Its position is
+  already stated exactly by `indentor`, so letting it crowd the 16 neighbor
+  slots of nearby panel nodes spends local capacity re-deriving a known input.
+- With it excluded, the structural graph is identical for all 142 impacts on a
+  design, so it is built once and reused instead of rebuilt per run.
+
+Held-out nodes still reach the pooled memory with their embedding intact; only
+local attention skips them. Preflight verifies the boundary against runs 1 and
+2 before training, so a wrong count fails immediately rather than silently
+holding out panel nodes. `--impactor-nodes 0` restores the old behavior and
+warns that the graph will be rebuilt for every run.
+
+#### Cost
+
+Measured on the real meshes (38,977 nodes for designs 0-5, 40,057 for 6-11)
+against the 21.8 s/epoch of the reference run `20260912_005426`:
+
+| | added per epoch | epoch total | vs baseline |
+|---|---:|---:|---:|
+| Rebuild per run | 299.6 s | 321.4 s | 14.7x |
+| Cached per design | 1.0 s | 22.8 s | **1.05x** |
+
+A graph costs about 115 ms to build and 0.73 ms to look up, so the nine
+training designs cost roughly one second once. Memory is not the constraint:
+full attention would need a 24.3 GB score tensor per mesh, while k=16 needs
+10 MB, and chunking with activation recomputation holds the live edge tensors
+to about 8 MB.
 
 ### 2. Learning design sensitivity
 
@@ -238,6 +274,9 @@ and weight 1; use that wrapper for the combined experiment.
 
 Tests exercise physical neighbor selection, permutation invariance, local
 influence, mesh isolation, chunked gradient equivalence, mixed precision,
+the headform holdout and its cache (structural rows unaffected by headform
+movement, held-out rows passed through, one build per geometry, nothing added
+to the state dict), the preflight boundary check,
 matched sampling without dropped/duplicated runs, pair alignment checks and
 the loss's signed gradients. A two-epoch integration run executes both changes,
 checks train-only scalers, exports test histories and reproduces them after

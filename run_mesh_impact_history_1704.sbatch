@@ -69,7 +69,8 @@ PREFLIGHT_ARGS=(--data-root "${DATA_ROOT}" --require-cuda
 EXPERIMENT_ARGS=()
 for option in NEIGHBORHOOD_LAYERS:neighborhood-layers NEIGHBORHOOD_K:neighborhood-k \
     NEIGHBORHOOD_SCALE_MM:neighborhood-scale-mm NEIGHBORHOOD_CHUNK_SIZE:neighborhood-chunk-size \
-    DESIGN_DIFFERENCE_WEIGHT:design-difference-weight BATCH_SIZE:batch-size; do
+    IMPACTOR_NODES:impactor-nodes DESIGN_DIFFERENCE_WEIGHT:design-difference-weight \
+    BATCH_SIZE:batch-size; do
     variable="HOOD_MESH_${option%%:*}"
     if [[ -n "${!variable}" ]]; then
         EXPERIMENT_ARGS+=("--${option#*:}" "${!variable}")

@@ -1,5 +1,6 @@
 """Sparse geometric point attention before mesh-to-latent pooling."""
 
+import hashlib
 import math
 
 import numpy as np
@@ -21,6 +22,36 @@ def geometric_neighbors(coordinates, count):
     _, indices = cKDTree(points[order]).query(points, k=min(count, len(points)), workers=1)
     indices = np.asarray(indices).reshape(len(points), -1)
     return torch.as_tensor(order[indices], device=coordinates.device, dtype=torch.long)
+
+
+class NeighborGraphCache:
+    """Reuse kNN graphs across runs whose structural nodes never move.
+
+    Keyed by the coordinate bytes, so a design contributes one entry no matter
+    how many impact locations it appears at. The capacity bound keeps memory
+    flat when the caller does pass geometry that changes every call.
+    """
+
+    def __init__(self, capacity=16):
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
+            raise ValueError("capacity must be a positive integer")
+        self.capacity = capacity
+        self.entries = {}
+        self.hits = 0
+        self.misses = 0
+
+    def neighbors(self, coordinates, count):
+        points = np.ascontiguousarray(coordinates.detach().cpu().numpy())
+        key = (hashlib.blake2b(points, digest_size=16).digest(), count, str(coordinates.device))
+        cached = self.entries.get(key)
+        if cached is None:
+            self.misses += 1
+            cached = self.entries[key] = geometric_neighbors(coordinates, count)
+            while len(self.entries) > self.capacity:
+                self.entries.pop(next(iter(self.entries)))
+        else:
+            self.hits += 1
+        return cached
 
 
 class NeighborhoodAttentionBlock(nn.Module):

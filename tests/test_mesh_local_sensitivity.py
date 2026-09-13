@@ -16,7 +16,7 @@ from mesh_design_sensitivity import (
     difference_loss, matched_training_loader,
 )
 from mesh_impact_history import MeshImpactHistoryNet
-from mesh_neighborhood import NeighborhoodAttentionBlock, geometric_neighbors
+from mesh_neighborhood import NeighborGraphCache, NeighborhoodAttentionBlock, geometric_neighbors
 
 
 @pytest.fixture(autouse=True)
@@ -98,6 +98,7 @@ def test_new_model_is_node_order_invariant_isolates_meshes_and_backpropagates():
 @pytest.mark.parametrize("options", [
     {"neighborhood_layers": -1}, {"neighborhood_layers": True}, {"neighborhood_k": 0},
     {"neighborhood_chunk_size": 0}, {"neighborhood_scale_mm": float("nan")}, {"neighborhood_scale_mm": 0},
+    {"impactor_nodes": -1}, {"impactor_nodes": True}, {"impactor_nodes": 1.5},
 ])
 def test_invalid_neighborhood_configuration_fails(options):
     with pytest.raises(ValueError):
@@ -191,6 +192,7 @@ def test_both_additions_train_save_and_reload_with_train_only_scalers():
         main(["--data-format", "euroncap1704", "--num-samples", "24", "--samples-per-design", "4",
               "--epochs", "2", "--batch-size", "4", "--width", "16", "--num-heads", "2", "--num-latents", "4",
               "--latent-layers", "1", "--temporal-layers", "1", "--neighborhood-layers", "2", "--neighborhood-k", "3",
+              "--impactor-nodes", "2",
               "--design-difference-weight", "1", "--device", "cpu", "--wandb-mode", "disabled", "--output-dir", folder])
         root = Path(folder)
         saved = json.loads((root / "config.json").read_text())
@@ -200,6 +202,7 @@ def test_both_additions_train_save_and_reload_with_train_only_scalers():
         assert splits["test"]["design_ids"] == [10, 11]
         assert saved["training"]["design_difference_weight"] == 1
         assert saved["architecture"]["kwargs"]["neighborhood_layers"] == 2
+        assert saved["architecture"]["kwargs"]["impactor_nodes"] == 2
         assert len(history["train_difference_losses"]) == 2
         assert min(history["train_pair_counts"]) >= 4
         assert np.isfinite(history["train_losses"]).all()
@@ -214,3 +217,68 @@ def test_both_additions_train_save_and_reload_with_train_only_scalers():
         frame = pd.read_csv(root / "training_history.csv")
         np.testing.assert_allclose(frame.train_mse_normalized, history["train_mse_losses"])
         np.testing.assert_allclose(frame.train_objective, history["train_losses"])
+
+
+# The leading nodes of a 1704 .inp *NODE block are the rigid headform. It moves
+# with the impact location, so holding it out is what makes the structural
+# neighbor graph constant across every impact on one design.
+def headform_mesh(headform_x):
+    """Two headform nodes, then six structural nodes one unit apart."""
+    headform = torch.tensor([[headform_x, .1, 0.], [headform_x, .2, 0.]])
+    structure = torch.tensor([[float(i), 0., 0.] for i in range(6)])
+    return torch.cat((headform, structure))
+
+
+def test_headform_holdout_keeps_local_attention_structural_and_passes_it_through():
+    torch.manual_seed(3)
+    held = small_model(impactor_nodes=2).eval()
+    nodes = torch.randn(8, 16)
+    near, far = headform_mesh(0.), headform_mesh(100.)
+    with torch.no_grad():
+        first, second = held._encode_neighborhoods(near, nodes), held._encode_neighborhoods(far, nodes)
+    # Structural rows never see the headform, so they cannot follow it.
+    torch.testing.assert_close(first[2:], second[2:], atol=0, rtol=0)
+    # Held-out rows reach pooling exactly as embedded, unchanged by the blocks.
+    torch.testing.assert_close(first[:2], nodes[:2], atol=0, rtol=0)
+
+    # Without the holdout the same weights do follow it, so the test above is
+    # measuring the exclusion rather than a headform too far away to matter.
+    plain = small_model(impactor_nodes=0).eval()
+    plain.load_state_dict(held.state_dict())
+    with torch.no_grad():
+        moved = plain._encode_neighborhoods(near, nodes), plain._encode_neighborhoods(far, nodes)
+    assert not torch.allclose(moved[0][2:], moved[1][2:])
+
+
+def test_neighbor_graph_is_built_once_per_geometry_and_stays_out_of_the_checkpoint():
+    model = small_model(impactor_nodes=2).eval()
+    nodes = torch.randn(8, 16)
+    with torch.no_grad():
+        for headform_x in (0., 30., 60.):          # three impacts, one design
+            model._encode_neighborhoods(headform_mesh(headform_x), nodes)
+    assert (model.neighbor_cache.misses, model.neighbor_cache.hits) == (1, 2)
+    with torch.no_grad():                           # a second design must miss
+        model._encode_neighborhoods(headform_mesh(0.) * 2.0, nodes)
+    assert (model.neighbor_cache.misses, model.neighbor_cache.hits) == (2, 2)
+    assert not [key for key in model.state_dict() if "neighbor_cache" in key]
+
+
+def test_cache_returns_the_true_graph_and_bounds_its_own_size():
+    cache = NeighborGraphCache(capacity=2)
+    points = [torch.randn(9, 3) for _ in range(3)]
+    for mesh in points:
+        torch.testing.assert_close(cache.neighbors(mesh, 3), geometric_neighbors(mesh, 3), atol=0, rtol=0)
+    assert len(cache.entries) == 2 and cache.misses == 3
+    # Distinct k on one mesh is a distinct graph, never a stale hit.
+    fresh = NeighborGraphCache()
+    torch.testing.assert_close(fresh.neighbors(points[0], 2), geometric_neighbors(points[0], 2), atol=0, rtol=0)
+    torch.testing.assert_close(fresh.neighbors(points[0], 4), geometric_neighbors(points[0], 4), atol=0, rtol=0)
+    assert fresh.misses == 2
+    with pytest.raises(ValueError):
+        NeighborGraphCache(capacity=0)
+
+
+def test_holdout_leaving_too_little_structure_is_rejected():
+    model = small_model(impactor_nodes=5).eval()
+    with pytest.raises(ValueError, match="structural nodes"):
+        model._encode_neighborhoods(torch.randn(6, 3), torch.randn(6, 16))

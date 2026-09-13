@@ -160,6 +160,10 @@ class MeshImpactHistoryNet(nn.Module):
     between the node embedding and global/local pooling. The zero default
     preserves old checkpoints. See README_mesh_local_sensitivity.md for the
     two-layer experiment and its training-only design-difference objective.
+
+    ``impactor_nodes`` holds the leading rigid-headform nodes out of that local
+    attention. They still reach the pooled memory unchanged; only the local
+    graph skips them. See ``_encode_neighborhoods``.
     """
 
     def __init__(
@@ -175,6 +179,7 @@ class MeshImpactHistoryNet(nn.Module):
         neighborhood_k: int = 16,
         neighborhood_scale_mm: float = 20.0,
         neighborhood_chunk_size: int = 1024,
+        impactor_nodes: int = 0,
     ):
         super().__init__()
         integer_options = {
@@ -199,6 +204,8 @@ class MeshImpactHistoryNet(nn.Module):
             raise ValueError("neighborhood_layers must be a nonnegative integer")
         if not math.isfinite(neighborhood_scale_mm) or neighborhood_scale_mm <= 0:
             raise ValueError("neighborhood_scale_mm must be finite and positive")
+        if isinstance(impactor_nodes, bool) or not isinstance(impactor_nodes, int) or impactor_nodes < 0:
+            raise ValueError("impactor_nodes must be a nonnegative integer")
 
         self.decoder = decoder
         self.width = width
@@ -207,6 +214,7 @@ class MeshImpactHistoryNet(nn.Module):
         self.num_global_latents = num_latents // 2
         self.attention_dropout = dropout
         self.neighborhood_k = neighborhood_k
+        self.impactor_nodes = impactor_nodes
 
         # The shared preprocessor fits mesh and impact scalers independently.
         # Store their affine maps in the checkpoint so relative coordinates
@@ -258,12 +266,16 @@ class MeshImpactHistoryNet(nn.Module):
         # Add after the original modules: baseline initialization and old
         # checkpoint keys stay identical when neighborhood_layers=0.
         self.neighborhood_blocks = nn.ModuleList()
+        self.neighbor_cache = None
         if neighborhood_layers:
-            from mesh_neighborhood import NeighborhoodAttentionBlock
+            from mesh_neighborhood import NeighborGraphCache, NeighborhoodAttentionBlock
             self.neighborhood_blocks.extend([
                 NeighborhoodAttentionBlock(width, num_heads, dropout, neighborhood_scale_mm, neighborhood_chunk_size)
                 for _ in range(neighborhood_layers)
             ])
+            # Plain attribute, never a buffer: the graph is derived from the
+            # inputs, so it must not enter the checkpoint or a state dict.
+            self.neighbor_cache = NeighborGraphCache()
 
     @torch.no_grad()
     def set_coordinate_scalers(
@@ -298,17 +310,37 @@ class MeshImpactHistoryNet(nn.Module):
         radius_squared = relative_xy.square().sum(dim=-1, keepdim=True)
         return torch.cat((mesh, relative_xy, radius_squared), dim=-1)
 
+    def _encode_neighborhoods(self, mesh: Tensor, nodes: Tensor) -> Tensor:
+        """Run local attention over the structural nodes, in input order.
+
+        The leading ``impactor_nodes`` rows are the rigid headform. It travels
+        with the impact location, which ``indentor`` already states exactly, and
+        it is not hood structure, so it takes no part in the local graph. Every
+        remaining node still attends, and the held-out rows reach pooling with
+        their embedding intact. Excluding them also makes the graph identical
+        for every impact on a design, so it is built once and reused.
+        """
+        # Undo anisotropic standardization; the omitted mean is a common
+        # translation and cannot change distances or relative positions.
+        coordinates = mesh[self.impactor_nodes:] * self.mesh_scale
+        if len(coordinates) < 2:
+            raise ValueError(
+                f"Neighborhood attention needs at least two structural nodes; "
+                f"got {len(coordinates)} after holding out {self.impactor_nodes} impactor nodes"
+            )
+        neighbors = self.neighbor_cache.neighbors(coordinates, self.neighborhood_k)
+        updated = nodes[self.impactor_nodes:]
+        for block in self.neighborhood_blocks:
+            updated = block(updated, coordinates, neighbors)
+        if not self.impactor_nodes:
+            return updated
+        return torch.cat((nodes[:self.impactor_nodes], updated))
+
     def _encode_mesh(self, mesh: Tensor, impact: Tensor, condition: Tensor) -> Tensor:
         features = self.node_features(mesh, impact)
         nodes = self.node_embedding(features)
         if self.neighborhood_blocks:
-            from mesh_neighborhood import geometric_neighbors
-            # Undo anisotropic standardization; the omitted mean is a common
-            # translation and cannot change distances or relative positions.
-            coordinates = mesh * self.mesh_scale
-            neighbors = geometric_neighbors(coordinates, self.neighborhood_k)
-            for block in self.neighborhood_blocks:
-                nodes = block(nodes, coordinates, neighbors)
+            nodes = self._encode_neighborhoods(mesh, nodes)
         tokens = self.latent_queries + condition.unsqueeze(0)
         head_width = self.width // self.num_heads
         query = self.mesh_query(self.query_norm(tokens))

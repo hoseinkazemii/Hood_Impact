@@ -16,6 +16,9 @@ export HOOD_MESH_NEIGHBORHOOD_LAYERS="2"
 export HOOD_MESH_NEIGHBORHOOD_K="16"
 export HOOD_MESH_NEIGHBORHOOD_SCALE_MM="20"
 export HOOD_MESH_NEIGHBORHOOD_CHUNK_SIZE="1024"
+# The 1704 .inp *NODE blocks list the rigid headform first. Preflight
+# verifies the boundary against two runs before training starts.
+export HOOD_MESH_IMPACTOR_NODES="286"
 export HOOD_MESH_DESIGN_DIFFERENCE_WEIGHT="1.0"
 export HOOD_MESH_TEST_DESIGNS="10 11"
 export HOOD_MESH_VAL_DESIGNS="5"
@@ -24,7 +27,8 @@ export HOOD_MESH_RUN_NAME="${HOOD_MESH_RUN_NAME:-mesh_history_1704_clusterD_loca
 export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_PROJECT="${WANDB_PROJECT:-hood-impact-mesh-attention}"
 
-printf 'Experiment: 2 neighborhood layers, k=16, temporal decoder, design-difference weight=1\n'
+printf 'Experiment: 2 neighborhood layers, k=16, headform (286 nodes) held out of the local graph\n'
+printf 'Decoder: temporal | design-difference weight=1\n'
 printf 'Holdout: train 0,1,2,3,4,6,7,8,9 | validation 5 | test 10,11\n'
 mkdir -p "${PROJECT_DIR}/runs/slurm"
 exec sbatch \

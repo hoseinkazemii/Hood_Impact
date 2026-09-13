@@ -283,3 +283,48 @@ class SubmissionDataTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ImpactorBoundaryTests(unittest.TestCase):
+    """The held-out block must be measured against the files, not assumed."""
+
+    def write_runs(self, root, moving):
+        (root / "inp_files").mkdir()
+        (root / "output_history_acc").mkdir()
+        for run in (1, 2):
+            rows = []
+            for node in range(6):
+                shift = run * 50 if node in moving else 0
+                rows.append(f"{node + 1}, {node + shift}, 0.0, 0.0")
+            body = chr(10).join(rows)
+            (root / "inp_files" / f"HoodImpact_{run}.inp").write_text(f"*NODE{chr(10)}{body}{chr(10)}*ELEMENT{chr(10)}")
+
+    def test_accepts_a_leading_block_that_matches_the_moving_nodes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            self.write_runs(root, moving={0, 1})
+            preflight.validate_impactor_boundary(root, 2)
+
+    def test_rejects_a_count_that_does_not_match_the_data(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            self.write_runs(root, moving={0, 1})
+            for wrong in (1, 3):
+                with self.assertRaisesRegex(ValueError, "does not match the data"):
+                    preflight.validate_impactor_boundary(root, wrong)
+
+    def test_rejects_moving_nodes_that_are_not_the_leading_block(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            self.write_runs(root, moving={3, 4})
+            with self.assertRaisesRegex(ValueError, "does not match the data"):
+                preflight.validate_impactor_boundary(root, 2)
+
+    def test_launcher_and_preflight_agree_on_the_1704_headform(self):
+        launcher = Path("submit_mesh_impact_history_1704_local_sensitivity.sh").read_text()
+        self.assertIn('export HOOD_MESH_IMPACTOR_NODES="286"', launcher)
+        self.assertIn("IMPACTOR_NODES:impactor-nodes",
+                      Path("run_mesh_impact_history_1704.sbatch").read_text())
+        for parse in (preflight.parse_args, training.parse_args):
+            self.assertEqual(parse([]).impactor_nodes, 0)
+            self.assertEqual(parse(["--impactor-nodes", "286"]).impactor_nodes, 286)
