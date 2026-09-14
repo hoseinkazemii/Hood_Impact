@@ -102,6 +102,7 @@ esac
         self.stub("sbatch", """printf 'DECODER=%s\\nTEST=%s\\nVAL=%s\\nLEAK=%s\\n' \\
     "$HOOD_MESH_DECODER" "$HOOD_MESH_TEST_DESIGNS" "$HOOD_MESH_VAL_DESIGNS" "$HOOD_MESH_ALLOW_CLONE_LEAK"
 printf 'LOCAL=%s\\nK=%s\\nDIFFERENCE=%s\\n' "$HOOD_MESH_NEIGHBORHOOD_LAYERS" "$HOOD_MESH_NEIGHBORHOOD_K" "$HOOD_MESH_DESIGN_DIFFERENCE_WEIGHT"
+printf 'RESUME=%s\\n' "$HOOD_MESH_RESUME_FROM"
 printf 'ARG=%s\\n' "$@"
 """)
 
@@ -144,8 +145,40 @@ printf 'ARG=%s\\n' "$@"
                         HOOD_MESH_NEIGHBORHOOD_LAYERS="0", HOOD_MESH_DESIGN_DIFFERENCE_WEIGHT="0")
         output = self.launch("submit_mesh_impact_history_1704_local_sensitivity.sh", ["--time=08:00:00"])
         for expected in ("DECODER=temporal", "TEST=10 11", "VAL=5", "LEAK=0",
-                         "LOCAL=2", "K=16", "DIFFERENCE=1.0", "ARG=--time=08:00:00"):
+                         "LOCAL=2", "K=16", "DIFFERENCE=1.0", "ARG=--time=48:00:00", "ARG=--time=08:00:00"):
             self.assertIn(expected, output)
+        self.assertLess(output.index("ARG=--time=48:00:00"), output.index("ARG=--time=08:00:00"))
+
+    def test_resume_launcher_passes_source_and_dependency_with_48_hours(self):
+        source = self.root / "old run with spaces"
+        source.mkdir()
+        checkpoint = source / "hood_impact_best_model.pt"
+        checkpoint.touch()
+        for selected in (source, checkpoint):
+            output = self.launch("submit_mesh_impact_history_1704_local_sensitivity_resume.sh",
+                                 [self.shell_path(selected), "--dependency=afterany:12345"])
+            for expected in ("ARG=--time=48:00:00", "ARG=--dependency=afterany:12345",
+                             "ARG=--job-name=mesh_hist_local_resume", f"RESUME={self.shell_path(selected)}"):
+                self.assertIn(expected, output)
+
+    def test_resume_launcher_rejects_missing_source_without_submitting(self):
+        for arguments in ([], [self.shell_path(self.root / "missing")]):
+            output = self.launch("submit_mesh_impact_history_1704_local_sensitivity_resume.sh",
+                                 arguments, expected_returncode=2)
+            self.assertNotIn("ARG=", output)
+
+    def test_resume_batch_uses_saved_settings_instead_of_stale_training_exports(self):
+        source = self.shell_path(self.root / "old run")
+        self.env.update(HOOD_MESH_RESUME_FROM=source, HOOD_MESH_EPOCHS="999",
+                        HOOD_MESH_WIDTH="256", HOOD_MESH_DESIGN_DIFFERENCE_WEIGHT="0")
+        output = self.launch("run_mesh_impact_history_1704.sbatch")
+        commands = [line for line in output.splitlines() if line.startswith("PYTHON")]
+        self.assertEqual(len(commands), 2)
+        self.assertIn(f"<--resume-from> <{source}>", commands[0])
+        self.assertIn(f"<--resume-from> <{source}>", commands[1])
+        for option in ("--epochs", "--width", "--design-difference-weight", "--test-designs"):
+            self.assertNotIn(f"<{option}>", commands[1])
+        self.assertIn("<--output-dir>", commands[1])
 
     def test_new_options_reach_both_direct_preflight_and_training(self):
         self.env.update(HOOD_MESH_NEIGHBORHOOD_LAYERS="2", HOOD_MESH_NEIGHBORHOOD_K="16",

@@ -20,10 +20,61 @@ bash submit_mesh_impact_history_1704_local_sensitivity.sh
 ```
 
 Setup uses the existing environment and checks the declared dependencies,
-including SciPy for sparse neighbor lookup. The existing six-hour allocation
-is enough: caching the structural neighbor graph keeps the added cost near
-5% of baseline epoch time (see **Cost**), against the 36 minutes the
-reference 100-epoch run took. W&B uses the existing login and project.
+including SciPy for sparse neighbor lookup. This wrapper requests **48 hours
+on one GPU** (`--time=48:00:00`). A trailing `--time` argument can override it.
+The shared batch script retains its six-hour default for other experiments.
+W&B uses the existing login and project.
+
+The neighborhood job reported epoch 35 after 4:22:11: about 7.5 minutes per
+epoch, or roughly 12.5 hours for 100 epochs at that average pace. The previous
+six-hour estimate understated the full training cost. Changing the script
+affects new submissions; it does not extend a job already running.
+
+### Resume an interrupted neighborhood job
+
+Sync the updated code to the cluster, then pass the **neighborhood run's**
+directory (containing `config.json`, `splits.json`, `scalers.joblib`,
+`prediction_times.npy` and the checkpoint):
+
+```bash
+RUN_DIR="runs/mesh_impact_history/YOUR_NEIGHBORHOOD_RUN_DIRECTORY"
+bash submit_mesh_impact_history_1704_local_sensitivity_resume.sh "$RUN_DIR"
+```
+
+If the original job is still running, queue the continuation after it ends,
+including if it times out (replace `1234567` with that job's ID):
+
+```bash
+bash submit_mesh_impact_history_1704_local_sensitivity_resume.sh "$RUN_DIR" \
+    --dependency=afterany:1234567
+```
+
+The resume wrapper also requests 48 hours on one GPU. At job start it selects
+`hood_impact_last_model.pt` when present, otherwise `hood_impact_best_model.pt`.
+If a timeout fell between saving best and latest, it uses the newer best epoch.
+To explicitly select the best checkpoint:
+
+```bash
+bash submit_mesh_impact_history_1704_local_sensitivity_resume.sh \
+    "$RUN_DIR/hood_impact_best_model.pt"
+```
+
+Resume restores model weights, AdamW state, cosine scheduler, completed epoch
+count, architecture, design-difference weight, split and original scalers.
+It continues to the saved **total** epoch target (normally 100); for example,
+an epoch-35 checkpoint starts at 36/100. Source artifacts remain unchanged.
+Results and W&B tracking go to a new run. Existing training-setting exports
+such as `HOOD_MESH_EPOCHS` are ignored by the resume launcher; the saved
+experiment settings govern continuation. If the dataset moved, set
+`HOOD_MESH_DATA_ROOT` to its new location.
+
+Jobs started with the old code saved only the **best validation epoch**, so
+later unsaved training must be repeated. Those checkpoints also omitted random
+generator states and separate acceleration/difference-loss components. Resume
+uses the configured seed for random draws and leaves old component metrics
+missing (JSON null, blank CSV cells and gaps in plots). New checkpoints save
+those fields, restore the matched sampler's epoch, and save both the best
+model and an atomic latest checkpoint after every completed epoch.
 
 The new wrapper pins temporal attention, both new additions, the headform
 holdout and the split:
@@ -151,10 +202,14 @@ warns that the graph will be rebuilt for every run.
 
 #### Cost
 
-Measured on the real meshes (38,977 nodes for designs 0-5, 40,057 for 6-11)
-against the 21.8 s/epoch of the reference run `20260912_005426`:
+The earlier estimate below used graph-construction timings on the real meshes
+(38,977 nodes for designs 0-5, 40,057 for 6-11) and the 21.8 s/epoch baseline
+from `20260912_005426`. These are **graph-overhead projections**, not measured
+end-to-end neighborhood training times; they omit attention forward/backward
+and recomputation costs. The observed neighborhood run instead averaged about
+449 s/epoch through epoch 35. Do not use this table to size its wall time.
 
-| | added per epoch | epoch total | vs baseline |
+| | estimated graph overhead per epoch | projected epoch total | vs baseline |
 |---|---:|---:|---:|
 | Rebuild per run | 299.6 s | 321.4 s | 14.7x |
 | Cached per design | 1.0 s | 22.8 s | **1.05x** |

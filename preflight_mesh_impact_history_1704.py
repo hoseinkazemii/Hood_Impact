@@ -26,6 +26,7 @@ from train_mesh_impact_history import (
     DECODER_BLOCKS,
     MODEL_DEFAULTS,
     MeshImpactHistoryNet,
+    parse_args as parse_training_args,
     resolve_splits,
     validate_data,
 )
@@ -273,7 +274,8 @@ def validate_cuda_model(data, decoder=MODEL_DEFAULTS["decoder"], **neighborhood_
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-root", default=DEFAULT_DATA_ROOT)
+    parser.add_argument("--data-root")
+    parser.add_argument("--resume-from", help="Read experiment settings from the checkpoint's run.")
     parser.add_argument("--require-cuda", action="store_true")
     parser.add_argument("--test-designs", type=int, nargs="+", default=[10, 11])
     parser.add_argument("--val-designs", type=int, nargs="+", default=[5])
@@ -287,7 +289,18 @@ def parse_args(argv=None):
                         help="Permit a holdout that leaves near-clones of a held-out "
                              "design in training. Scores from such a run measure "
                              "retrieval, not geometry.")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.resume_from:
+        saved = parse_training_args(["--resume-from", args.resume_from])
+        if saved.data_format != "euroncap1704" or saved.num_samples != NUM_RUNS or saved.samples_per_design != SAMPLES_PER_DESIGN:
+            parser.error("The 1704 resume launcher requires a full euroncap1704 run")
+        for key in (*EXPERIMENT_MODEL_KEYS, "decoder", "test_designs", "val_designs",
+                    "batch_size", "design_difference_weight"):
+            setattr(args, key, getattr(saved, key))
+        if args.data_root is None:
+            args.data_root = str(Path(saved.inp_dir).parent)
+    args.data_root = args.data_root or DEFAULT_DATA_ROOT
+    return args
 
 
 def main(argv=None):

@@ -56,8 +56,10 @@ def export_training_history_plot(history, output_dir):
     train, validation = _loss_arrays(history)
     if "train_mse_losses" in history:
         mse = np.asarray(history["train_mse_losses"], dtype=np.float64)
-        if mse.shape != train.shape or not np.isfinite(mse).all():
-            raise ValueError("Training MSE must be finite and match the epoch count")
+        if mse.shape != train.shape or np.isinf(mse).any():
+            raise ValueError("Training MSE must match the epoch count and contain no infinities")
+        # Legacy resumed checkpoints lack separate MSE measurements. Missing
+        # entries are plotted as gaps; the combined objective is not MSE.
         train = mse
     epochs = np.arange(1, len(train) + 1)
     best = int(np.argmin(validation))

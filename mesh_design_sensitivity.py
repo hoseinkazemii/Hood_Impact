@@ -172,3 +172,22 @@ class DesignSensitivityTrainer(Trainer):
                 "train_difference_losses": self.train_difference_losses,
                 "train_pair_counts": self.train_pair_counts,
                 "design_difference_weight": self.difference_weight}
+
+    def checkpoint_state(self):
+        return {**super().checkpoint_state(),
+                "train_mse_losses": self.train_mse_losses,
+                "train_difference_losses": self.train_difference_losses,
+                "train_pair_counts": self.train_pair_counts}
+
+    def load_checkpoint(self, filepath):
+        checkpoint = super().load_checkpoint(filepath)
+        completed = len(self.train_losses)
+        # Older checkpoints kept the objective, but omitted these components.
+        # Keep unknown measurements missing instead of inventing MSE values.
+        for key in ("train_mse_losses", "train_difference_losses", "train_pair_counts"):
+            values = checkpoint.get(key, [None] * completed)
+            if len(values) != completed:
+                raise ValueError(f"Checkpoint {key} does not match its epoch count")
+            setattr(self, key, list(values))
+        self.train_loader.batch_sampler.epoch = completed
+        return checkpoint

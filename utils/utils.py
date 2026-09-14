@@ -1,4 +1,5 @@
 import os
+import random
 import wandb
 import sys
 import logging
@@ -893,7 +894,7 @@ class Trainer:
         print(f"\nTraining on {self.config.device}")
         print(f"{'='*60}")
         
-        for epoch in range(self.config.num_epochs):
+        for epoch in range(len(self.train_losses), self.config.num_epochs):
             # Train
             train_loss = self.train_epoch()
             
@@ -929,6 +930,8 @@ class Trainer:
                 self.save_checkpoint(os.path.join(self.config.output_dir, 'hood_impact_best_model.pt'))
                 print(f"Best model saved at epoch {epoch+1} with val Loss {val_loss:.4f} g")
                 wandb.run.summary["best_val_loss"] = self.best_val_loss
+            if getattr(self.config, "save_last_checkpoint", False):
+                self.save_checkpoint(os.path.join(self.config.output_dir, 'hood_impact_last_model.pt'))
                 
         return {
             'train_losses': self.train_losses,
@@ -936,24 +939,55 @@ class Trainer:
             'best_val_loss': self.best_val_loss,
         }
 
-    def save_checkpoint(self, filepath: str):
-        torch.save({
+    def checkpoint_state(self):
+        numpy_state = np.random.get_state()
+        return {
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'train_losses': self.train_losses,
             'val_losses': self.val_losses,
             'best_val_loss': self.best_val_loss,
-        }, filepath)
+            'completed_epochs': len(self.train_losses),
+            'torch_rng_state': torch.get_rng_state(),
+            'cuda_rng_states': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+            'numpy_rng_state': (numpy_state[0], numpy_state[1].tolist(), *numpy_state[2:]),
+            'python_rng_state': random.getstate(),
+        }
+
+    def save_checkpoint(self, filepath: str):
+        # Replace only after a complete write, preserving the previous epoch
+        # if Slurm terminates the process while serializing the next one.
+        temporary = str(filepath) + '.tmp'
+        try:
+            torch.save(self.checkpoint_state(), temporary)
+            os.replace(temporary, filepath)
+        finally:
+            if os.path.exists(temporary):
+                os.remove(temporary)
     
     def load_checkpoint(self, filepath: str):
-        checkpoint = torch.load(filepath, map_location=self.config.device, weights_only=False)
+        checkpoint = torch.load(filepath, map_location='cpu', weights_only=True)
+        completed = len(checkpoint['train_losses'])
+        if (len(checkpoint['val_losses']) != completed or
+                checkpoint.get('completed_epochs', completed) != completed):
+            raise ValueError('Checkpoint epoch count and loss histories disagree')
+        if checkpoint['scheduler_state_dict']['T_max'] != self.config.num_epochs:
+            raise ValueError('Resume must retain the original total epochs and cosine schedule')
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         self.train_losses = checkpoint['train_losses']
         self.val_losses = checkpoint['val_losses']
         self.best_val_loss = checkpoint['best_val_loss']
+        if 'torch_rng_state' in checkpoint:
+            torch.set_rng_state(checkpoint['torch_rng_state'])
+            if torch.cuda.is_available() and checkpoint.get('cuda_rng_states'):
+                torch.cuda.set_rng_state_all(checkpoint['cuda_rng_states'])
+            numpy_state = checkpoint['numpy_rng_state']
+            np.random.set_state((numpy_state[0], np.asarray(numpy_state[1], dtype=np.uint32), *numpy_state[2:]))
+            random.setstate(checkpoint['python_rng_state'])
+        return checkpoint
 
 
 # ============================================================================

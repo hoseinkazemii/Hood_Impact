@@ -80,6 +80,12 @@ PREFLIGHT_ARGS+=("${EXPERIMENT_ARGS[@]}")
 if [[ "${HOOD_MESH_ALLOW_CLONE_LEAK:-0}" == "1" ]]; then
     PREFLIGHT_ARGS+=(--allow-clone-leak)
 fi
+if [[ -n "${HOOD_MESH_RESUME_FROM:-}" ]]; then
+    PREFLIGHT_ARGS=(--resume-from "${HOOD_MESH_RESUME_FROM}" --require-cuda)
+    if [[ -n "${HOOD_MESH_DATA_ROOT:-}" ]]; then
+        PREFLIGHT_ARGS+=(--data-root "${DATA_ROOT}")
+    fi
+fi
 # This is one Python process on one allocated GPU. Run in Slurm's existing
 # batch step: an extra srun step can fail with "Error configuring interconnect"
 # before Python starts (job 3139891). Inherit Slurm's CUDA_VISIBLE_DEVICES.
@@ -115,6 +121,22 @@ for option in "${OPTIONS[@]}"; do
         TRAIN_ARGS+=("--${option#*:}" "${!variable}")
     fi
 done
+
+if [[ -n "${HOOD_MESH_RESUME_FROM:-}" ]]; then
+    # Architecture, split, loss, optimizer settings and total epochs come from
+    # the source config, so stale experiment exports cannot change a resume.
+    TRAIN_ARGS=(--resume-from "${HOOD_MESH_RESUME_FROM}"
+        --device cuda --output-dir "${OUTPUT_DIR}" --run-name "${RUN_NAME}"
+        --wandb-mode "${WANDB_MODE}" --wandb-project "${WANDB_PROJECT}")
+    if [[ -n "${WANDB_ENTITY:-}" ]]; then
+        TRAIN_ARGS+=(--wandb-entity "${WANDB_ENTITY}")
+    fi
+    if [[ -n "${HOOD_MESH_DATA_ROOT:-}" ]]; then
+        TRAIN_ARGS+=(--inp-dir "${DATA_ROOT}/inp_files"
+            --impact-coords-path "${DATA_ROOT}/ImpactCoords_1704.csv"
+            --acceleration-dir "${DATA_ROOT}/output_history_acc")
+    fi
+fi
 
 printf 'Training command:'
 printf ' %q' "${PYTHON_BIN}" -u train_mesh_impact_history.py "${TRAIN_ARGS[@]}"
