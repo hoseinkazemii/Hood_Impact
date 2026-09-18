@@ -24,6 +24,8 @@ from train_mesh_impact_history import (
     Config,
     DataPreprocessor,
     DECODER_BLOCKS,
+    DEFAULT_TEST_DESIGNS,
+    DEFAULT_VAL_DESIGNS,
     MODEL_DEFAULTS,
     MeshImpactHistoryNet,
     parse_args as parse_training_args,
@@ -277,8 +279,8 @@ def parse_args(argv=None):
     parser.add_argument("--data-root")
     parser.add_argument("--resume-from", help="Read experiment settings from the checkpoint's run.")
     parser.add_argument("--require-cuda", action="store_true")
-    parser.add_argument("--test-designs", type=int, nargs="+", default=[10, 11])
-    parser.add_argument("--val-designs", type=int, nargs="+", default=[5])
+    parser.add_argument("--test-designs", type=int, nargs="+", default=list(DEFAULT_TEST_DESIGNS))
+    parser.add_argument("--val-designs", type=int, nargs="+", default=list(DEFAULT_VAL_DESIGNS))
     parser.add_argument("--decoder", choices=sorted(DECODER_BLOCKS), default=MODEL_DEFAULTS["decoder"])
     for key in EXPERIMENT_MODEL_KEYS:
         parser.add_argument(f"--{key.replace('_', '-')}", type=type(MODEL_DEFAULTS[key]),

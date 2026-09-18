@@ -197,3 +197,17 @@ def test_resume_preflight_reads_saved_experiment_and_dataset_location(tmp_path, 
     assert args.impactor_nodes == 2
     assert args.design_difference_weight == 1
     assert Path(args.data_root) == tmp_path / "data"
+
+
+def test_historical_cluster_D_resume_keeps_its_split_after_defaults_change(tmp_path, toy_data):
+    source = tmp_path / "historical_cluster_D"
+    with mock.patch.object(DataPreprocessor, "load_all_data", return_value=toy_data):
+        main(training_args(source) + ["--test-designs", "10", "11", "--val-designs", "5"])
+    assert parse_args([]).test_designs == [4, 5]
+    resumed = parse_args(["--resume-from", str(source)])
+    assert resumed.test_designs == [10, 11]
+    assert resumed.val_designs == [5]
+    assert resumed.resume_splits["train"]["design_ids"] == [0, 4, 6]
+    # A checkpoint that learned design 4 cannot become a cluster-B test run.
+    with pytest.raises(SystemExit):
+        parse_args(["--resume-from", str(source), "--test-designs", "4", "5", "--val-designs", "11"])

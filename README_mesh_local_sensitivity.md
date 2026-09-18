@@ -4,8 +4,13 @@ This experiment adds **two local point-attention layers before mesh pooling**
 and a **matched-location, cross-cluster response-difference loss**. It retains
 the temporal decoder restored after the no-temporal ablation.
 
+Fresh submissions now hold out **cluster B (designs 4 and 5)**, validate on
+design **11**, and train on **0, 1, 2, 3, 6, 7, 8, 9, 10**. The network and
+loss settings are unchanged. Start from scratch for this split: the previous
+cluster-D checkpoint trained on design 4 and cannot supply a clean B test.
+
 Branch: `agent/mesh-impact-neighborhood-attention`.
-Reference run: `20260912_005426_3134539_1704`.
+Historical cluster-D reference run: `20260912_005426_3134539_1704`.
 
 ## Submit on DeltaAI
 
@@ -19,6 +24,12 @@ bash -l setup_mesh_impact_history_env.sh
 bash submit_mesh_impact_history_1704_local_sensitivity.sh
 ```
 
+The launcher pins test `4 5`, validation `11`, two neighborhood layers, k=16,
+the 286-node headform exclusion and difference-loss weight 1. It overrides old
+split exports. If `HOOD_MESH_RESUME_FROM` is still exported from an earlier job,
+unset it before this fresh submission. Slurm logs and the default W&B run name
+include `clusterB`.
+
 Setup uses the existing environment and checks the declared dependencies,
 including SciPy for sparse neighbor lookup. This wrapper requests **48 hours
 on one GPU** (`--time=48:00:00`). A trailing `--time` argument can override it.
@@ -31,6 +42,9 @@ six-hour estimate understated the full training cost. Changing the script
 affects new submissions; it does not extend a job already running.
 
 ### Resume an interrupted neighborhood job
+
+Resume continues the **source run's saved split**, whether B or D was its test
+cluster. It never changes an old cluster-D checkpoint into a cluster-B run.
 
 Sync the updated code to the cluster, then pass the **neighborhood run's**
 directory (containing `config.json`, `splits.json`, `scalers.joblib`,
@@ -81,12 +95,14 @@ holdout and the split:
 
 | Split | Designs | Impacts |
 |---|---|---:|
-| Train | 0, 1, 2, 3, 4, 6, 7, 8, 9 | 1278 |
-| Validation | 5 | 142 |
-| Test | 10, 11, the entire D cluster | 284 |
+| Train | 0, 1, 2, 3, 6, 7, 8, 9, 10 | 1278 |
+| Validation | 11 | 142 |
+| Test | 4, 5, the entire B cluster | 284 |
 
-Validation design 5 still shares cluster B with training design 4, exactly as
-in the reference run. Neither test design participates in training, scaler
+Validation design 11 shares cluster D with training design 10. This preserves
+the previous experiment's split sizes and validation-within-cluster setup;
+validation is not an independent geometry-cluster evaluation. Preflight reports
+that limitation. Neither test design participates in training, scaler
 fitting, difference pairs or validation checkpoint selection. The batch script
 keeps the working direct-Python launch inside the Slurm batch allocation.
 
@@ -279,11 +295,11 @@ it repeatedly pairs the two largest remaining cluster pools, with randomized
 tie-breaking and partners. It shuffles these pairs and keeps them together in
 even-sized batches. All leftover examples are included afterward.
 
-For this split, each location has four A designs, one B design and four C
-designs: four pairs plus one leftover. All 1278 training runs appear exactly
+For this split, each location has four A designs, four C designs and one D
+design: four pairs plus one leftover. All 1278 training runs appear exactly
 once per epoch, in 160 batches at batch size 8. The loss uses every eligible
 pair present in a batch, so accidental additional matches are included too.
-Pairing varies reproducibly with `seed + epoch`. A/B/C labels only construct
+Pairing varies reproducibly with `seed + epoch`. A/C/D labels only construct
 the training objective; **design IDs and cluster IDs are not network inputs**.
 
 AdamW, learning rate 0.0003, weight decay 0.00001, cosine scheduling, gradient
@@ -307,18 +323,19 @@ The same checkpoint and `HistoryPredictor` interface work with the existing
 acceleration and HIC evaluation tools. Old configs omit the new parameters and
 strictly reload the baseline architecture.
 
-To test each contribution separately, use the generic cluster-D wrapper:
+To test each contribution separately on the new split, use the cluster-B wrapper:
 
 ```bash
 # Neighborhood encoder only
 HOOD_MESH_DECODER=temporal HOOD_MESH_NEIGHBORHOOD_LAYERS=2 \
+HOOD_MESH_IMPACTOR_NODES=286 \
 HOOD_MESH_DESIGN_DIFFERENCE_WEIGHT=0 \
-bash submit_mesh_impact_history_1704_clusterD.sh
+bash submit_mesh_impact_history_1704_clusterB.sh
 
 # Design-sensitivity training only
 HOOD_MESH_DECODER=temporal HOOD_MESH_NEIGHBORHOOD_LAYERS=0 \
 HOOD_MESH_DESIGN_DIFFERENCE_WEIGHT=1 \
-bash submit_mesh_impact_history_1704_clusterD.sh
+bash submit_mesh_impact_history_1704_clusterB.sh
 ```
 
 Python defaults are zero neighborhood layers and zero difference weight,
@@ -338,12 +355,18 @@ checks train-only scalers, exports test histories and reproduces them after
 strict checkpoint reload. Submission tests execute the real shell scripts with
 Slurm stand-ins, including the previously failing `srun` scenario.
 
+The cluster-B pipeline revision passed 77 tests (plus 131 subtests), including
+the new split, training-only scalers, saved-split resume compatibility and
+launcher behavior with stale split/resume exports. A real-data CUDA preflight
+also passed with both neighborhood layers and the 286-node headform exclusion,
+confirming 1,278 training, 142 validation and 284 cluster-B test cases.
+
 A local CUDA smoke test using eight actual approximately 39,000-node meshes
 completed two optimization steps at full default model width, with finite
 losses and about 5.13 GiB peak allocated GPU memory. This checks executability,
-not convergence or DeltaAI runtime. The completed 100-epoch cluster-D run is
-needed to measure acceleration and HIC prediction performance.
+not convergence or DeltaAI runtime. A completed cluster-B run is needed to
+measure acceleration and HIC prediction performance on the new holdout.
 
-The actual 1278 training histories also passed the coordinate/time alignment
+The previous cluster-D split's 1278 training histories passed the coordinate/time alignment
 audit: 142 matched locations, 160 batches and 575 eligible pairs in epoch 1
 with seed 42 (568 deliberately arranged pairs plus seven additional matches).

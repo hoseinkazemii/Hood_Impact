@@ -5,6 +5,10 @@ Code for hood-impact acceleration-history modeling and Abaqus sample generation.
 For the new irregular-mesh attention network mapping hood geometry and impact
 location to acceleration history, see [Mesh impact history](README_mesh_impact_history.md).
 
+The neighborhood experiment now tests **cluster B (designs 4 and 5)**, validates
+on design **11**, and trains on the remaining nine designs. Start a fresh run with
+`bash submit_mesh_impact_history_1704_local_sensitivity.sh`.
+
 Main areas:
 
 - `abaqus_scripts/`: generate Abaqus impact decks, run Abaqus batches, extract and postprocess acceleration histories.

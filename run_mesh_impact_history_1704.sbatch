@@ -13,7 +13,8 @@
 #SBATCH --error=mesh_history_1704_%j.err
 
 # Train MeshImpactHistoryNet from scratch on the 1704 acceleration histories.
-# Preferred submission: bash submit_mesh_impact_history_1704_clusterD.sh
+# Preferred baseline submission: bash submit_mesh_impact_history_1704_clusterB.sh
+# Neighborhood experiment: bash submit_mesh_impact_history_1704_local_sensitivity.sh
 # Direct sbatch also works when submitted from the repository root.
 # Do not enable nounset: module/conda activation may access unset variables.
 set -eo pipefail
@@ -43,10 +44,10 @@ export WANDB_MODE=${WANDB_MODE:-online}
 export WANDB_PROJECT=${WANDB_PROJECT:-hood-impact-mesh-attention}
 
 DATA_ROOT=${HOOD_MESH_DATA_ROOT:-${PROJECT_DIR}/Data/HoodImpact_1704_EuroNCAP}
-# Hardest existing split: all of cluster D stays in test, and validation
-# design 5 belongs to cluster B. Preflight rejects test clones in training.
-read -r -a TEST_DESIGNS <<< "${HOOD_MESH_TEST_DESIGNS:-10 11}"
-read -r -a VAL_DESIGNS <<< "${HOOD_MESH_VAL_DESIGNS:-5}"
+# Fresh-run default: whole cluster B in test, design 11 in validation.
+# Preflight rejects test clones in training; saved splits govern resumes.
+read -r -a TEST_DESIGNS <<< "${HOOD_MESH_TEST_DESIGNS:-4 5}"
+read -r -a VAL_DESIGNS <<< "${HOOD_MESH_VAL_DESIGNS:-11}"
 DECODER=${HOOD_MESH_DECODER:-temporal}
 STAMP=$(date +%Y%m%d_%H%M%S)
 JOB_ID=${SLURM_JOB_ID:-local}
@@ -55,8 +56,12 @@ RUN_NAME=${HOOD_MESH_RUN_NAME:-mesh_history_1704_${JOB_ID}}
 
 printf 'Node: %s\nPython: %s\nModule: %s\n' "$(hostname)" "${PYTHON_BIN}" "${PYTORCH_MODULE}"
 printf 'Commit: %s\nDataset: %s\nOutput: %s\n' "$(git rev-parse HEAD)" "${DATA_ROOT}" "${OUTPUT_DIR}"
-printf 'Test designs: %s | Validation designs: %s\n' "${TEST_DESIGNS[*]}" "${VAL_DESIGNS[*]}"
-printf 'Decoder arm: %s\n' "${DECODER}"
+if [[ -n "${HOOD_MESH_RESUME_FROM:-}" ]]; then
+    printf 'Resume: split and architecture restored from %s\n' "${HOOD_MESH_RESUME_FROM}"
+else
+    printf 'Test designs: %s | Validation designs: %s\n' "${TEST_DESIGNS[*]}" "${VAL_DESIGNS[*]}"
+    printf 'Decoder arm: %s\n' "${DECODER}"
+fi
 printf 'W&B: %s | project: %s | entity: %s\n' "${WANDB_MODE}" "${WANDB_PROJECT}" "${WANDB_ENTITY:-default team}"
 module list 2>&1 || true
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader

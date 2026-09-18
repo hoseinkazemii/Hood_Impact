@@ -105,7 +105,7 @@ def test_invalid_neighborhood_configuration_fails(options):
         MeshImpactHistoryNet(**options)
 
 
-def training_metadata(designs=(0, 1, 2, 3, 4, 6, 7, 8, 9), locations=142):
+def training_metadata(designs=(0, 1, 2, 3, 6, 7, 8, 9, 10), locations=142):
     return SimpleNamespace(
         run_numbers=[d * locations + i + 1 for d in designs for i in range(locations)],
         indentor_positions=[np.array([i, 2 * i], dtype=np.float32) for d in designs for i in range(locations)],
@@ -127,7 +127,7 @@ def test_sampler_preserves_all_1278_train_runs_once_and_keeps_cross_cluster_pair
     assert len(batches) == len(sampler) == 160
     flat = [i for batch in batches for i in batch]
     assert sorted(flat) == list(range(1278))
-    assert not {5, 10, 11} & set(matched.designs)
+    assert not {4, 5, 11} & set(matched.designs)
     # Four cross-cluster pairs at each of 142 locations; one leftover per location.
     for offset in range(0, 1136, 2):
         a, b = flat[offset:offset + 2]
@@ -174,13 +174,13 @@ def test_difference_loss_detects_geometry_collapse_and_cancels_common_error():
 def test_both_additions_train_save_and_reload_with_train_only_scalers():
     from train_mesh_impact_history import DataPreprocessor, HistoryPredictor, main
 
-    # Four locations per design; training A/B/C, validation 5, test whole D.
+    # Four locations per design; training A/C/D, validation 11, test whole B.
     # Mock only disk loading so the real split, scalers, sampler, optimizer,
     # checkpoint selection, exports and inference all execute.
     rng = np.random.default_rng(14)
     data = {key: [] for key in ("run_numbers", "mesh_geometries", "indentor_positions", "time_arrays", "accelerations")}
     times = np.linspace(0, .025, 7, dtype=np.float32)
-    for design in (0, 4, 6, 5, 10, 11):
+    for design in (0, 6, 10, 11, 4, 5):
         for location in range(4):
             data["run_numbers"].append(design * 4 + location + 1)
             data["mesh_geometries"].append((rng.normal(size=(10 + location, 3)) + design).astype(np.float32))
@@ -198,8 +198,9 @@ def test_both_additions_train_save_and_reload_with_train_only_scalers():
         saved = json.loads((root / "config.json").read_text())
         history = json.loads((root / "training_history.json").read_text())
         splits = json.loads((root / "splits.json").read_text())
-        assert splits["train"]["design_ids"] == [0, 4, 6]
-        assert splits["test"]["design_ids"] == [10, 11]
+        assert splits["train"]["design_ids"] == [0, 6, 10]
+        assert splits["validation"]["design_ids"] == [11]
+        assert splits["test"]["design_ids"] == [4, 5]
         assert saved["training"]["design_difference_weight"] == 1
         assert saved["architecture"]["kwargs"]["neighborhood_layers"] == 2
         assert saved["architecture"]["kwargs"]["impactor_nodes"] == 2

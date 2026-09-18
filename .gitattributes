@@ -1,6 +1,7 @@
 # Slurm and bash require Unix line endings, including after Windows edits.
 setup_mesh_impact_history_env.sh text eol=lf
 submit_mesh_impact_history_1704.sh text eol=lf
+submit_mesh_impact_history_1704_clusterB.sh text eol=lf
 submit_mesh_impact_history_1704_clusterD.sh text eol=lf
 submit_mesh_impact_history_1704_no_temporal.sh text eol=lf
 submit_mesh_impact_history_1704_local_sensitivity.sh text eol=lf

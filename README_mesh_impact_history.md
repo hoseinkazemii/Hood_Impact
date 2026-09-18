@@ -1,9 +1,11 @@
 # Mesh and impact location to acceleration history
 
 For the **neighborhood encoder + design-sensitivity training** experiment on
-the same cluster-D holdout, see [the architecture and training derivation](README_mesh_local_sensitivity.md).
+the cluster-B holdout, see [the architecture and training derivation](README_mesh_local_sensitivity.md).
 Submit it with `bash submit_mesh_impact_history_1704_local_sensitivity.sh`.
-The ordinary launcher and Python defaults still reproduce the temporal baseline.
+The ordinary launcher and Python defaults retain the temporal baseline architecture
+and now use test designs **4, 5** and validation design **11**. The historical
+cluster-D and no-temporal reproduction launchers retain their original D split.
 
 `mesh_impact_history.py` defines the new `MeshImpactHistoryNet` from scratch.
 It takes the irregular hood mesh node coordinates `(N, 3)` and the in-plane
@@ -59,11 +61,15 @@ The depth flag remains `--temporal-layers` for checkpoint compatibility; with
 `mesh_only`, it counts mesh cross-attention blocks and adds no temporal attention.
 
 ```powershell
-python train_mesh_impact_history.py --data-format euroncap1704 --test-designs 10 11 --val-designs 5 --decoder temporal --epochs 100 --batch-size 8 --lr 0.0003 --device cuda --output-dir runs/mesh_impact_history/euroncap_01
+python train_mesh_impact_history.py --data-format euroncap1704 --test-designs 4 5 --val-designs 11 --decoder temporal --epochs 100 --batch-size 8 --lr 0.0003 --device cuda --output-dir runs/mesh_impact_history/euroncap_clusterB_01
 ```
 
 Design IDs are **zero based**: `(run_number - 1) // samples_per_design`.
-The defaults reserve designs 10 and 11 for testing and design 5 for validation.
+The defaults reserve designs 4 and 5 (whole cluster B) for testing and design 11
+for validation. On the 1704 set, training uses designs 0,1,2,3,6,7,8,9,10.
+Validation design 11 shares cluster D with training design 10; preflight reports
+that validation limitation. Start a fresh run for the B holdout: older D-holdout
+checkpoints trained on design 4. Resumes always retain the source run's split.
 For `industrylike`, one run is one design; for `euroncap1704`, each design has
 142 runs; for `legacy`, each design has 50 runs. All other loaded designs train
 the model. Validation/test designs must be disjoint, must have loaded runs,
@@ -89,18 +95,18 @@ training with a login/destination error instead of silently disabling tracking.
 
 ## Submit the 1704 dataset on DeltaAI
 
-On the cluster, check out branch `agent/mesh-impact-history-1704`, then run from
+On the cluster, check out branch `agent/mesh-impact-neighborhood-attention`, then run from
 the repository root:
 
 ```bash
 git fetch origin
-git switch agent/mesh-impact-history-1704
-git pull --ff-only origin agent/mesh-impact-history-1704
+git switch agent/mesh-impact-neighborhood-attention
+git pull --ff-only origin agent/mesh-impact-neighborhood-attention
 bash -l setup_mesh_impact_history_env.sh
 module load "${HOOD_MESH_PYTORCH_MODULE:-python/miniforge3_pytorch/2.10.0}"
 source "${HOOD_MESH_VENV:-.venv-mesh-history}/bin/activate"
 python -m wandb login
-bash submit_mesh_impact_history_1704_clusterD.sh
+bash submit_mesh_impact_history_1704_clusterB.sh
 ```
 
 The setup script creates a Linux-native `.venv-mesh-history` overlay using
@@ -111,14 +117,15 @@ both setup and submission if you use a different module or environment path.
 For example, an environment on scratch can be selected with
 `export HOOD_MESH_VENV=/work/nvme/<account>/$USER/hood-mesh-history`.
 
-`submit_mesh_impact_history_1704_clusterD.sh` creates `runs/slurm` before submitting
+`submit_mesh_impact_history_1704_clusterB.sh` pins the B test split even if older
+split settings are exported, and creates `runs/slurm` before submitting
 `run_mesh_impact_history_1704.sbatch`. The job requests one GPU, 16 CPU cores,
 96 GB host memory, and six hours on `ghx4`, account `bbqg-dtai-gh`. Additional
 submission-script arguments go to `sbatch`, so resources can be overridden:
 
 ```bash
 # One epoch over all 1704 cases to check the complete pipeline first.
-HOOD_MESH_EPOCHS=1 bash submit_mesh_impact_history_1704_clusterD.sh --time=00:30:00
+HOOD_MESH_EPOCHS=1 bash submit_mesh_impact_history_1704_clusterB.sh --time=00:30:00
 
 # Longer experiment with different held-out designs.
 HOOD_MESH_EPOCHS=200 HOOD_MESH_BATCH_SIZE=8 \
@@ -145,7 +152,7 @@ Python checks. Pull the fix and resubmit with the submission command above;
 no environment reinstall is needed for this launcher change.
 
 The job always selects **euroncap1704**, 1,704 runs, acceleration prediction,
-and 142 cases per design. Default test designs 10 and 11 and validation design 5
+and 142 cases per design. Default test designs 4 and 5 and validation design 11
 give **1,278 training / 142 validation / 284 test** cases. Epochs, batch size, learning
 rate, and time stride inherit the current Python configuration (currently
 100 epochs, batch 8, LR 0.0003, stride 16). There is no launcher time-stride
@@ -182,7 +189,7 @@ The existing dataset analysis identifies near-clone geometry groups
 `[0,1,2,3]`, `[4,5]`, `[6,7,8,9]`, and `[10,11]`; hold out whole groups when
 measuring generalization to different geometry.
 
-### Temporal-attention ablation on the hardest existing split
+### Historical temporal-attention ablation on the cluster-D split
 
 The dedicated `submit_mesh_impact_history_1704_no_temporal.sh` launcher pins
 `decoder=mesh_only`, test designs **10,11** and validation design **5**, even if
@@ -212,7 +219,8 @@ against full-resolution simulations, versus **0.7603** for the temporal baseline
 `20260912_005426_3134539_1704` on the same 284 test impacts. HIC RMSE rose from
 **210.53** to **220.95**, and predictions within ±10% fell from **62.0%** to
 **56.0%**. Temporal attention is therefore restored as the training and launcher
-default. The hardest split and direct Python launch fix are retained.
+default. The direct Python launch fix is retained. New default experiments now
+hold out cluster B; the results in this section refer to the original D split.
 
 To submit the restored temporal model on this same split:
 
@@ -220,8 +228,10 @@ To submit the restored temporal model on this same split:
 bash submit_mesh_impact_history_1704_clusterD.sh
 ```
 
-The generic and cluster-D launchers also default to the hardest split and
-`temporal`, but allow explicit environment overrides. The dedicated
+The generic launcher now defaults to test 4,5 / validation 11 and `temporal`,
+with explicit environment overrides available. The named cluster-B launcher
+pins that split. The historical cluster-D launcher retains test 10,11 /
+validation 5 and allows explicit environment overrides. The dedicated
 `submit_mesh_impact_history_1704_no_temporal.sh` still pins the ablation for
 reproduction, and saved `mesh_only` checkpoints remain loadable. Both preflight and
 training receive the same resolved decoder. The decoder is recorded in
@@ -342,7 +352,8 @@ geometry/impact sensitivity, gradients, mixed precision, coordinate alignment,
 the existing time stride, and a complete one-epoch training/checkpoint/inference
 cycle for both decoder variants with training-only scalers. Ablation checks cover
 zero coupling between distinct time queries, CUDA gradients, legacy checkpoint
-reload, the exact cluster-D split, and launchers with simulated Slurm commands.
+reload, the default cluster-B split, historical cluster-D reproduction and
+launchers with simulated Slurm commands.
 The ablation also passed the real 1704-dataset preflight and a CUDA
 forward/backward probe on its first 38,977-node mesh with 63 sampled times.
 A previous one-epoch CUDA smoke run on 12 real industrylike cases used the

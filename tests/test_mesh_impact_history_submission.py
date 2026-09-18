@@ -16,24 +16,24 @@ import train_mesh_impact_history as training
 
 
 class SubmissionSplitTests(unittest.TestCase):
-    def test_defaults_match_hardest_existing_split_and_temporal_model(self):
+    def test_defaults_hold_out_whole_cluster_B_and_keep_temporal_model(self):
         for parse in (preflight.parse_args, training.parse_args):
             args = parse([])
             self.assertEqual(args.decoder, "temporal")
-            self.assertEqual(args.test_designs, [10, 11])
-            self.assertEqual(args.val_designs, [5])
-        splits = preflight.validate_splits([10, 11], [5])
-        self.assertEqual(splits["train"]["design_ids"], [0, 1, 2, 3, 4, 6, 7, 8, 9])
+            self.assertEqual(args.test_designs, [4, 5])
+            self.assertEqual(args.val_designs, [11])
+        splits = preflight.validate_splits([4, 5], [11])
+        self.assertEqual(splits["train"]["design_ids"], [0, 1, 2, 3, 6, 7, 8, 9, 10])
         self.assertEqual(len(splits["train"]["run_numbers"]), 1278)
-        self.assertEqual(splits["validation"]["run_numbers"], list(range(711, 853)))
-        self.assertEqual(splits["test"]["run_numbers"], list(range(1421, 1705)))
-        held_clusters, warnings = preflight.validate_cluster_holdout([10, 11], [5])
-        self.assertEqual(held_clusters, ["D"])
+        self.assertEqual(splits["validation"]["run_numbers"], list(range(1563, 1705)))
+        self.assertEqual(splits["test"]["run_numbers"], list(range(569, 853)))
+        held_clusters, warnings = preflight.validate_cluster_holdout([4, 5], [11])
+        self.assertEqual(held_clusters, ["B"])
         self.assertEqual(len(warnings), 1)
-        self.assertIn("cluster B", warnings[0])
+        self.assertIn("cluster D", warnings[0])
 
     def test_rejects_test_geometry_clones_in_training(self):
-        for test, validation in (([2], [10]), ([11], [5])):
+        for test, validation in (([2], [10]), ([11], [5]), ([4], [11]), ([5], [11])):
             with self.subTest(test=test, validation=validation):
                 with self.assertRaisesRegex(ValueError, "near-clones in training"):
                     preflight.validate_cluster_holdout(test, validation)
@@ -139,15 +139,30 @@ printf 'ARG=%s\\n' "$@"
         for expected in ("DECODER=temporal", "TEST=10 11", "VAL=5"):
             self.assertIn(expected, output)
 
-    def test_local_sensitivity_launcher_pins_both_changes_and_hardest_split(self):
+    def test_cluster_B_launcher_overrides_old_split_but_accepts_model_options(self):
+        self.env.update(HOOD_MESH_TEST_DESIGNS="10 11", HOOD_MESH_VAL_DESIGNS="5",
+                        HOOD_MESH_ALLOW_CLONE_LEAK="1", HOOD_MESH_NEIGHBORHOOD_LAYERS="2")
+        output = self.launch("submit_mesh_impact_history_1704_clusterB.sh", ["--time=08:00:00"])
+        for expected in ("DECODER=temporal", "TEST=4 5", "VAL=11", "LEAK=0", "LOCAL=2",
+                         "ARG=--job-name=mesh_hist_clusterB", "ARG=--time=08:00:00"):
+            self.assertIn(expected, output)
+
+    def test_local_sensitivity_launcher_pins_both_changes_and_cluster_B_split(self):
         self.env.update(HOOD_MESH_DECODER="mesh_only", HOOD_MESH_TEST_DESIGNS="2",
                         HOOD_MESH_VAL_DESIGNS="10", HOOD_MESH_ALLOW_CLONE_LEAK="1",
                         HOOD_MESH_NEIGHBORHOOD_LAYERS="0", HOOD_MESH_DESIGN_DIFFERENCE_WEIGHT="0")
         output = self.launch("submit_mesh_impact_history_1704_local_sensitivity.sh", ["--time=08:00:00"])
-        for expected in ("DECODER=temporal", "TEST=10 11", "VAL=5", "LEAK=0",
+        for expected in ("DECODER=temporal", "TEST=4 5", "VAL=11", "LEAK=0",
                          "LOCAL=2", "K=16", "DIFFERENCE=1.0", "ARG=--time=48:00:00", "ARG=--time=08:00:00"):
             self.assertIn(expected, output)
         self.assertLess(output.index("ARG=--time=48:00:00"), output.index("ARG=--time=08:00:00"))
+
+    def test_fresh_cluster_B_launchers_cannot_silently_resume_an_old_split(self):
+        self.env["HOOD_MESH_RESUME_FROM"] = "old_cluster_D_run"
+        for script in ("submit_mesh_impact_history_1704_clusterB.sh",
+                       "submit_mesh_impact_history_1704_local_sensitivity.sh"):
+            output = self.launch(script, expected_returncode=2)
+            self.assertNotIn("ARG=", output)
 
     def test_resume_launcher_passes_source_and_dependency_with_48_hours(self):
         source = self.root / "old run with spaces"
@@ -179,6 +194,8 @@ printf 'ARG=%s\\n' "$@"
         for option in ("--epochs", "--width", "--design-difference-weight", "--test-designs"):
             self.assertNotIn(f"<{option}>", commands[1])
         self.assertIn("<--output-dir>", commands[1])
+        self.assertNotIn("Test designs:", output)
+        self.assertIn("split and architecture restored", output)
 
     def test_new_options_reach_both_direct_preflight_and_training(self):
         self.env.update(HOOD_MESH_NEIGHBORHOOD_LAYERS="2", HOOD_MESH_NEIGHBORHOOD_K="16",
@@ -205,7 +222,7 @@ printf 'ARG=%s\\n' "$@"
                 self.assertIn("train_mesh_impact_history.py", commands[1])
                 for command in commands:
                     self.assertIn(f"<--decoder> <{decoder or 'temporal'}>", command)
-                    self.assertIn("<--test-designs> <10> <11> <--val-designs> <5>", command)
+                    self.assertIn("<--test-designs> <4> <5> <--val-designs> <11>", command)
                     self.assertIn("CUDA_VISIBLE_DEVICES=GPU-allocated-by-slurm", command)
                 self.assertIn("Finished. Checkpoints, metrics and acceleration histories:", output)
 

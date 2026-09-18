@@ -50,6 +50,9 @@ MODEL_DEFAULTS = {
     # 1704 .inp files put the 286 impactor nodes first; 0 disables the holdout.
     "impactor_nodes": 0,
 }
+# Fresh experiments hold out the whole B cluster. Resumes restore saved splits.
+DEFAULT_TEST_DESIGNS = (4, 5)
+DEFAULT_VAL_DESIGNS = (11,)
 CHECKPOINT_NAME = "hood_impact_best_model.pt"  # Filename used by shared Trainer.
 LAST_CHECKPOINT_NAME = "hood_impact_last_model.pt"
 
@@ -61,10 +64,9 @@ def parse_args(argv=None):
         parser.add_argument(f"--{name}")
     parser.add_argument("--num-samples", type=int)
     parser.add_argument("--samples-per-design", type=int)
-    # Keep all of cluster D in test, including during validation-based
-    # checkpoint selection. Match the hardest existing run (validation 5).
-    parser.add_argument("--test-designs", type=int, nargs="+", default=[10, 11], help="Zero-based design IDs.")
-    parser.add_argument("--val-designs", type=int, nargs="+", default=[5], help="Zero-based design IDs.")
+    # Cluster B never participates in optimization or checkpoint selection.
+    parser.add_argument("--test-designs", type=int, nargs="+", default=list(DEFAULT_TEST_DESIGNS), help="Zero-based design IDs.")
+    parser.add_argument("--val-designs", type=int, nargs="+", default=list(DEFAULT_VAL_DESIGNS), help="Zero-based design IDs.")
     parser.add_argument("--epochs", type=int, help="Total epoch target, including completed epochs.")
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--lr", type=float)

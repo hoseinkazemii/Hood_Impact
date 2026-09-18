@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Cluster-D holdout run of MeshImpactHistoryNet on the 1704 EuroNCAP set.
+# Historical reproduction; fresh B-holdout runs use the clusterB or local_sensitivity launcher.
 #
 #   train      designs 0,1,2,3,4,6,7,8,9   (geometry clusters A, B, C)
 #   validation design 5                    (cluster B)
