@@ -41,6 +41,29 @@ epoch, or roughly 12.5 hours for 100 epochs at that average pace. The previous
 six-hour estimate understated the full training cost. Changing the script
 affects new submissions; it does not extend a job already running.
 
+### Cluster-B experiment with 256 neighbors
+
+After pulling the updated code on DeltaAI, start a fresh run with:
+
+```bash
+bash submit_mesh_impact_history_1704_local_sensitivity_k256.sh
+```
+
+This uses the same configuration as the k=16 neighborhood launcher, except
+that each structural node attends to **256 nearest nodes**, including itself.
+It retains two neighborhood layers, the temporal decoder, difference-loss
+weight 1, 286 excluded headform nodes, 20 mm positional scaling, chunk size
+1024, test designs **4 5**, and validation design **11**. The existing training
+defaults remain 100 epochs and batch size 8. Both preflight and training
+receive `--neighborhood-k 256`; the saved run config records the value.
+
+The launcher requests 48 hours on one GPU and uses `k256` in the Slurm job,
+log filenames, and default W&B run name. Unset `HOOD_MESH_RESUME_FROM` before
+submission if it is exported. Other training environment overrides still apply.
+Increasing k from 16 to 256 creates 16 times as many neighbor edges per node;
+actual GPU memory use and runtime must be measured on DeltaAI. The existing
+chunking and activation checkpointing remain enabled.
+
 ### Resume an interrupted neighborhood job
 
 Resume continues the **source run's saved split**, whether B or D was its test
