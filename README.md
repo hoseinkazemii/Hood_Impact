@@ -9,6 +9,11 @@ The neighborhood experiment now tests **cluster B (designs 4 and 5)**, validates
 on design **11**, and trains on the remaining nine designs. Start a fresh run with
 `bash submit_mesh_impact_history_1704_local_sensitivity.sh`.
 
+For the previous best acceleration Temporal DeepONet trained from scratch on
+the same 1704-sample cluster-B split, see
+[Temporal DeepONet baseline](README_temporal_deeponet_1704.md).
+Submit with `bash submit_temporal_deeponet_1704.sh`.
+
 Main areas:
 
 - `abaqus_scripts/`: generate Abaqus impact decks, run Abaqus batches, extract and postprocess acceleration histories.

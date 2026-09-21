@@ -8,3 +8,5 @@ submit_mesh_impact_history_1704_local_sensitivity.sh text eol=lf
 submit_mesh_impact_history_1704_local_sensitivity_k256.sh text eol=lf
 submit_mesh_impact_history_1704_local_sensitivity_resume.sh text eol=lf
 run_mesh_impact_history_1704.sbatch text eol=lf
+submit_temporal_deeponet_1704.sh text eol=lf
+run_temporal_deeponet_1704.sbatch text eol=lf

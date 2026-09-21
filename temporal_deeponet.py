@@ -512,6 +512,60 @@ class HoodImpactNeuralOperator(nn.Module):
         return out
 
 
+# Recovered from the state_dict and logged architecture of the acceleration
+# run 20260116_160228_best. Keep this independent of evolving Config defaults.
+ACCELERATION_BEST_ARCH = {
+    "pointnet_input_dim": 3,
+    "pointnet_hidden_dims": [64, 128, 128, 128, 256],
+    "pointnet_output_dim": 128,
+    "film_condition_dim": 2,
+    "film_hidden_dim": 64,
+    "trunk_hidden_dims": [64, 128, 256],
+    "trunk_output_dim": 128,
+    "num_fourier_frequencies": 8,
+    "num_tcn_layers": 5,
+    "operator_head_hidden_dims": [256, 256],
+}
+
+
+class LegacyHoodImpactNeuralOperator(nn.Module):
+    """January's acceleration model: global PointNet, one FiLM, temporal trunk.
+
+    With ACCELERATION_BEST_ARCH, the original checkpoint loads strictly, including
+    its ``film_layer.*`` keys. Training on new data uses fresh weights/scalers.
+    """
+
+    def __init__(self, config: Config):
+        super().__init__()
+        if config.prediction_target != "acceleration":
+            raise ValueError("The legacy acceleration baseline requires acceleration targets")
+        self.config = config
+        self.mesh_encoder = PointNetEncoder(
+            config.pointnet_input_dim, config.pointnet_hidden_dims, config.pointnet_output_dim,
+        )
+        self.film_layer = FiLMLayer(
+            config.pointnet_output_dim, config.film_condition_dim, config.film_hidden_dim,
+        )
+        self.branch_transform = nn.Sequential(
+            nn.Linear(config.pointnet_output_dim, config.pointnet_output_dim),
+            nn.LayerNorm(config.pointnet_output_dim),
+            nn.GELU(),
+        )
+        self.trunk = TrunkNetwork(
+            config.trunk_output_dim, config.num_fourier_frequencies,
+            config.trunk_hidden_dims, config.num_tcn_layers, dropout=0.1,
+        )
+        self.output_net = OutputNetwork(
+            config.trunk_output_dim, config.operator_head_hidden_dims, dropout=0.1,
+        )
+
+    def forward(self, mesh, mesh_batch, indentor, time, time_batch, batch_size=1):
+        branch = self.mesh_encoder(mesh, mesh_batch, indentor, batch_size)
+        branch = self.branch_transform(self.film_layer(branch, indentor))
+        trunk = self.trunk(time, time_batch, batch_size)
+        return self.output_net(branch[time_batch] * trunk)
+
+
 def main():
     config = Config()
     set_seed(config.seed)

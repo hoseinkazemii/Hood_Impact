@@ -95,7 +95,7 @@ class SubmissionLauncherTests(unittest.TestCase):
 printf ' CUDA_VISIBLE_DEVICES=%s\\n' "${CUDA_VISIBLE_DEVICES-unset}"
 case "$2" in
     preflight_mesh_impact_history_1704.py) exit "${MESH_TEST_PREFLIGHT_STATUS:-0}" ;;
-    train_mesh_impact_history.py) exit "${MESH_TEST_TRAIN_STATUS:-0}" ;;
+    train_mesh_impact_history.py|train_temporal_deeponet_1704.py) exit "${MESH_TEST_TRAIN_STATUS:-0}" ;;
 esac
 """)
         self.env.update(MESH_TEST_PREFLIGHT_STATUS="0", MESH_TEST_TRAIN_STATUS="0")
@@ -125,6 +125,33 @@ printf 'ARG=%s\\n' "$@"
         )
         self.assertEqual(result.returncode, expected_returncode, result.stdout + result.stderr)
         return result.stdout
+
+    def test_temporal_deeponet_submission_forwards_slurm_options(self):
+        output = self.launch("submit_temporal_deeponet_1704.sh", ["--time=00:30:00"])
+        for expected in ("ARG=--time=00:30:00", "run_temporal_deeponet_1704.sbatch",
+                         "temporal_deeponet_1704_%j.out", "ARG=--export=ALL"):
+            self.assertIn(expected, output)
+
+    def test_temporal_deeponet_ignores_old_model_exports_and_preserves_gpu(self):
+        self.env.update(HOOD_MESH_RESUME_FROM="old-run", HOOD_MESH_TEST_DESIGNS="2",
+                        HOOD_MESH_VAL_DESIGNS="10", HOOD_MESH_DESIGN_DIFFERENCE_WEIGHT="1",
+                        HOOD_MESH_EPOCHS="900", CUDA_VISIBLE_DEVICES="GPU-allocated-by-slurm",
+                        HOOD_TD_EPOCHS="7", HOOD_TD_SEED="19", HOOD_TD_DATA_ROOT="/data/with spaces")
+        output = self.launch("run_temporal_deeponet_1704.sbatch")
+        commands = [line for line in output.splitlines() if line.startswith("PYTHON")]
+        self.assertEqual(len(commands), 1)
+        command = commands[0]
+        for expected in ("train_temporal_deeponet_1704.py", "<--test-designs> <4> <5> <--val-designs> <11>",
+                         "<--epochs> <7>", "<--seed> <19>", "<--data-root> </data/with spaces>",
+                         "CUDA_VISIBLE_DEVICES=GPU-allocated-by-slurm", "<--device> <cuda>"):
+            self.assertIn(expected, command)
+        for unwanted in ("--resume-from", "--design-difference-weight", "--decoder", "900"):
+            self.assertNotIn(unwanted, command)
+
+    def test_temporal_deeponet_failure_propagates_to_slurm(self):
+        self.env["MESH_TEST_TRAIN_STATUS"] = "23"
+        output = self.launch("run_temporal_deeponet_1704.sbatch", expected_returncode=23)
+        self.assertNotIn("Finished.", output)
 
     def test_ablation_launcher_pins_hardest_split_despite_old_environment(self):
         self.env.update(HOOD_MESH_DECODER="temporal", HOOD_MESH_TEST_DESIGNS="2",
