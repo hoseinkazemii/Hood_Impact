@@ -42,7 +42,7 @@ DATA_ROOT=${HOOD_V6_DATA_ROOT:-${PROJECT_DIR}/Data}
 OUTPUT_DIR=${HOOD_V6_OUTPUT_DIR:-${PROJECT_DIR}/runs/gpu_multiscale_1704/$(date +%Y%m%d_%H%M%S)_${SLURM_JOB_ID:-local}}
 TRAIN_ARGS=(
     --dataset 1704 --data-root "${DATA_ROOT}" --require-cuda
-    --validation-design "${HOOD_VAL_DESIGN:-10}" --test-design "${HOOD_TEST_DESIGN:-11}"
+    --validation-design 11 --test-designs 4 5 --no-refit-development
     --epochs "${HOOD_V6_EPOCHS:-200}" --batch-size "${HOOD_V6_BATCH_SIZE:-16}"
     --workers "${HOOD_V6_WORKERS:-8}" --evaluate-test
     --output-dir "${OUTPUT_DIR}" --wandb-project "${WANDB_PROJECT}"

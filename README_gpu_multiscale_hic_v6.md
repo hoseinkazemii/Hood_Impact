@@ -196,18 +196,21 @@ python gpu_multiscale_hic_v6.py \
 ## Train the same CNN on 1704 samples
 
 The architecture, 48x48 maps, three spatial scales, direct HIC15 target,
-auxiliary 1,000-point history loss, optimizer, and selection/refit procedure
-are unchanged. `--dataset 1704` selects only `HoodImpact_1704_EuroNCAP`
+auxiliary 1,000-point history loss, optimizer, and validation-based epoch
+selection are unchanged. `--dataset 1704` selects only `HoodImpact_1704_EuroNCAP`
 (12 designs x 142 locations); it does not add the 60 IndustryLike runs.
 The default 660 mode and old launcher remain available.
 
 The 1704 mode validates merged run IDs (`run = 142 * design + loc`), uses
 merged IDs for filenames, preserves original-source provenance, fits all 142
 location means using training designs only, and fingerprints its own cache.
-Defaults: training designs 0-9 (1,420 samples), validation design 10 (142),
-reference test design 11 (142). After epoch selection, a fresh refit uses
-0-10 (1,562 samples). This preserves the old split, not the cluster-B split
-used by the newer attention/DeepONet experiments; compare scores accordingly.
+The split matches the neighborhood attention cluster-B experiment exactly:
+training designs 0,1,2,3,6,7,8,9,10 (1,278 samples), validation design 11
+(142), and test designs 4,5 (284). The launcher pins this split even if old
+split environment variables are exported. There is no train+validation refit:
+validation remains held out and test evaluation uses the best validation
+checkpoint trained on the nine training designs. These are also the direct
+Python defaults for `--dataset 1704`; legacy 660 defaults remain unchanged.
 
 On the same DeltaAI setup as the existing 1704 jobs:
 
@@ -224,13 +227,13 @@ The launcher uses `python/miniforge3_pytorch/2.10.0` and
 Pass scheduler overrides to the submission wrapper, e.g. `--time=12:00:00`.
 The complete dataset must already be on DeltaAI; it is not tracked in Git.
 `HOOD_V6_DATA_ROOT` is the parent directory containing the dataset folder.
-`HOOD_V6_EPOCHS`, `HOOD_V6_BATCH_SIZE`, `HOOD_V6_WORKERS`,
-`HOOD_VAL_DESIGN`, and `HOOD_TEST_DESIGN` override training defaults.
+`HOOD_V6_EPOCHS`, `HOOD_V6_BATCH_SIZE`, and `HOOD_V6_WORKERS`
+override training defaults. The submission script fixes the cluster-B split.
 W&B defaults to offline (`WANDB_MODE=online` enables live logging).
 
 Logs: `runs/slurm/gpu_multiscale_hic_1704_<jobid>.{out,err}`.
-Results: `runs/gpu_multiscale_1704/<timestamp>_<jobid>/`, including selection
-and final checkpoints, normalizers, manifest/split, HIC and waveform metrics,
+Results: `runs/gpu_multiscale_1704/<timestamp>_<jobid>/`, including `best_model.pt`,
+`normalization.npz`, manifest/split, HIC and waveform metrics,
 predictions, and plots. The same-grid restriction now covers 142 locations.
 
 Local dataset check:

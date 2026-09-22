@@ -32,9 +32,9 @@ def test_merged_ids_paths_and_split():
         assert metadata.iloc[-1].original_source_run != 1704
         assert v6.history_path(root, "euroncap142", 1704).name == "HoodImpact_1704_SAE1000_interp1000.csv"
         assert v6.representative_deck(root, 11, "euroncap142").name == "HoodImpact_1563.inp"
-        train, val, test = v6.split_indices(metadata, 10, 11)
-        assert (len(train), len(val), len(test)) == (1420, 142, 142)
-        assert set(metadata.iloc[train].design) == set(range(10))
+        train, val, test = v6.split_indices(metadata, 11, [4, 5])
+        assert (len(train), len(val), len(test)) == (1278, 142, 284)
+        assert set(metadata.iloc[train].design) == {0, 1, 2, 3, 6, 7, 8, 9, 10}
         assert not (set(train) & set(val) or set(train) & set(test))
 
 
@@ -54,16 +54,16 @@ def test_142_location_normalization_and_evaluation():
     frame["source"] = "euroncap142"
     samples = len(frame)
     hic = (frame.location + frame.design * 10).to_numpy(np.float32)
-    hic[frame.design >= 10] += 1e6
+    hic[frame.design.isin([4, 5, 11])] += 1e6
     times = np.tile(np.linspace(0, 0.025, 10), (samples, 1))
     data = v6.PreparedData(
         frame, np.ones((samples, 3, len(v6.MAP_CHANNELS), 2, 2), np.float32),
         np.ones((samples, len(v6.SCALAR_FEATURES)), np.float32),
         times, np.ones_like(times) * 10, hic, "test-1704",
     )
-    train, val, _ = v6.split_indices(frame, 10, 11)
+    train, val, _ = v6.split_indices(frame, 11, [4, 5])
     normalizer = v6.TrainingNormalizer().fit(data, train)
-    np.testing.assert_allclose(normalizer.euroncap_hic_mean, np.arange(1, 143) + 45)
+    np.testing.assert_allclose(normalizer.euroncap_hic_mean, np.arange(1, 143) + (460 / 9))
     assert normalizer.industry_hic_mean.size == 0
     normalized = normalizer.transform_hic(hic[val], frame.iloc[val])
     np.testing.assert_allclose(normalizer.inverse_hic(normalized, frame.iloc[val]), hic[val])
@@ -76,3 +76,29 @@ def test_142_location_normalization_and_evaluation():
         normalizer.save(path)
         with np.load(path, allow_pickle=False) as saved:
             assert saved["euroncap_hic_mean"].shape == (142,)
+
+
+def test_dataset_defaults_preserve_validation_holdout():
+    args = v6.parse_args(["--dataset", "1704"])
+    assert args.test_design == [4, 5]
+    assert args.validation_design == 11
+    assert args.refit_development is False
+    legacy = v6.parse_args([])
+    assert (legacy.validation_design, legacy.test_design) == (10, 11)
+    assert legacy.refit_development is True
+
+
+@pytest.mark.parametrize("tests", [[4, 4], [4, 11], [], [4, 12]])
+def test_invalid_cluster_split_rejected(tests):
+    frame = manifest()
+    frame["source"] = "euroncap142"
+    with pytest.raises(ValueError):
+        v6.split_indices(frame, 11, tests)
+
+
+def test_launcher_pins_cluster_b_and_disables_refit():
+    root = Path(__file__).resolve().parents[1]
+    script = (root / "run_gpu_multiscale_hic_1704.sbatch").read_text()
+    assert "--validation-design 11 --test-designs 4 5 --no-refit-development" in script
+    assert "HOOD_TEST_DESIGN" not in script
+    assert "HOOD_VAL_DESIGN" not in script

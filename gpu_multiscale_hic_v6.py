@@ -1121,19 +1121,23 @@ def model_parameter_count(model: nn.Module) -> int:
 def split_indices(
     metadata: pd.DataFrame,
     validation_design: int,
-    test_design: int,
+    test_design: int | Sequence[int],
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    if validation_design == test_design:
+    test_designs = [test_design] if isinstance(test_design, (int, np.integer)) else list(test_design)
+    if not test_designs or len(set(test_designs)) != len(test_designs):
+        raise ValueError("test designs must be nonempty and unique")
+    if validation_design in test_designs:
         raise ValueError("validation and test design must differ")
-    for name, design in (("validation", validation_design), ("test", test_design)):
+    for design in [validation_design, *test_designs]:
         if design not in range(EXPECTED_DESIGNS):
-            raise ValueError(f"{name} design must be in [0, 11], got {design}")
+            raise ValueError(f"held-out design must be in [0, 11], got {design}")
     design = metadata["design"].to_numpy(np.int64)
-    train = np.flatnonzero((design != validation_design) & (design != test_design))
+    test_mask = np.isin(design, test_designs)
+    train = np.flatnonzero((design != validation_design) & ~test_mask)
     validation = np.flatnonzero(design == validation_design)
-    test = np.flatnonzero(design == test_design)
+    test = np.flatnonzero(test_mask)
     per_design = 142 if set(metadata["source"]) == {"euroncap142"} else 55
-    expected = (10 * per_design, per_design, per_design)
+    expected = ((11 - len(test_designs)) * per_design, per_design, len(test_designs) * per_design)
     if (len(train), len(validation), len(test)) != expected:
         raise ValueError(
             f"expected design split sizes {expected}, found {(len(train), len(validation), len(test))}"
@@ -1471,8 +1475,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--cache-dir", type=Path, default=Path("runs/_gpu_multiscale_hic_v6_cache")
     )
     parser.add_argument("--output-dir", type=Path, default=None)
-    parser.add_argument("--validation-design", type=int, default=10)
-    parser.add_argument("--test-design", type=int, default=11)
+    parser.add_argument("--validation-design", type=int, default=None)
+    test_group = parser.add_mutually_exclusive_group()
+    test_group.add_argument("--test-design", type=int, default=None)
+    test_group.add_argument("--test-designs", type=int, nargs="+", default=None)
     parser.add_argument("--max-window", type=float, default=0.015)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--min-epochs", type=int, default=30)
@@ -1492,7 +1498,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--refit-development",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=None,
         help=(
             "after validation selection, fit a fresh model on train+validation "
             "for the selected epoch count"
@@ -1502,7 +1508,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--rebuild-cache", action="store_true")
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--wandb-project", type=str, default=None)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.validation_design is None:
+        args.validation_design = 11 if args.dataset == "1704" else 10
+    if args.test_designs is not None:
+        args.test_design = args.test_designs
+    elif args.test_design is None:
+        args.test_design = [4, 5] if args.dataset == "1704" else 11
+    if args.refit_development is None:
+        args.refit_development = args.dataset == "660"
+    return args
 
 
 def validate_training_args(args: argparse.Namespace) -> None:
@@ -1835,7 +1850,7 @@ def run(args: argparse.Namespace) -> Path:
         )
         logger.info(
             "Design split | train designs %s (%d) | validation design %d (%d) | "
-            "historical reference design %d (%d)",
+            "test designs %s (%d)",
             sorted(data.metadata.iloc[train_indices]["design"].unique().tolist()),
             len(train_indices),
             args.validation_design,
@@ -2135,7 +2150,7 @@ def run(args: argparse.Namespace) -> Path:
                 output_dir / "test_selection_metrics.json",
                 {
                     "design": args.test_design,
-                    "status": "pre-refit historical reference benchmark",
+                    "status": "selection-model held-out design evaluation",
                     "training_designs": sorted(
                         data.metadata.iloc[train_indices]["design"].unique().tolist()
                     ),
@@ -2157,7 +2172,7 @@ def run(args: argparse.Namespace) -> Path:
                 data.hic15[test_indices],
                 selection_test_prediction["hic_direct"],
                 selection_test_wave_hic,
-                f"Pre-refit historical reference design {args.test_design}",
+                f"Selection model test designs {args.test_design}",
             )
             log_evaluation_to_wandb(
                 wandb_run,
@@ -2193,7 +2208,7 @@ def run(args: argparse.Namespace) -> Path:
             add_baseline_metrics(test_metric_sets, data, test_indices, test_baseline)
             test_summary = {
                 "design": args.test_design,
-                "status": "historical reference benchmark; not a statistically untouched test",
+                "status": "held-out design evaluation; previously examined benchmark",
                 "selected_epoch": best_epoch,
                 "refit_development": bool(args.refit_development),
                 "training_designs": sorted(
@@ -2216,7 +2231,7 @@ def run(args: argparse.Namespace) -> Path:
                 data.hic15[test_indices],
                 test_prediction["hic_direct"],
                 test_wave_hic,
-                f"Historical reference design {args.test_design}",
+                f"Test designs {args.test_design}",
             )
             log_evaluation_to_wandb(
                 wandb_run,

@@ -8,7 +8,7 @@ if ! command -v sbatch >/dev/null 2>&1; then
     exit 127
 fi
 mkdir -p "${PROJECT_DIR}/runs/slurm"
-printf 'Multiscale CNN | 1704 samples | train 0-9 | validation 10 | test 11 (defaults)\n'
+printf 'Multiscale CNN | 1704 samples | train 0,1,2,3,6,7,8,9,10 | validation 11 | test 4,5 (cluster B)\n'
 exec sbatch \
     --chdir="${PROJECT_DIR}" \
     --export=ALL \
