@@ -1,6 +1,6 @@
 # GPU multi-scale HIC model (V6)
 
-V6 is a new PyTorch experiment for the combined 660-sample dataset. It is
+V6 supports the original combined 660-sample dataset and the canonical 1704-sample dataset. It is
 additive: it does not import or modify `temporal_deeponet.py`, `utils/utils.py`,
 their launchers, or previous checkpoints.
 
@@ -191,4 +191,50 @@ On a CUDA workstation, a two-epoch end-to-end smoke run is available:
 python gpu_multiscale_hic_v6.py \
   --require-cuda --smoke-test --evaluate-test \
   --output-dir runs/local_gpu_v6_smoke
+```
+
+## Train the same CNN on 1704 samples
+
+The architecture, 48x48 maps, three spatial scales, direct HIC15 target,
+auxiliary 1,000-point history loss, optimizer, and selection/refit procedure
+are unchanged. `--dataset 1704` selects only `HoodImpact_1704_EuroNCAP`
+(12 designs x 142 locations); it does not add the 60 IndustryLike runs.
+The default 660 mode and old launcher remain available.
+
+The 1704 mode validates merged run IDs (`run = 142 * design + loc`), uses
+merged IDs for filenames, preserves original-source provenance, fits all 142
+location means using training designs only, and fingerprints its own cache.
+Defaults: training designs 0-9 (1,420 samples), validation design 10 (142),
+reference test design 11 (142). After epoch selection, a fresh refit uses
+0-10 (1,562 samples). This preserves the old split, not the cluster-B split
+used by the newer attention/DeepONet experiments; compare scores accordingly.
+
+On the same DeltaAI setup as the existing 1704 jobs:
+
+```bash
+git pull
+# Only if the shared training environment has not already been created:
+bash -l setup_mesh_impact_history_env.sh
+bash submit_gpu_multiscale_hic_1704.sh
+```
+
+The launcher uses `python/miniforge3_pytorch/2.10.0` and
+`.venv-mesh-history`; override with `HOOD_MESH_PYTORCH_MODULE` and
+`HOOD_MESH_VENV`. It requests one GH200, 16 CPUs, 96 GB, and six hours.
+Pass scheduler overrides to the submission wrapper, e.g. `--time=12:00:00`.
+The complete dataset must already be on DeltaAI; it is not tracked in Git.
+`HOOD_V6_DATA_ROOT` is the parent directory containing the dataset folder.
+`HOOD_V6_EPOCHS`, `HOOD_V6_BATCH_SIZE`, `HOOD_V6_WORKERS`,
+`HOOD_VAL_DESIGN`, and `HOOD_TEST_DESIGN` override training defaults.
+W&B defaults to offline (`WANDB_MODE=online` enables live logging).
+
+Logs: `runs/slurm/gpu_multiscale_hic_1704_<jobid>.{out,err}`.
+Results: `runs/gpu_multiscale_1704/<timestamp>_<jobid>/`, including selection
+and final checkpoints, normalizers, manifest/split, HIC and waveform metrics,
+predictions, and plots. The same-grid restriction now covers 142 locations.
+
+Local dataset check:
+
+```bash
+python gpu_multiscale_hic_v6.py --dataset 1704 --preflight-only
 ```
