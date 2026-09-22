@@ -376,12 +376,17 @@ class HistoryPredictor:
     def from_run(cls, output_dir, device="cpu"):
         run_dir = Path(output_dir)
         saved = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
-        if saved.get("format_version") != 1 or saved.get("architecture", {}).get("name") != "MeshImpactHistoryNet":
-            raise ValueError("This directory is not a supported MeshImpactHistoryNet run")
+        architecture_name = saved.get("architecture", {}).get("name")
+        if saved.get("format_version") != 1 or architecture_name not in ("MeshImpactHistoryNet", "MeshChangeAttentionNet"):
+            raise ValueError("This directory is not a supported mesh history run")
         config = SimpleNamespace(**saved["preprocessing"], device=torch.device(device))
         preprocessor = DataPreprocessor(config)
         preprocessor.load_scalers(str(run_dir / "scalers.joblib"))
-        model = MeshImpactHistoryNet(**saved["architecture"]["kwargs"])
+        model_class = MeshImpactHistoryNet
+        if architecture_name == "MeshChangeAttentionNet":
+            from mesh_change_attention import MeshChangeAttentionNet
+            model_class = MeshChangeAttentionNet
+        model = model_class(**saved["architecture"]["kwargs"])
         checkpoint = torch.load(run_dir / CHECKPOINT_NAME, map_location="cpu", weights_only=True)
         model.load_state_dict(checkpoint["model_state_dict"], strict=True)
         times = np.load(run_dir / "prediction_times.npy", allow_pickle=False)

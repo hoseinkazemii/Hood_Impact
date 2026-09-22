@@ -10,5 +10,7 @@ submit_mesh_impact_history_1704_local_sensitivity_resume.sh text eol=lf
 run_mesh_impact_history_1704.sbatch text eol=lf
 submit_temporal_deeponet_1704.sh text eol=lf
 run_temporal_deeponet_1704.sbatch text eol=lf
+submit_mesh_change_attention_1704.sh text eol=lf
 submit_gpu_multiscale_hic_1704.sh text eol=lf
 run_gpu_multiscale_hic_1704.sbatch text eol=lf
+run_mesh_change_attention_1704.sbatch text eol=lf
