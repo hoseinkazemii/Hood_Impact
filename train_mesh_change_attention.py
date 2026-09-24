@@ -284,8 +284,8 @@ def evaluate_run(args):
     write_json(run_dir / "metrics.json", metrics)
     write_json(run_dir / "test_design_sensitivity.json", sensitivity)
     export_predictions(run_dir / "test_acceleration_histories.csv", dataset, predictions, targets)
-    # The existing postprocessor integrates the exact sampled grid, in seconds.
-    from analyze_impact_locality_1704 import batched_hic
+    # The shared postprocessor integrates the exact sampled grid, in seconds.
+    from hic15 import batched_hic
     rows, offset = [], 0
     for run, times in zip(dataset.run_numbers, dataset.time_arrays):
         count = len(times)

@@ -22,6 +22,7 @@ from scipy.spatial import cKDTree
 from scipy.stats import rankdata
 
 from abaqus_scripts.inp_geom import Deck
+from hic15 import batched_hic
 from mesh_impact_history import MeshImpactHistoryNet
 
 ROOT = Path(__file__).resolve().parent
@@ -39,25 +40,6 @@ def cluster_mapping():
         ):
             return ast.literal_eval(node.value)
     raise ValueError("GEOMETRY_CLUSTERS literal not found")
-
-
-def batched_hic(times, acceleration, window=.015):
-    """Exact trapezoidal HIC over all admissible pairs on a shared time grid."""
-    times = np.asarray(times, float)
-    a = np.asarray(acceleration, float)
-    if a.shape[-1] != len(times) or np.any(np.diff(times) <= 0):
-        raise ValueError("Acceleration and strictly increasing times must align")
-    integral = np.concatenate((np.zeros((*a.shape[:-1], 1)), np.cumsum(
-        .5 * (a[..., 1:] + a[..., :-1]) * np.diff(times), axis=-1)), axis=-1)
-    best = np.zeros(a.shape[:-1])
-    for lag in range(1, len(times)):
-        duration = times[lag:] - times[:-lag]
-        valid = duration <= window
-        if not valid.any():
-            break
-        mean = (integral[..., lag:] - integral[..., :-lag])[..., valid] / duration[valid]
-        best = np.maximum(best, (np.maximum(mean, 0)**2.5 * duration[valid]).max(axis=-1))
-    return best
 
 
 def row_correlation(x, y):
