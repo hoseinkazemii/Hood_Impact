@@ -35,7 +35,7 @@ from utils.utils import (
 MODEL_DEFAULTS = {
     "width": 128,
     "num_heads": 4,
-    "num_latents": 32,
+    "num_latents": 256,
     "latent_layers": 3,
     "temporal_layers": 2,
     "dropout": 0.1,

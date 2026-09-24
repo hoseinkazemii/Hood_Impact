@@ -170,7 +170,7 @@ class MeshImpactHistoryNet(nn.Module):
         self,
         width: int = 128,
         num_heads: int = 4,
-        num_latents: int = 32,
+        num_latents: int = 256,
         latent_layers: int = 3,
         temporal_layers: int = 2,
         dropout: float = 0.1,
