@@ -74,6 +74,8 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int)
     parser.add_argument("--design-difference-weight", type=float, default=0.0,
                         help="Add matched-location cross-cluster difference MSE; 0 keeps ordinary training.")
+    parser.add_argument("--hic-range-threshold-percent", type=float,
+                        help="Keep locations with 100*(max-min)/mean HIC15 >= this value across all 12 designs.")
     parser.add_argument("--max-train-time", type=float, help="Optional cutoff before the configured time stride is applied.")
     parser.add_argument("--device", help="PyTorch device, e.g. cpu, cuda, or cuda:0.")
     for key, default in MODEL_DEFAULTS.items():
@@ -131,6 +133,7 @@ def restore_resume_arguments(args, parser, argv):
                 "lr": saved["training"]["learning_rate"],
                 "max_train_time": saved["preprocessing"]["max_train_time"],
                 "design_difference_weight": saved["training"].get("design_difference_weight", 0.0),
+                "hic_range_threshold_percent": (saved.get("location_filter") or {}).get("threshold_percent"),
                 "test_designs": splits["test"]["design_ids"],
                 "val_designs": splits["validation"]["design_ids"]}
     explicit = {token.split("=", 1)[0] for token in argv if token.startswith("--")}
@@ -180,6 +183,11 @@ def build_config(args):
         raise ValueError("CUDA was requested but is unavailable; use --device cpu")
     if not np.isfinite(args.design_difference_weight) or args.design_difference_weight < 0:
         raise ValueError("design_difference_weight must be finite and nonnegative")
+    if args.hic_range_threshold_percent is not None:
+        if not np.isfinite(args.hic_range_threshold_percent) or args.hic_range_threshold_percent < 0:
+            raise ValueError("HIC range threshold must be finite and nonnegative")
+        if config.data_format != "euroncap1704" or config.samples_per_design != 142 or config.num_samples != 1704:
+            raise ValueError("HIC location filtering requires the complete 12 x 142 euroncap1704 dataset")
     if args.design_difference_weight > 0:
         if config.data_format != "euroncap1704":
             raise ValueError("Design sensitivity is defined only for --data-format euroncap1704")
@@ -253,6 +261,7 @@ def resolved_config(config, args, model_kwargs, prediction_grid):
         "format_version": 1,
         "architecture": {"name": "MeshImpactHistoryNet", "kwargs": model_kwargs},
         "data": data_config,
+        "location_filter": getattr(args, "location_filter_report", None),
         "preprocessing": {
             "prediction_target": "acceleration",
             "time_subsample_stride": config.time_subsample_stride,
@@ -475,6 +484,21 @@ def main(argv=None):
         validate_data(data)
         if len(data["run_numbers"]) != config.num_samples:
             logger.warning("Loaded %s of %s runs; see preprocessing warnings for missing files.", len(data["run_numbers"]), config.num_samples)
+        if args.hic_range_threshold_percent is not None:
+            from hic_location_filter import analyze, filter_data
+            if set(data["run_numbers"]) != set(range(1, 1705)):
+                raise ValueError("HIC location filtering requires all 1704 runs to load successfully")
+            if source_dir is not None:
+                report = args.resume_config["location_filter"]
+                shutil.copy2(source_dir / "hic_location_variation.csv", output_dir / "hic_location_variation.csv")
+            else:
+                table, report = analyze(config.acceleration_dir, args.hic_range_threshold_percent)
+                table.to_csv(output_dir / "hic_location_variation.csv", index=False)
+            args.location_filter_report = report
+            write_json(output_dir / "hic_location_filter.json", report)
+            data = filter_data(data, report["selected_locations"])
+            logger.info("HIC range >= %s%% across all 12 designs: %s/142 locations; %s retained runs",
+                        report["threshold_percent"], len(report["selected_locations"]), len(data["run_numbers"]))
         splits = resolve_splits(data, config, args.test_designs, args.val_designs)
         if source_dir is not None and splits != args.resume_splits:
             raise ValueError("Loaded train/validation/test runs differ from the saved resume split")

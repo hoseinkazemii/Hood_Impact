@@ -184,6 +184,19 @@ printf 'ARG=%s\\n' "$@"
             self.assertIn(expected, output)
         self.assertLess(output.index("ARG=--time=48:00:00"), output.index("ARG=--time=08:00:00"))
 
+    def test_hic_filtered_launcher_and_training_argument(self):
+        for threshold in ("10", "20"):
+            if threshold == "20":
+                self.env["HOOD_MESH_HIC_RANGE_THRESHOLD_PERCENT"] = threshold
+            output = self.launch("submit_mesh_impact_history_1704_hic_filtered_k256.sh")
+            for expected in ("LOCAL=2", "K=256", "TEST=4 5", "VAL=11", "DIFFERENCE=1.0",
+                             f">= {threshold}%", "ARG=--job-name=mesh_hist_hic_filtered_k256"):
+                self.assertIn(expected, output)
+        output = self.launch("run_mesh_impact_history_1704.sbatch")
+        commands = [line for line in output.splitlines() if line.startswith("PYTHON")]
+        self.assertNotIn("--hic-range-threshold-percent", commands[0])
+        self.assertIn("<--hic-range-threshold-percent> <20>", commands[1])
+
     def test_fresh_cluster_B_launchers_cannot_silently_resume_an_old_split(self):
         self.env["HOOD_MESH_RESUME_FROM"] = "old_cluster_D_run"
         for script in ("submit_mesh_impact_history_1704_clusterB.sh",

@@ -116,6 +116,7 @@ if [[ -n "${WANDB_ENTITY:-}" ]]; then
     TRAIN_ARGS+=(--wandb-entity "${WANDB_ENTITY}")
 fi
 OPTIONS=(
+    HIC_RANGE_THRESHOLD_PERCENT:hic-range-threshold-percent
     EPOCHS:epochs LR:lr WEIGHT_DECAY:weight-decay SEED:seed
     WIDTH:width NUM_HEADS:num-heads NUM_LATENTS:num-latents
     LATENT_LAYERS:latent-layers TEMPORAL_LAYERS:temporal-layers DROPOUT:dropout
