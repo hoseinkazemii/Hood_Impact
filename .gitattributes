@@ -1,0 +1,18 @@
+# Slurm and bash require Unix line endings, including after Windows edits.
+setup_mesh_impact_history_env.sh text eol=lf
+submit_mesh_impact_history_1704.sh text eol=lf
+submit_mesh_impact_history_1704_clusterB.sh text eol=lf
+submit_mesh_impact_history_1704_clusterD.sh text eol=lf
+submit_mesh_impact_history_1704_no_temporal.sh text eol=lf
+submit_mesh_impact_history_1704_local_sensitivity.sh text eol=lf
+submit_mesh_impact_history_1704_local_sensitivity_k256.sh text eol=lf
+submit_mesh_impact_history_1704_hic_filtered_k256.sh text eol=lf
+submit_mesh_impact_history_1704_local_sensitivity_resume.sh text eol=lf
+run_mesh_impact_history_1704.sbatch text eol=lf
+submit_temporal_deeponet_1704.sh text eol=lf
+run_temporal_deeponet_1704.sbatch text eol=lf
+submit_mesh_change_attention_1704.sh text eol=lf
+submit_gpu_multiscale_hic_1704.sh text eol=lf
+run_gpu_multiscale_hic_1704.sbatch text eol=lf
+run_mesh_change_attention_1704.sbatch text eol=lf
+abaqus_scripts/delta/hood_noise_floor.sbatch text eol=lf

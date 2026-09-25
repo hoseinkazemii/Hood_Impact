@@ -1,0 +1,608 @@
+"""Train a new irregular-mesh attention model and predict acceleration histories.
+
+Only data processing and optimization utilities are shared with previous work.
+The network is defined independently in :mod:`mesh_impact_history`.
+"""
+
+import argparse
+from datetime import datetime
+import json
+import logging
+import os
+from pathlib import Path
+import shutil
+import sys
+from types import SimpleNamespace
+
+import numpy as np
+import pandas as pd
+import torch
+import wandb
+
+from mesh_impact_history import DECODER_BLOCKS, MeshImpactHistoryNet
+from mesh_impact_history_reporting import export_training_history_plot
+from utils.utils import (
+    Config,
+    DataPreprocessor,
+    Evaluator,
+    Trainer,
+    create_data_loaders,
+    run_to_design_id,
+    set_seed,
+)
+
+
+MODEL_DEFAULTS = {
+    "width": 128,
+    "num_heads": 4,
+    "num_latents": 256,
+    "latent_layers": 3,
+    "temporal_layers": 2,
+    "dropout": 0.1,
+    # Restore temporal attention after the cluster-D ablation comparison.
+    # mesh_only remains available to reload and reproduce ablation runs.
+    "decoder": "temporal",
+    "neighborhood_layers": 0,
+    "neighborhood_k": 16,
+    "neighborhood_scale_mm": 20.0,
+    "neighborhood_chunk_size": 1024,
+    # Leading rigid-headform nodes held out of local attention only. The
+    # 1704 .inp files put the 286 impactor nodes first; 0 disables the holdout.
+    "impactor_nodes": 0,
+}
+# Fresh experiments hold out the whole B cluster. Resumes restore saved splits.
+DEFAULT_TEST_DESIGNS = (4, 5)
+DEFAULT_VAL_DESIGNS = (11,)
+CHECKPOINT_NAME = "hood_impact_best_model.pt"  # Filename used by shared Trainer.
+LAST_CHECKPOINT_NAME = "hood_impact_last_model.pt"
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-format", choices=["legacy", "industrylike", "euroncap1704"])
+    for name in ("inp-dir", "impact-coords-path", "mesh-geometry-dir", "doe-path", "acceleration-dir"):
+        parser.add_argument(f"--{name}")
+    parser.add_argument("--num-samples", type=int)
+    parser.add_argument("--samples-per-design", type=int)
+    # Cluster B never participates in optimization or checkpoint selection.
+    parser.add_argument("--test-designs", type=int, nargs="+", default=list(DEFAULT_TEST_DESIGNS), help="Zero-based design IDs.")
+    parser.add_argument("--val-designs", type=int, nargs="+", default=list(DEFAULT_VAL_DESIGNS), help="Zero-based design IDs.")
+    parser.add_argument("--epochs", type=int, help="Total epoch target, including completed epochs.")
+    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--lr", type=float)
+    parser.add_argument("--weight-decay", type=float)
+    parser.add_argument("--seed", type=int)
+    parser.add_argument("--design-difference-weight", type=float, default=0.0,
+                        help="Add matched-location cross-cluster difference MSE; 0 keeps ordinary training.")
+    parser.add_argument("--hic-range-threshold-percent", type=float,
+                        help="Keep locations with 100*(max-min)/mean HIC15 >= this value across all 12 designs.")
+    parser.add_argument("--max-train-time", type=float, help="Optional cutoff before the configured time stride is applied.")
+    parser.add_argument("--device", help="PyTorch device, e.g. cpu, cuda, or cuda:0.")
+    for key, default in MODEL_DEFAULTS.items():
+        if key != "decoder":
+            parser.add_argument(f"--{key.replace('_', '-')}", type=type(default), default=default)
+    parser.add_argument(
+        "--decoder", choices=sorted(DECODER_BLOCKS), default=MODEL_DEFAULTS["decoder"],
+        help="mesh_only removes temporal self-attention; temporal restores the original baseline.",
+    )
+    parser.add_argument("--output-dir", help="New run directory; defaults to runs/mesh_impact_history/<timestamp>.")
+    parser.add_argument("--resume-from", help="Prior run directory (latest, else best checkpoint) or checkpoint file; writes a new run.")
+    parser.add_argument(
+        "--wandb-mode", choices=["disabled", "offline", "online"],
+        default=os.environ.get("WANDB_MODE") or "online",
+        help="Tracking mode; defaults to WANDB_MODE, or online when unset.",
+    )
+    parser.add_argument("--wandb-project", default=os.environ.get("WANDB_PROJECT") or "hood-impact-mesh-attention")
+    parser.add_argument("--wandb-entity", default=os.environ.get("WANDB_ENTITY") or None,
+                        help="W&B team/account; defaults to WANDB_ENTITY or your W&B default team.")
+    parser.add_argument("--run-name")
+    args = parser.parse_args(argv)
+    if args.wandb_mode not in ("disabled", "offline", "online"):
+        parser.error("WANDB_MODE must be disabled, offline, or online; override it with --wandb-mode")
+    if args.resume_from:
+        restore_resume_arguments(args, parser, sys.argv[1:] if argv is None else argv)
+    return args
+
+
+def restore_resume_arguments(args, parser, argv):
+    """Restore saved experimental settings; allow data paths to be relocated."""
+    source = Path(args.resume_from).expanduser().resolve()
+    if source.is_dir():
+        latest, best = source / LAST_CHECKPOINT_NAME, source / CHECKPOINT_NAME
+        source = latest if latest.is_file() else best
+        if latest.is_file() and best.is_file():
+            # A timeout may fall between the atomic best and latest writes.
+            # If best is newer, that completed epoch is the recovery point.
+            latest_count = len(torch.load(latest, map_location="cpu", weights_only=True)["train_losses"])
+            best_count = len(torch.load(best, map_location="cpu", weights_only=True)["train_losses"])
+            if best_count > latest_count:
+                source = best
+    source_dir = source.parent
+    for path in (source, *(source_dir / name for name in
+                          ("config.json", "splits.json", "scalers.joblib", "prediction_times.npy"))):
+        if not path.is_file():
+            parser.error(f"Missing resume artifact: {path}")
+    saved = json.loads((source_dir / "config.json").read_text(encoding="utf-8"))
+    if saved.get("format_version") != 1 or saved.get("architecture", {}).get("name") != "MeshImpactHistoryNet":
+        parser.error("Resume requires a supported MeshImpactHistoryNet run")
+    splits = json.loads((source_dir / "splits.json").read_text(encoding="utf-8"))
+    settings = {**MODEL_DEFAULTS, **saved["architecture"]["kwargs"],
+                **{key: saved["data"][key] for key in ("data_format", "num_samples", "samples_per_design")},
+                **{key: saved["training"][key] for key in ("batch_size", "weight_decay", "seed")},
+                "epochs": saved["training"]["num_epochs"],
+                "lr": saved["training"]["learning_rate"],
+                "max_train_time": saved["preprocessing"]["max_train_time"],
+                "design_difference_weight": saved["training"].get("design_difference_weight", 0.0),
+                "hic_range_threshold_percent": (saved.get("location_filter") or {}).get("threshold_percent"),
+                "test_designs": splits["test"]["design_ids"],
+                "val_designs": splits["validation"]["design_ids"]}
+    explicit = {token.split("=", 1)[0] for token in argv if token.startswith("--")}
+    for key, value in settings.items():
+        option = "--" + key.replace("_", "-")
+        if option in explicit and getattr(args, key) != value:
+            parser.error(f"Resume must retain saved {option}={value!r}; omit the conflicting override")
+        setattr(args, key, value)
+    for key in ("inp_dir", "impact_coords_path", "mesh_geometry_dir", "doe_path", "acceleration_dir"):
+        if getattr(args, key) is None and key in saved["data"]:
+            setattr(args, key, saved["data"][key])
+    args.resume_from = str(source)
+    args.resume_config, args.resume_splits = saved, splits
+
+
+def build_config(args):
+    """Inherit current preprocessing/training defaults, without model presets."""
+    overrides = {"prediction_target": "acceleration", "save_last_checkpoint": True}
+    if args.resume_from:
+        overrides["time_subsample_stride"] = args.resume_config["preprocessing"]["time_subsample_stride"]
+        overrides["max_train_time"] = args.resume_config["preprocessing"]["max_train_time"]
+    mapping = {"epochs": "num_epochs", "lr": "learning_rate"}
+    for key in (
+        "data_format", "inp_dir", "impact_coords_path", "mesh_geometry_dir", "doe_path",
+        "acceleration_dir", "num_samples", "samples_per_design", "epochs", "batch_size",
+        "lr", "weight_decay", "seed", "max_train_time",
+    ):
+        value = getattr(args, key)
+        if value is not None:
+            overrides[mapping.get(key, key)] = value
+    if args.device is not None:
+        overrides["device"] = torch.device(args.device)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    overrides["output_dir"] = str(Path(args.output_dir or Path("runs") / "mesh_impact_history" / stamp).resolve())
+    config = Config(**overrides)
+    for key in ("num_samples", "samples_per_design", "num_epochs", "batch_size", "time_subsample_stride"):
+        value = getattr(config, key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(f"{key} must be a positive integer; got {value!r}")
+    if not np.isfinite(config.learning_rate) or config.learning_rate <= 0:
+        raise ValueError("learning_rate must be finite and positive")
+    if not np.isfinite(config.weight_decay) or config.weight_decay < 0:
+        raise ValueError("weight_decay must be finite and nonnegative")
+    if config.max_train_time is not None and (not np.isfinite(config.max_train_time) or config.max_train_time <= 0):
+        raise ValueError("max_train_time must be finite and positive")
+    if config.device.type == "cuda" and not torch.cuda.is_available():
+        raise ValueError("CUDA was requested but is unavailable; use --device cpu")
+    if not np.isfinite(args.design_difference_weight) or args.design_difference_weight < 0:
+        raise ValueError("design_difference_weight must be finite and nonnegative")
+    if args.hic_range_threshold_percent is not None:
+        if not np.isfinite(args.hic_range_threshold_percent) or args.hic_range_threshold_percent < 0:
+            raise ValueError("HIC range threshold must be finite and nonnegative")
+        if config.data_format != "euroncap1704" or config.samples_per_design != 142 or config.num_samples != 1704:
+            raise ValueError("HIC location filtering requires the complete 12 x 142 euroncap1704 dataset")
+    if args.design_difference_weight > 0:
+        if config.data_format != "euroncap1704":
+            raise ValueError("Design sensitivity is defined only for --data-format euroncap1704")
+        if config.batch_size < 2 or config.batch_size % 2:
+            raise ValueError("Design sensitivity requires an even batch_size >= 2")
+    return config
+
+
+def validate_data(data):
+    """Catch malformed records before fitting scalers or launching training."""
+    run_numbers = data["run_numbers"]
+    if not run_numbers:
+        raise ValueError("No valid acceleration runs loaded. Check dataset paths and preprocessing warnings.")
+    if len(set(run_numbers)) != len(run_numbers):
+        raise ValueError("Run numbers must be unique")
+    for key in ("mesh_geometries", "indentor_positions", "time_arrays", "accelerations"):
+        if len(data[key]) != len(run_numbers):
+            raise ValueError(f"{key} does not match the number of loaded runs")
+    for i, run in enumerate(run_numbers):
+        mesh = np.asarray(data["mesh_geometries"][i])
+        impact = np.asarray(data["indentor_positions"][i])
+        times = np.asarray(data["time_arrays"][i])
+        accel = np.asarray(data["accelerations"][i])
+        if mesh.ndim != 2 or mesh.shape[1] != 3 or not len(mesh):
+            raise ValueError(f"Run {run}: mesh must have shape (N, 3) with at least one node")
+        if impact.shape != (2,):
+            raise ValueError(f"Run {run}: impact location must have shape (2,)")
+        if times.ndim != 1 or len(times) < 1 or accel.shape != times.shape:
+            raise ValueError(f"Run {run}: sampled times and accelerations must be matching nonempty vectors")
+        if not all(np.isfinite(array).all() for array in (mesh, impact, times, accel)):
+            raise ValueError(f"Run {run}: nonfinite mesh, impact, time, or acceleration values")
+        if np.any(np.diff(times) <= 0):
+            raise ValueError(f"Run {run}: sampled times must be strictly increasing")
+
+
+def resolve_splits(data, config, test_designs, val_designs):
+    """Validate design separation using runs that actually loaded successfully."""
+    test_ids, val_ids = set(test_designs), set(val_designs)
+    if not test_ids or not val_ids:
+        raise ValueError("Validation and test design lists must both be nonempty")
+    if test_ids & val_ids:
+        raise ValueError(f"Validation and test design IDs overlap: {sorted(test_ids & val_ids)}")
+    design_ids = {run_to_design_id(run, config.samples_per_design) for run in data["run_numbers"]}
+    missing = (test_ids | val_ids) - design_ids
+    if missing:
+        raise ValueError(f"Requested held-out designs have no loaded runs: {sorted(missing)}; loaded designs: {sorted(design_ids)}")
+    split = {
+        "train": {"design_ids": sorted(design_ids - test_ids - val_ids), "run_numbers": []},
+        "validation": {"design_ids": sorted(val_ids), "run_numbers": []},
+        "test": {"design_ids": sorted(test_ids), "run_numbers": []},
+    }
+    for run in data["run_numbers"]:
+        design = run_to_design_id(run, config.samples_per_design)
+        name = "test" if design in test_ids else "validation" if design in val_ids else "train"
+        split[name]["run_numbers"].append(int(run))
+    for name, group in split.items():
+        if not group["run_numbers"]:
+            raise ValueError(f"The {name} split is empty; choose held-out designs leaving training data")
+    return split
+
+
+def resolved_config(config, args, model_kwargs, prediction_grid):
+    data_keys = ["data_format", "num_samples", "samples_per_design"]
+    path_keys = (
+        ["mesh_geometry_dir", "doe_path", "acceleration_dir"] if config.data_format == "legacy"
+        else ["inp_dir", "impact_coords_path", "acceleration_dir"]
+    )
+    data_config = {key: getattr(config, key) for key in data_keys}
+    data_config.update({key: str(Path(getattr(config, key)).resolve()) for key in path_keys})
+    return {
+        "format_version": 1,
+        "architecture": {"name": "MeshImpactHistoryNet", "kwargs": model_kwargs},
+        "data": data_config,
+        "location_filter": getattr(args, "location_filter_report", None),
+        "preprocessing": {
+            "prediction_target": "acceleration",
+            "time_subsample_stride": config.time_subsample_stride,
+            "max_train_time": config.max_train_time,
+            "mesh_columns": ["X1", "X2", "X3"],
+            "impact_columns": ["X1", "X2"],
+            "acceleration_units": "g",
+            "scalers_fit_on": "train",
+        },
+        "training": {
+            **{key: getattr(config, key) for key in ("num_epochs", "batch_size", "learning_rate", "weight_decay", "seed")},
+            "device": str(config.device),
+            "initialization": "checkpoint" if args.resume_from else "from_scratch",
+            "resume_from": args.resume_from,
+            "optimizer": "AdamW",
+            "loss": ("normalized_acceleration_mse_plus_design_difference_mse"
+                     if args.design_difference_weight else "normalized_acceleration_mse"),
+            "design_difference_weight": args.design_difference_weight,
+            "batch_sampling": "matched_location_cross_cluster" if args.design_difference_weight else "shuffle",
+            "difference_pairs_from": "train_only" if args.design_difference_weight else None,
+            "scheduler": "CosineAnnealingLR",
+            "gradient_clip_norm": 1.0,
+        },
+        "prediction_grid": prediction_grid,
+        "wandb": {
+            "mode": args.wandb_mode, "project": args.wandb_project,
+            "entity": args.wandb_entity, "run_name": args.run_name or Path(config.output_dir).name,
+        },
+        "output_dir": config.output_dir,
+    }
+
+
+def write_json(path, payload):
+    # Strict JSON: undefined R2 for constant targets is represented by null.
+    def clean(value):
+        if isinstance(value, dict):
+            return {key: clean(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [clean(item) for item in value]
+        if isinstance(value, (float, np.floating)):
+            return float(value) if np.isfinite(value) else None
+        if isinstance(value, np.integer):
+            return int(value)
+        return value
+    Path(path).write_text(json.dumps(clean(payload), indent=2, allow_nan=False) + "\n", encoding="utf-8")
+
+
+def initialize_wandb(args, initial_config, output_dir, logger):
+    """Start tracking before dataset loading and save the resolved destination."""
+    run = None
+    try:
+        logger.info("Initializing W&B: mode=%s | project=%s | entity=%s",
+                    args.wandb_mode, args.wandb_project, args.wandb_entity or "default team")
+        run = wandb.init(
+            project=args.wandb_project, entity=args.wandb_entity,
+            name=args.run_name or output_dir.name, config=initial_config,
+            dir=str(output_dir), mode=args.wandb_mode,
+        )
+        run.define_metric("epoch")
+        for metric in ("train/loss", "train/acceleration_mse", "train/design_difference_mse",
+                       "train/design_pairs", "val/loss", "val/mae_g", "lr"):
+            run.define_metric(metric, step_metric="epoch")
+        actual_mode = run.settings.mode
+        metadata = {
+            "id": run.id, "name": run.name, "project": run.project,
+            "entity": run.entity, "mode": actual_mode,
+            "url": run.url if actual_mode == "online" else None,
+        }
+        write_json(output_dir / "wandb_run.json", metadata)
+        logger.info("W&B run: mode=%s | project=%s | entity=%s | id=%s | URL=%s",
+                    actual_mode, run.project, run.entity, run.id, metadata["url"] or "none (local tracking)")
+        if actual_mode != args.wandb_mode:
+            raise RuntimeError(f"Requested W&B mode {args.wandb_mode!r}, but initialized {actual_mode!r}")
+        if actual_mode == "offline":
+            logger.info("W&B is offline: history is saved locally and will appear online only after wandb sync.")
+        elif actual_mode == "disabled":
+            logger.info("W&B is disabled: this run will not appear on the W&B website.")
+        return run
+    except Exception as exc:
+        message = (
+            f"W&B initialization failed (mode={args.wandb_mode}, project={args.wandb_project}, "
+            f"entity={args.wandb_entity or 'default team'}). "
+            "For online logging, run `python -m wandb login` in the training environment "
+            "(on the cluster login node before submission), and check the selected team/project "
+            "and network connection. For intentional local tracking use --wandb-mode offline; "
+            "to turn tracking off use --wandb-mode disabled."
+        )
+        logger.error("%s Cause: %s", message, exc)
+        if run is not None:
+            run.finish(exit_code=1)
+        raise RuntimeError(message) from exc
+
+
+def export_predictions(path, dataset, predictions, targets):
+    """Flatten test histories in the same sequential order as the test loader."""
+    counts = [len(times) for times in dataset.time_arrays]
+    if sum(counts) != len(predictions) or len(targets) != len(predictions):
+        raise ValueError("Test predictions do not match the sampled histories")
+    pd.DataFrame({
+        "run_number": np.repeat(dataset.run_numbers, counts),
+        "time": np.concatenate(dataset.time_arrays),
+        "acceleration_true_g": targets,
+        "acceleration_pred_g": predictions,
+    }).to_csv(path, index=False)
+
+
+class HistoryPredictor:
+    """Inference from raw geometry and impact coordinates, with saved output times.
+
+    ``predict(mesh_xyz, impact_xy)`` returns acceleration in g at
+    ``predictor.time_points``. Optional time points must already be subsampled.
+    """
+
+    def __init__(self, model, preprocessor, time_points, device="cpu"):
+        self.device = torch.device(device)
+        self.model = model.to(self.device).eval()
+        self.preprocessor = preprocessor
+        self.time_points = np.asarray(time_points, dtype=np.float32).copy()
+
+    @classmethod
+    def from_run(cls, output_dir, device="cpu"):
+        run_dir = Path(output_dir)
+        saved = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
+        architecture_name = saved.get("architecture", {}).get("name")
+        if saved.get("format_version") != 1 or architecture_name not in ("MeshImpactHistoryNet", "MeshChangeAttentionNet"):
+            raise ValueError("This directory is not a supported mesh history run")
+        config = SimpleNamespace(**saved["preprocessing"], device=torch.device(device))
+        preprocessor = DataPreprocessor(config)
+        preprocessor.load_scalers(str(run_dir / "scalers.joblib"))
+        model_class = MeshImpactHistoryNet
+        if architecture_name == "MeshChangeAttentionNet":
+            from mesh_change_attention import MeshChangeAttentionNet
+            model_class = MeshChangeAttentionNet
+        model = model_class(**saved["architecture"]["kwargs"])
+        checkpoint = torch.load(run_dir / CHECKPOINT_NAME, map_location="cpu", weights_only=True)
+        model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+        times = np.load(run_dir / "prediction_times.npy", allow_pickle=False)
+        return cls(model, preprocessor, times, device=device)
+
+    @torch.no_grad()
+    def predict(self, mesh_xyz, impact_xy, sampled_time_points=None):
+        mesh = np.asarray(mesh_xyz, dtype=np.float32)
+        impact = np.asarray(impact_xy, dtype=np.float32)
+        times = self.time_points if sampled_time_points is None else np.asarray(sampled_time_points, dtype=np.float32)
+        if mesh.ndim != 2 or mesh.shape[1] != 3 or not len(mesh):
+            raise ValueError("mesh_xyz must have shape (N, 3), with at least one node")
+        if impact.shape != (2,):
+            raise ValueError("impact_xy must have shape (2,), in the same physical coordinate frame as the mesh")
+        if times.ndim != 1 or not len(times) or np.any(np.diff(times) <= 0):
+            raise ValueError("sampled_time_points must be a nonempty, strictly increasing vector")
+        if not all(np.isfinite(array).all() for array in (mesh, impact, times)):
+            raise ValueError("Mesh, impact coordinates, and sampled times must all be finite")
+
+        def tensor(array):
+            return torch.as_tensor(array, dtype=torch.float32, device=self.device)
+
+        # Time slicing occurs only while loading training data, never here.
+        normalized_mesh = tensor(self.preprocessor.transform_mesh(mesh))
+        normalized_impact = tensor(self.preprocessor.transform_indentor(impact)).unsqueeze(0)
+        normalized_times = tensor(self.preprocessor.transform_time(times))
+        prediction = self.model(
+            normalized_mesh,
+            torch.zeros(len(mesh), dtype=torch.long, device=self.device),
+            normalized_impact,
+            normalized_times,
+            torch.zeros(len(times), dtype=torch.long, device=self.device),
+            batch_size=1,
+        )
+        return self.preprocessor.inverse_transform_acceleration(prediction.cpu().numpy())
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    config = build_config(args)
+    output_dir = Path(config.output_dir)
+    # A new run cannot accidentally evaluate a leftover checkpoint from old work.
+    if any((output_dir / name).exists() for name in ("config.json", CHECKPOINT_NAME, LAST_CHECKPOINT_NAME, "scalers.joblib")):
+        raise FileExistsError(f"Run artifacts already exist in {output_dir}; choose a new --output-dir")
+    source_dir = Path(args.resume_from).parent if args.resume_from else None
+    if source_dir is not None:
+        checkpoint = torch.load(args.resume_from, map_location="cpu", weights_only=True)
+        completed = len(checkpoint["train_losses"])
+        if not 0 < completed < config.num_epochs:
+            raise ValueError(f"Checkpoint has {completed} completed epochs; target is {config.num_epochs}, so no training remains")
+        if len(checkpoint["val_losses"]) != completed or checkpoint.get("completed_epochs", completed) != completed:
+            raise ValueError("Checkpoint epoch count and loss histories disagree")
+        if checkpoint["scheduler_state_dict"]["T_max"] != config.num_epochs:
+            raise ValueError("Checkpoint scheduler does not match the saved total epoch target")
+        # Seed best-model evaluation even if no later epoch improves on it.
+        best_source = source_dir / CHECKPOINT_NAME
+        best = torch.load(best_source, map_location="cpu", weights_only=True)
+        best_count = len(best["val_losses"])
+        if (not 0 < best_count <= completed or best["val_losses"] != checkpoint["val_losses"][:best_count]
+                or best["best_val_loss"] != checkpoint["best_val_loss"]):
+            raise ValueError("Source best checkpoint is inconsistent with the resume checkpoint; use artifacts from the same completed job")
+        shutil.copy2(best_source, output_dir / CHECKPOINT_NAME)
+        del checkpoint, best
+    set_seed(config.seed)
+    logger = logging.getLogger("mesh_impact_history.train")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    handlers = [logging.FileHandler(output_dir / "training.log", encoding="utf-8"), logging.StreamHandler(sys.stdout)]
+    for handler in handlers:
+        handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+        logger.addHandler(handler)
+    run = None
+    try:
+        model_kwargs = {key: getattr(args, key) for key in MODEL_DEFAULTS}
+        model = MeshImpactHistoryNet(**model_kwargs)
+        logger.info("MeshImpactHistoryNet: %s", model_kwargs)
+        if source_dir is not None:
+            logger.info("Resume: %s | completed epochs: %s | next epoch: %s/%s",
+                        args.resume_from, completed, completed + 1, config.num_epochs)
+        logger.info("Output: %s | device: %s | configured time stride: %s", output_dir, config.device, config.time_subsample_stride)
+        run = initialize_wandb(
+            args, resolved_config(config, args, model_kwargs, prediction_grid=None), output_dir, logger,
+        )
+        preprocessor = DataPreprocessor(config)
+        data = preprocessor.load_all_data()
+        validate_data(data)
+        if len(data["run_numbers"]) != config.num_samples:
+            logger.warning("Loaded %s of %s runs; see preprocessing warnings for missing files.", len(data["run_numbers"]), config.num_samples)
+        if args.hic_range_threshold_percent is not None:
+            from hic_location_filter import analyze, filter_data
+            if set(data["run_numbers"]) != set(range(1, 1705)):
+                raise ValueError("HIC location filtering requires all 1704 runs to load successfully")
+            if source_dir is not None:
+                report = args.resume_config["location_filter"]
+                shutil.copy2(source_dir / "hic_location_variation.csv", output_dir / "hic_location_variation.csv")
+            else:
+                table, report = analyze(config.acceleration_dir, args.hic_range_threshold_percent)
+                table.to_csv(output_dir / "hic_location_variation.csv", index=False)
+            args.location_filter_report = report
+            write_json(output_dir / "hic_location_filter.json", report)
+            data = filter_data(data, report["selected_locations"])
+            logger.info("HIC range >= %s%% across all 12 designs: %s/142 locations; %s retained runs",
+                        report["threshold_percent"], len(report["selected_locations"]), len(data["run_numbers"]))
+        splits = resolve_splits(data, config, args.test_designs, args.val_designs)
+        if source_dir is not None and splits != args.resume_splits:
+            raise ValueError("Loaded train/validation/test runs differ from the saved resume split")
+        loaders = create_data_loaders(
+            data, preprocessor, config,
+            test_design_ids=splits["test"]["design_ids"],
+            val_design_id=splits["validation"]["design_ids"],
+        )
+        train_loader, val_loader, test_loader, test_dataset = loaders
+        train_dataset = train_loader.dataset
+        if args.design_difference_weight:
+            from mesh_design_sensitivity import matched_training_loader
+            train_loader = matched_training_loader(train_dataset, config)
+            logger.info("Matched training batches: %s runs, %s batches/epoch, difference weight=%s",
+                        len(train_dataset), len(train_loader), args.design_difference_weight)
+        if source_dir is not None:
+            preprocessor.load_scalers(str(source_dir / "scalers.joblib"))
+        else:
+            preprocessor.fit_scalers(
+                mesh_geometries=train_dataset.mesh_geometries,
+                indentor_positions=train_dataset.indentor_positions,
+                time_arrays=train_dataset.time_arrays,
+                accelerations=train_dataset.accelerations,
+            )
+        model.set_coordinate_scalers(
+            preprocessor.mesh_scaler.mean_, preprocessor.mesh_scaler.scale_,
+            preprocessor.indentor_scaler.mean_, preprocessor.indentor_scaler.scale_,
+        )
+        first_times = np.asarray(train_dataset.time_arrays[0], dtype=np.float32)
+        if source_dir is not None and not np.array_equal(
+                first_times, np.load(source_dir / "prediction_times.npy", allow_pickle=False)):
+            raise ValueError("Loaded prediction time grid differs from the resume run")
+        matching_grid = all(np.array_equal(first_times, times) for times in data["time_arrays"])
+        prediction_grid = {
+            "file": "prediction_times.npy",
+            "reference_run_number": int(train_dataset.run_numbers[0]),
+            "num_time_points": len(first_times),
+            "same_grid_for_all_loaded_runs": matching_grid,
+            "already_subsampled": True,
+            "time_units": "source Time column (seconds for the supplied datasets)",
+        }
+        if not matching_grid:
+            logger.warning("Loaded runs have different sampled time grids. Default inference uses training run %s; pass sampled_time_points for another already-subsampled grid.", train_dataset.run_numbers[0])
+        saved_config = resolved_config(config, args, model_kwargs, prediction_grid)
+        if source_dir is not None:
+            saved_config["training"]["resumed_after_epoch"] = completed
+        write_json(output_dir / "config.json", saved_config)
+        write_json(output_dir / "splits.json", splits)
+        preprocessor.save_scalers(str(output_dir / "scalers.joblib"))
+        np.save(output_dir / "prediction_times.npy", first_times, allow_pickle=False)
+        logger.info("Saved train-only scalers and sampled prediction grid (%s points); parameters: %s", len(first_times), sum(parameter.numel() for parameter in model.parameters()))
+        run.config.update(saved_config, allow_val_change=True)
+        if args.design_difference_weight:
+            from mesh_design_sensitivity import DesignSensitivityTrainer
+            trainer = DesignSensitivityTrainer(model, train_loader, val_loader, config, preprocessor,
+                                               difference_weight=args.design_difference_weight)
+        else:
+            trainer = Trainer(model, train_loader, val_loader, config, preprocessor)
+        if source_dir is not None:
+            restored = trainer.load_checkpoint(args.resume_from)
+            if "torch_rng_state" not in restored:
+                logger.info("Legacy checkpoint has no random-generator state; stochastic draws restart from seed %s", config.seed)
+            if args.design_difference_weight and "train_mse_losses" not in restored:
+                logger.info("Legacy checkpoint omitted separate design-loss metrics; previous component values remain missing")
+            run.summary["resumed_after_epoch"] = completed
+            run.summary["best_val_loss"] = trainer.best_val_loss
+            del restored
+        history = trainer.train()
+        write_json(output_dir / "training_history.json", history)
+        history_columns = {
+            "epoch": np.arange(1, len(history["train_losses"]) + 1),
+            "train_mse_normalized": history.get("train_mse_losses", history["train_losses"]),
+            "validation_mse_normalized": history["val_losses"],
+        }
+        if args.design_difference_weight:
+            history_columns.update(train_objective=history["train_losses"],
+                                   train_design_difference_mse=history["train_difference_losses"],
+                                   train_design_pairs=history["train_pair_counts"])
+        pd.DataFrame(history_columns).to_csv(output_dir / "training_history.csv", index=False)
+        history_plot = export_training_history_plot(history, output_dir)
+        logger.info("Saved training history plot: %s", history_plot)
+        run.summary["best_epoch"] = int(np.argmin(history["val_losses"])) + 1
+        if args.wandb_mode != "disabled":
+            run.log({"training/history": wandb.Image(str(history_plot))})
+        checkpoint_path = output_dir / CHECKPOINT_NAME
+        if not checkpoint_path.exists():
+            raise RuntimeError("Training produced no finite best validation checkpoint; inspect losses and input data")
+        checkpoint = torch.load(checkpoint_path, map_location=config.device, weights_only=True)
+        model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+        evaluator = Evaluator(model, config, preprocessor)
+        metrics, predictions, targets = evaluator.evaluate(test_loader)
+        write_json(output_dir / "metrics.json", metrics)
+        export_predictions(output_dir / "test_acceleration_histories.csv", test_dataset, predictions, targets)
+        wandb.log({f"test/{key}": value for key, value in metrics.items() if np.isfinite(value)})
+        logger.info("Best-checkpoint test metrics (acceleration in g): %s", metrics)
+        logger.info("Finished. Run artifacts: %s", output_dir)
+        return metrics
+    finally:
+        if run is not None:
+            run.finish(exit_code=0 if sys.exc_info()[0] is None else 1)
+        for handler in handlers:
+            logger.removeHandler(handler)
+            handler.close()
+
+
+if __name__ == "__main__":
+    main()

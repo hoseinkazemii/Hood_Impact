@@ -1,4 +1,4 @@
-"""GPU multi-scale geometry CNN for the 660-sample hood-impact corpus.
+"""GPU multi-scale geometry CNN for the 660- and 1704-sample hood-impact corpora.
 
 This experiment is intentionally self-contained and does not import the legacy
 ``temporal_deeponet.py`` or ``utils/utils.py`` training paths.  It predicts
@@ -275,6 +275,8 @@ def atomic_torch_save(payload: Mapping, path: Path) -> None:
 
 
 def history_path(root: Path, source: str, source_run: int) -> Path:
+    if source == "euroncap142":
+        return root / "HoodImpact_1704_EuroNCAP" / "output_history_acc" / f"HoodImpact_{source_run}_SAE1000_interp1000.csv"
     folder = (
         root / "HoodImpact_60_IndustryLike" / "output_history_acc"
         if source == "industry5"
@@ -283,7 +285,37 @@ def history_path(root: Path, source: str, source_run: int) -> Path:
     return folder / f"HoodImpact_{source_run}_SAE1000_interp1000.csv"
 
 
-def build_metadata(data_root: Path) -> pd.DataFrame:
+def build_metadata(data_root: Path, dataset: str = "660") -> pd.DataFrame:
+    if dataset == "1704":
+        path = data_root / "HoodImpact_1704_EuroNCAP" / "manifest_1704.csv"
+        frame = pd.read_csv(path)
+        required = ["run", "design", "loc", "X1", "X2", "X3"]
+        if not set(required).issubset(frame.columns):
+            raise ValueError("1704 manifest is missing required columns")
+        numeric = frame[required].apply(pd.to_numeric, errors="coerce")
+        if not np.isfinite(numeric.to_numpy()).all():
+            raise ValueError("1704 manifest contains non-finite required values")
+        frame[required] = numeric
+        frame = frame.sort_values("run").reset_index(drop=True)
+        runs = np.arange(1, 1705)
+        if len(frame) != 1704 or not np.array_equal(frame["run"], runs):
+            raise ValueError("1704 manifest run IDs must be exactly 1..1704")
+        if (not np.array_equal(frame["design"], (runs - 1) // 142)
+                or not np.array_equal(frame["loc"], (runs - 1) % 142 + 1)):
+            raise ValueError("1704 manifest must use run = 142 * design + loc")
+        # Preserve original-corpus provenance separately from merged file IDs.
+        frame = frame.rename(columns={"source_run": "original_source_run",
+                                      "source_loc": "original_source_loc",
+                                      "run": "source_run", "loc": "location"})
+        for column in ("source_run", "design", "location"):
+            frame[column] = frame[column].astype(np.int64)
+        frame["global_run"] = frame["source_run"]
+        frame["source"] = "euroncap142"
+        frame.insert(0, "sample_index", np.arange(len(frame)))
+        frame["sample_key"] = "euroncap142:" + frame["source_run"].astype(str)
+        return frame
+    if dataset != "660":
+        raise ValueError(f"unknown dataset: {dataset}")
     industry_coords_path = data_root / "HoodImpact_60_IndustryLike" / "ImpactCoords_60.csv"
     manifest_path = data_root / "HoodImpact_600_EuroNCAP" / "manifest_600.csv"
     industry = pd.read_csv(industry_coords_path)
@@ -409,6 +441,8 @@ def shell_geometry(
 
 
 def representative_deck(data_root: Path, design: int, source: str = "industry5") -> Path:
+    if source == "euroncap142":
+        return data_root / "HoodImpact_1704_EuroNCAP" / "inp_files" / f"HoodImpact_{design * 142 + 1}.inp"
     if source == "industry5":
         run = design * INDUSTRY_LOCATIONS + 1
         folder = data_root / "HoodImpact_60_IndustryLike" / "inp_files"
@@ -418,8 +452,8 @@ def representative_deck(data_root: Path, design: int, source: str = "industry5")
     return folder / f"HoodImpact_{run}.inp"
 
 
-def preflight(data_root: Path) -> Dict[str, object]:
-    metadata = build_metadata(data_root)
+def preflight(data_root: Path, dataset: str = "660") -> Dict[str, object]:
+    metadata = build_metadata(data_root, dataset)
     expected_counts = {
         "industry_inp": (data_root / "HoodImpact_60_IndustryLike" / "inp_files", 60, "*.inp"),
         "industry_history": (
@@ -434,6 +468,17 @@ def preflight(data_root: Path) -> Dict[str, object]:
             "*.csv",
         ),
     }
+    if dataset == "1704":
+        root = data_root / "HoodImpact_1704_EuroNCAP"
+        expected_counts = {
+            "euroncap_inp": (root / "inp_files", 1704, "*.inp"),
+            "euroncap_history": (root / "output_history_acc", 1704, "*.csv"),
+        }
+        for row in metadata.itertuples(index=False):
+            for path in (root / "inp_files" / f"HoodImpact_{row.source_run}.inp",
+                         history_path(data_root, row.source, row.source_run)):
+                if not path.is_file():
+                    raise FileNotFoundError(path)
     counts = {}
     for name, (folder, expected, pattern) in expected_counts.items():
         actual = len(list(folder.glob(pattern)))
@@ -446,23 +491,26 @@ def preflight(data_root: Path) -> Dict[str, object]:
     inner_counts: Dict[int, int] = {}
     connector_counts: Dict[int, int] = {}
     for design in range(EXPECTED_DESIGNS):
-        ids_60, xyz_60, outer_60, inner_60, connector_60 = shell_geometry(
-            representative_deck(data_root, design)
+        primary = representative_deck(
+            data_root, design, "euroncap142" if dataset == "1704" else "industry5"
         )
-        ids_600, xyz_600, _, inner_600, connector_600 = shell_geometry(
-            representative_deck(data_root, design, source="euroncap50")
+        # Check the selected-50 and remaining-92 source geometry in merged mode.
+        secondary = (
+            primary.with_name(f"HoodImpact_{design * 142 + 142}.inp")
+            if dataset == "1704"
+            else representative_deck(data_root, design, "euroncap50")
         )
-        if (
-            not np.array_equal(ids_60, ids_600)
-            or not np.array_equal(xyz_60, xyz_600)
-            or not np.array_equal(inner_60, inner_600)
-            or not np.array_equal(connector_60, connector_600)
-        ):
+        ids, xyz, outer, inner, connectors = shell_geometry(primary)
+        other_ids, other_xyz, other_outer, other_inner, other_connectors = shell_geometry(secondary)
+        if any(not np.array_equal(left, right) for left, right in (
+            (ids, other_ids), (xyz, other_xyz), (outer, other_outer),
+            (inner, other_inner), (connectors, other_connectors),
+        )):
             raise ValueError(f"source geometries disagree for design {design}")
-        hood_counts[design] = len(xyz_60)
-        outer_counts[design] = len(outer_60)
-        inner_counts[design] = len(inner_60)
-        connector_counts[design] = len(connector_60)
+        hood_counts[design] = len(xyz)
+        outer_counts[design] = len(outer)
+        inner_counts[design] = len(inner)
+        connector_counts[design] = len(connectors)
 
     for row in (metadata.iloc[0], metadata.iloc[-1]):
         frame = pd.read_csv(
@@ -636,7 +684,10 @@ def dataset_fingerprint(data_root: Path, metadata: pd.DataFrame, max_window_s: f
         data_root / "HoodImpact_60_IndustryLike" / "ImpactCoords_60.csv",
         data_root / "HoodImpact_600_EuroNCAP" / "manifest_600.csv",
     ]
-    paths.extend(representative_deck(data_root, design) for design in range(EXPECTED_DESIGNS))
+    source = str(metadata.iloc[0]["source"])
+    if source == "euroncap142":
+        paths = [data_root / "HoodImpact_1704_EuroNCAP" / "manifest_1704.csv"]
+    paths.extend(representative_deck(data_root, design, source) for design in range(EXPECTED_DESIGNS))
     paths.extend(
         history_path(data_root, str(row.source), int(row.source_run))
         for row in metadata.itertuples(index=False)
@@ -654,8 +705,9 @@ def load_or_prepare_data(
     max_window_s: float,
     rebuild_cache: bool,
     logger: logging.Logger,
+    dataset: str = "660",
 ) -> PreparedData:
-    metadata = build_metadata(data_root)
+    metadata = build_metadata(data_root, dataset)
     fingerprint = dataset_fingerprint(data_root, metadata, max_window_s)
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_path = cache_dir / f"dataset_{fingerprint[:16]}.npz"
@@ -676,7 +728,7 @@ def load_or_prepare_data(
     geometries = {}
     for design in range(EXPECTED_DESIGNS):
         _, hood_xyz, outer_xyz, inner_xyz, connector_xyz = shell_geometry(
-            representative_deck(data_root, design)
+            representative_deck(data_root, design, "euroncap142" if dataset == "1704" else "industry5")
         )
         geometries[design] = (hood_xyz, outer_xyz, inner_xyz, connector_xyz)
         logger.info(
@@ -768,11 +820,12 @@ class TrainingNormalizer:
         train_metadata["hic15"] = data.hic15[train_indices]
         location_means = train_metadata.groupby(["source", "location"])["hic15"].mean()
         self.industry_hic_mean = np.asarray(
-            [location_means.loc[("industry5", location)] for location in range(1, 6)],
+            [location_means.loc[("industry5", location)] for location in range(1, 6)] if "industry5" in train_metadata["source"].values else [],
             dtype=np.float32,
         )
+        euro_source = "euroncap142" if "euroncap142" in train_metadata["source"].values else "euroncap50"
         self.euroncap_hic_mean = np.asarray(
-            [location_means.loc[("euroncap50", location)] for location in range(1, 51)],
+            [location_means.loc[(euro_source, location)] for location in range(1, 143 if euro_source == "euroncap142" else 51)],
             dtype=np.float32,
         )
         baseline = self.hic_baseline(train_metadata)
@@ -816,7 +869,9 @@ class TrainingNormalizer:
         for index, row in enumerate(metadata.itertuples(index=False)):
             if row.source == "industry5":
                 table = self.industry_hic_mean
-            elif row.source == "euroncap50":
+            elif row.source in ("euroncap50", "euroncap142"):
+                if len(self.euroncap_hic_mean) != (142 if row.source == "euroncap142" else 50):
+                    raise ValueError("HIC-baseline source does not match fitted dataset")
                 table = self.euroncap_hic_mean
             else:
                 raise ValueError(f"unknown HIC-baseline source: {row.source!r}")
@@ -1066,18 +1121,23 @@ def model_parameter_count(model: nn.Module) -> int:
 def split_indices(
     metadata: pd.DataFrame,
     validation_design: int,
-    test_design: int,
+    test_design: int | Sequence[int],
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    if validation_design == test_design:
+    test_designs = [test_design] if isinstance(test_design, (int, np.integer)) else list(test_design)
+    if not test_designs or len(set(test_designs)) != len(test_designs):
+        raise ValueError("test designs must be nonempty and unique")
+    if validation_design in test_designs:
         raise ValueError("validation and test design must differ")
-    for name, design in (("validation", validation_design), ("test", test_design)):
+    for design in [validation_design, *test_designs]:
         if design not in range(EXPECTED_DESIGNS):
-            raise ValueError(f"{name} design must be in [0, 11], got {design}")
+            raise ValueError(f"held-out design must be in [0, 11], got {design}")
     design = metadata["design"].to_numpy(np.int64)
-    train = np.flatnonzero((design != validation_design) & (design != test_design))
+    test_mask = np.isin(design, test_designs)
+    train = np.flatnonzero((design != validation_design) & ~test_mask)
     validation = np.flatnonzero(design == validation_design)
-    test = np.flatnonzero(design == test_design)
-    expected = (550, 55, 55)
+    test = np.flatnonzero(test_mask)
+    per_design = 142 if set(metadata["source"]) == {"euroncap142"} else 55
+    expected = ((11 - len(test_designs)) * per_design, per_design, len(test_designs) * per_design)
     if (len(train), len(validation), len(test)) != expected:
         raise ValueError(
             f"expected design split sizes {expected}, found {(len(train), len(validation), len(test))}"
@@ -1234,7 +1294,7 @@ def detailed_metrics(
             ),
         }
     }
-    for source in ("industry5", "euroncap50"):
+    for source in sorted(data.metadata["source"].unique()):
         mask = frame["source"].to_numpy() == source
         metrics[source] = {
             "hic_direct": asdict(
@@ -1400,7 +1460,7 @@ def add_baseline_metrics(
         regression_metrics(data.hic15[indices], baseline)
     )
     frame = data.metadata.iloc[indices].reset_index(drop=True)
-    for source in ("industry5", "euroncap50"):
+    for source in sorted(data.metadata["source"].unique()):
         mask = frame["source"].to_numpy() == source
         metric_sets[source]["location_mean_baseline"] = asdict(
             regression_metrics(data.hic15[indices][mask], baseline[mask])
@@ -1409,13 +1469,16 @@ def add_baseline_metrics(
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dataset", choices=("660", "1704"), default="660")
     parser.add_argument("--data-root", type=Path, default=Path("Data"))
     parser.add_argument(
         "--cache-dir", type=Path, default=Path("runs/_gpu_multiscale_hic_v6_cache")
     )
     parser.add_argument("--output-dir", type=Path, default=None)
-    parser.add_argument("--validation-design", type=int, default=10)
-    parser.add_argument("--test-design", type=int, default=11)
+    parser.add_argument("--validation-design", type=int, default=None)
+    test_group = parser.add_mutually_exclusive_group()
+    test_group.add_argument("--test-design", type=int, default=None)
+    test_group.add_argument("--test-designs", type=int, nargs="+", default=None)
     parser.add_argument("--max-window", type=float, default=0.015)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--min-epochs", type=int, default=30)
@@ -1435,7 +1498,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--refit-development",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=None,
         help=(
             "after validation selection, fit a fresh model on train+validation "
             "for the selected epoch count"
@@ -1445,7 +1508,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--rebuild-cache", action="store_true")
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--wandb-project", type=str, default=None)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.validation_design is None:
+        args.validation_design = 11 if args.dataset == "1704" else 10
+    if args.test_designs is not None:
+        args.test_design = args.test_designs
+    elif args.test_design is None:
+        args.test_design = [4, 5] if args.dataset == "1704" else 11
+    if args.refit_development is None:
+        args.refit_development = args.dataset == "660"
+    return args
 
 
 def validate_training_args(args: argparse.Namespace) -> None:
@@ -1708,8 +1780,8 @@ def run(args: argparse.Namespace) -> Path:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if args.require_cuda and device.type != "cuda":
         raise RuntimeError("CUDA is required for this GPU experiment but is unavailable")
-    split_indices(build_metadata(args.data_root), args.validation_design, args.test_design)
-    preflight_summary = preflight(args.data_root)
+    split_indices(build_metadata(args.data_root, args.dataset), args.validation_design, args.test_design)
+    preflight_summary = preflight(args.data_root, args.dataset)
     device_smoke = None
     if args.require_cuda:
         device_smoke = cuda_smoke_check(device)
@@ -1771,13 +1843,14 @@ def run(args: argparse.Namespace) -> Path:
             args.max_window,
             args.rebuild_cache,
             logger,
+            args.dataset,
         )
         train_indices, validation_indices, test_indices = split_indices(
             data.metadata, args.validation_design, args.test_design
         )
         logger.info(
             "Design split | train designs %s (%d) | validation design %d (%d) | "
-            "historical reference design %d (%d)",
+            "test designs %s (%d)",
             sorted(data.metadata.iloc[train_indices]["design"].unique().tolist()),
             len(train_indices),
             args.validation_design,
@@ -2077,7 +2150,7 @@ def run(args: argparse.Namespace) -> Path:
                 output_dir / "test_selection_metrics.json",
                 {
                     "design": args.test_design,
-                    "status": "pre-refit historical reference benchmark",
+                    "status": "selection-model held-out design evaluation",
                     "training_designs": sorted(
                         data.metadata.iloc[train_indices]["design"].unique().tolist()
                     ),
@@ -2099,7 +2172,7 @@ def run(args: argparse.Namespace) -> Path:
                 data.hic15[test_indices],
                 selection_test_prediction["hic_direct"],
                 selection_test_wave_hic,
-                f"Pre-refit historical reference design {args.test_design}",
+                f"Selection model test designs {args.test_design}",
             )
             log_evaluation_to_wandb(
                 wandb_run,
@@ -2135,7 +2208,7 @@ def run(args: argparse.Namespace) -> Path:
             add_baseline_metrics(test_metric_sets, data, test_indices, test_baseline)
             test_summary = {
                 "design": args.test_design,
-                "status": "historical reference benchmark; not a statistically untouched test",
+                "status": "held-out design evaluation; previously examined benchmark",
                 "selected_epoch": best_epoch,
                 "refit_development": bool(args.refit_development),
                 "training_designs": sorted(
@@ -2158,7 +2231,7 @@ def run(args: argparse.Namespace) -> Path:
                 data.hic15[test_indices],
                 test_prediction["hic_direct"],
                 test_wave_hic,
-                f"Historical reference design {args.test_design}",
+                f"Test designs {args.test_design}",
             )
             log_evaluation_to_wandb(
                 wandb_run,
