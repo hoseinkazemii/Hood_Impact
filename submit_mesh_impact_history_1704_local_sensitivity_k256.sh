@@ -38,7 +38,7 @@ mkdir -p "${PROJECT_DIR}/runs/slurm"
 exec sbatch \
     --chdir="${PROJECT_DIR}" \
     --job-name=mesh_hist_clusterB_k256 \
-    --time=48:00:00 \
+    --time=24:00:00 \
     --export=ALL \
     --output="${PROJECT_DIR}/runs/slurm/mesh_history_1704_clusterB_local_sensitivity_k256_%j.out" \
     --error="${PROJECT_DIR}/runs/slurm/mesh_history_1704_clusterB_local_sensitivity_k256_%j.err" \
