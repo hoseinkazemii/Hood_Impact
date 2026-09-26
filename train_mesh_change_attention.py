@@ -228,7 +228,7 @@ def resolved_config(config, args, model_kwargs, prediction_grid):
                         ("num_epochs", "batch_size", "learning_rate", "weight_decay", "seed")},
                      "device": str(config.device), "initialization": "from_scratch",
                      "optimizer": "AdamW", "scheduler": "CosineAnnealingLR", "gradient_clip_norm": 1.0,
-                     "loss": "normalized_acceleration_mse", "design_difference_weight": 0.0,
+                     "loss": "normalized_acceleration_mse",
                      "batch_sampling": "shuffle",
                      "checkpoint_selection": "validation_acceleration_mse", "test_loaded_during_training": False},
         "change_atlas": {"fit_on": "train_only", "file": "change_atlas.npz", "metadata_file": "change_atlas.json",

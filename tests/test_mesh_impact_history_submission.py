@@ -180,7 +180,7 @@ printf 'ARG=%s\\n' "$@"
                         HOOD_MESH_NEIGHBORHOOD_LAYERS="0", HOOD_MESH_DESIGN_DIFFERENCE_WEIGHT="0")
         output = self.launch("submit_mesh_impact_history_1704_local_sensitivity.sh", ["--time=08:00:00"])
         for expected in ("DECODER=temporal", "TEST=4 5", "VAL=11", "LEAK=0",
-                         "LOCAL=2", "K=16", "DIFFERENCE=1.0", "ARG=--time=48:00:00", "ARG=--time=08:00:00"):
+                         "LOCAL=2", "K=16", "ARG=--time=48:00:00", "ARG=--time=08:00:00"):
             self.assertIn(expected, output)
         self.assertLess(output.index("ARG=--time=48:00:00"), output.index("ARG=--time=08:00:00"))
 
@@ -189,13 +189,36 @@ printf 'ARG=%s\\n' "$@"
             if threshold == "20":
                 self.env["HOOD_MESH_HIC_RANGE_THRESHOLD_PERCENT"] = threshold
             output = self.launch("submit_mesh_impact_history_1704_hic_filtered_k256.sh")
-            for expected in ("LOCAL=2", "K=256", "TEST=4 5", "VAL=11", "DIFFERENCE=1.0",
+            for expected in ("LOCAL=2", "K=256", "TEST=4 5", "VAL=11",
                              f">= {threshold}%", "ARG=--job-name=mesh_hist_hic_filtered_k256"):
                 self.assertIn(expected, output)
         output = self.launch("run_mesh_impact_history_1704.sbatch")
         commands = [line for line in output.splitlines() if line.startswith("PYTHON")]
         self.assertNotIn("--hic-range-threshold-percent", commands[0])
         self.assertIn("<--hic-range-threshold-percent> <20>", commands[1])
+
+    def test_attention_submission_and_post_training_export(self):
+        self.stub("sbatch", 'printf "EXPORT=%s\\nHIC=%s\\nSPLIT=%s\\nSUMMARY=%s\\nRUNS=%s\\n" "$HOOD_MESH_EXPORT_ATTENTION" "$HOOD_MESH_HIC_RANGE_THRESHOLD_PERCENT" "$HOOD_MESH_ATTENTION_SPLIT" "$HOOD_MESH_ATTENTION_SUMMARY_ONLY" "$HOOD_MESH_ATTENTION_RUNS"; printf "ARG=%s\\n" "$@"\n')
+        self.env.update(HOOD_MESH_HIC_RANGE_THRESHOLD_PERCENT="10", HOOD_MESH_ATTENTION_SPLIT="train",
+                        HOOD_MESH_ATTENTION_SUMMARY_ONLY="1", HOOD_MESH_ATTENTION_RUNS="572")
+        output = self.launch("submit_mesh_impact_history_1704_attention_export.sh")
+        self.assertIn("EXPORT=1", output)
+        for expected in ("HIC=30", "SPLIT=test", "SUMMARY=0",
+                         "RUNS=577 622 670 693 710 719 764 812 835 852"):
+            self.assertIn(expected, output)
+        self.assertIn("ARG=--time=48:00:00", output)
+        self.env.update(HOOD_MESH_EXPORT_ATTENTION="1", HOOD_MESH_ATTENTION_SPLIT="test",
+                        HOOD_MESH_ATTENTION_RUNS="572 714", HOOD_MESH_ATTENTION_SUMMARY_ONLY="1")
+        output = self.launch("run_mesh_impact_history_1704.sbatch")
+        commands = [line for line in output.splitlines() if line.startswith("PYTHON")]
+        self.assertEqual(len(commands), 3)
+        self.assertIn("train_mesh_impact_history.py", commands[1])
+        self.assertIn("export_mesh_pooling_attention.py", commands[2])
+        for expected in ("<--split> <test>", "<--summary-only>", "<--runs> <572> <714>"):
+            self.assertIn(expected, commands[2])
+        self.env["MESH_TEST_TRAIN_STATUS"] = "23"
+        failed = self.launch("run_mesh_impact_history_1704.sbatch", expected_returncode=23)
+        self.assertNotIn("export_mesh_pooling_attention.py", failed)
 
     def test_fresh_cluster_B_launchers_cannot_silently_resume_an_old_split(self):
         self.env["HOOD_MESH_RESUME_FROM"] = "old_cluster_D_run"
@@ -245,8 +268,9 @@ printf 'ARG=%s\\n' "$@"
         commands = [line for line in output.splitlines() if line.startswith("PYTHON")]
         self.assertEqual(len(commands), 2)
         for command in commands:
+            self.assertNotIn("--design-difference-weight", command)
             for expected in ("<--neighborhood-layers> <2>", "<--neighborhood-k> <16>",
-                             "<--design-difference-weight> <1.0>", "<--batch-size> <8>",
+                             "<--batch-size> <8>",
                              "<--neighborhood-scale-mm> <20>", "<--neighborhood-chunk-size> <1024>"):
                 self.assertIn(expected, command)
 

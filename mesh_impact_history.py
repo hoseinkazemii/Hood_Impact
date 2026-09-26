@@ -3,7 +3,6 @@
 The mesh is an unordered set of XYZ nodes; no grid or element connectivity is
 required. Every node participates in impact-conditioned attention. A compact
 latent mesh representation drives a decoder with optional temporal attention.
-This module is independent of the repository's previous model implementations.
 
 ``forward`` accepts the flattened batches used by the shared training utilities.
 Time contains output-grid coordinates, never measured acceleration. For the
@@ -159,7 +158,7 @@ class MeshImpactHistoryNet(nn.Module):
     ``neighborhood_layers > 0`` inserts sparse, physical-XYZ kNN attention
     between the node embedding and global/local pooling. The zero default
     preserves old checkpoints. See README_mesh_local_sensitivity.md for the
-    two-layer experiment and its training-only design-difference objective.
+    two-layer experiment with ordinary acceleration MSE.
 
     ``impactor_nodes`` holds the leading rigid-headform nodes out of that local
     attention. They still reach the pooled memory unchanged; only the local
@@ -336,7 +335,7 @@ class MeshImpactHistoryNet(nn.Module):
             return updated
         return torch.cat((nodes[:self.impactor_nodes], updated))
 
-    def _encode_mesh(self, mesh: Tensor, impact: Tensor, condition: Tensor) -> Tensor:
+    def _mesh_pooling_inputs(self, mesh: Tensor, impact: Tensor, condition: Tensor):
         features = self.node_features(mesh, impact)
         nodes = self.node_embedding(features)
         if self.neighborhood_blocks:
@@ -356,6 +355,32 @@ class MeshImpactHistoryNet(nn.Module):
             F.softplus(self.local_log_precision),
         ))
         spatial_bias = -precision[:, None] * features[:, 5].unsqueeze(0)
+        return tokens, query, key, value, spatial_bias
+
+    @torch.no_grad()
+    def iter_pooling_attention(self, mesh: Tensor, impact: Tensor, token_chunk_size: int = 16):
+        """Yield (first_token, weights[heads, chunk_tokens, nodes]) in eval mode.
+
+        Inputs use the saved training scalers, as in forward(). The weights
+        include the learned local radial bias and softmax over ALL mesh nodes.
+        No dropout is applied. No weights are retained in the model/checkpoint.
+        """
+        if self.training:
+            raise ValueError("Attention export requires model.eval()")
+        if token_chunk_size < 1:
+            raise ValueError("token_chunk_size must be positive")
+        # Generator execution must itself be inside no_grad.
+        with torch.no_grad():
+            condition = self.impact_embedding(impact)
+            _, query, key, _, spatial_bias = self._mesh_pooling_inputs(mesh, impact, condition)
+            for start in range(0, self.num_latents, token_chunk_size):
+                stop = min(start + token_chunk_size, self.num_latents)
+                scores = query[:, start:stop].float() @ key.float().transpose(-1, -2)
+                scores = scores / math.sqrt(self.width // self.num_heads)
+                yield start, torch.softmax(scores + spatial_bias[None, start:stop].float(), dim=-1)
+
+    def _encode_mesh(self, mesh: Tensor, impact: Tensor, condition: Tensor) -> Tensor:
+        tokens, query, key, value, spatial_bias = self._mesh_pooling_inputs(mesh, impact, condition)
         update = F.scaled_dot_product_attention(
             query.unsqueeze(0), key.unsqueeze(0), value.unsqueeze(0),
             attn_mask=spatial_bias.to(query.dtype)[None, None, :, :],

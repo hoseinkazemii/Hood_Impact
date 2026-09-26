@@ -139,7 +139,7 @@ def resolved_config(config, args, grid=None):
                 "num_epochs", "batch_size", "learning_rate", "weight_decay", "seed")},
             "device": str(config.device), "initialization": "from_scratch",
             "optimizer": "AdamW", "scheduler": "CosineAnnealingLR", "gradient_clip_norm": 1.0,
-            "loss": "normalized_acceleration_mse", "design_difference_weight": 0.0,
+            "loss": "normalized_acceleration_mse",
             "batch_sampling": "shuffle",
         },
         "prediction_grid": grid,

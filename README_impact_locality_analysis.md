@@ -24,7 +24,7 @@ improve a newly trained model.
 ## What the simulations show
 
 The 1,704 runs provide all combinations of 12 designs and 142 impact locations.
-The authoritative clusters in `mesh_design_sensitivity.py` are A = 0–3,
+The authoritative clusters in `mesh_design_clusters.py` are A = 0–3,
 B = 4–5, C = 6–9 and D = 10–11. All response time grids and impact XY coordinates
 were checked for alignment before comparisons.
 

@@ -44,7 +44,7 @@ DEFAULT_DATA_ROOT = "Data/HoodImpact_1704_EuroNCAP"
 # cluster the surfaces agree to 0.06 mm, between clusters they differ by at
 # least 2.13 mm. Holding out one design while its clones stay in training makes
 # the test score measure duplicate retrieval instead of learned physics.
-from mesh_design_sensitivity import GEOMETRY_CLUSTERS
+from mesh_design_clusters import GEOMETRY_CLUSTERS
 
 # Model knobs this experiment adds on top of the baseline architecture.
 EXPERIMENT_MODEL_KEYS = tuple(
@@ -285,7 +285,6 @@ def parse_args(argv=None):
     for key in EXPERIMENT_MODEL_KEYS:
         parser.add_argument(f"--{key.replace('_', '-')}", type=type(MODEL_DEFAULTS[key]),
                             default=MODEL_DEFAULTS[key])
-    parser.add_argument("--design-difference-weight", type=float, default=0.0)
     parser.add_argument("--batch-size", type=int, default=Config.batch_size)
     parser.add_argument("--allow-clone-leak", action="store_true",
                         help="Permit a holdout that leaves near-clones of a held-out "
@@ -297,7 +296,7 @@ def parse_args(argv=None):
         if saved.data_format != "euroncap1704" or saved.num_samples != NUM_RUNS or saved.samples_per_design != SAMPLES_PER_DESIGN:
             parser.error("The 1704 resume launcher requires a full euroncap1704 run")
         for key in (*EXPERIMENT_MODEL_KEYS, "decoder", "test_designs", "val_designs",
-                    "batch_size", "design_difference_weight"):
+                    "batch_size"):
             setattr(args, key, getattr(saved, key))
         if args.data_root is None:
             args.data_root = str(Path(saved.inp_dir).parent)
@@ -309,10 +308,6 @@ def main(argv=None):
     args = parse_args(argv)
     try:
         validate_runtime(args.require_cuda)
-        if not np.isfinite(args.design_difference_weight) or args.design_difference_weight < 0:
-            raise ValueError("design_difference_weight must be finite and nonnegative")
-        if args.design_difference_weight and (args.batch_size < 2 or args.batch_size % 2):
-            raise ValueError("Design sensitivity requires an even batch_size >= 2")
         splits = validate_splits(args.test_designs, args.val_designs)
         if args.allow_clone_leak:
             print("Cluster check: SKIPPED (--allow-clone-leak); scores may measure retrieval")

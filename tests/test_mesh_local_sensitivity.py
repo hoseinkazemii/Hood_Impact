@@ -1,4 +1,4 @@
-"""Behavioral checks for neighborhood learning and training-only differences."""
+"""Behavioral checks for neighborhood learning with ordinary acceleration MSE."""
 
 import json
 from pathlib import Path
@@ -11,10 +11,6 @@ import pandas as pd
 import pytest
 import torch
 
-from mesh_design_sensitivity import (
-    MatchedDesignBatchSampler, MatchedDesignDataset, collate_matched_designs,
-    difference_loss, matched_training_loader,
-)
 from mesh_impact_history import MeshImpactHistoryNet
 from mesh_neighborhood import NeighborGraphCache, NeighborhoodAttentionBlock, geometric_neighbors
 
@@ -105,73 +101,7 @@ def test_invalid_neighborhood_configuration_fails(options):
         MeshImpactHistoryNet(**options)
 
 
-def training_metadata(designs=(0, 1, 2, 3, 6, 7, 8, 9, 10), locations=142):
-    return SimpleNamespace(
-        run_numbers=[d * locations + i + 1 for d in designs for i in range(locations)],
-        indentor_positions=[np.array([i, 2 * i], dtype=np.float32) for d in designs for i in range(locations)],
-        time_arrays=[np.linspace(0, .025, 5, dtype=np.float32) for d in designs for i in range(locations)],
-    )
-
-
-def test_sampler_preserves_all_1278_train_runs_once_and_keeps_cross_cluster_pairs():
-    raw = training_metadata()
-    # Dataset len is only needed by the sampler, so supply a minimal interface.
-    class Metadata:
-        def __len__(self):
-            return len(self.run_numbers)
-    dataset = Metadata()
-    dataset.__dict__.update(raw.__dict__)
-    matched = MatchedDesignDataset(dataset, 142)
-    sampler = MatchedDesignBatchSampler(matched, 8, 42)
-    batches = list(sampler)
-    assert len(batches) == len(sampler) == 160
-    flat = [i for batch in batches for i in batch]
-    assert sorted(flat) == list(range(1278))
-    assert not {4, 5, 11} & set(matched.designs)
-    # Four cross-cluster pairs at each of 142 locations; one leftover per location.
-    for offset in range(0, 1136, 2):
-        a, b = flat[offset:offset + 2]
-        assert matched.locations[a] == matched.locations[b]
-        assert matched.clusters[a] != matched.clusters[b]
-    assert batches == list(MatchedDesignBatchSampler(matched, 8, 42))
-    assert batches != list(sampler)
-
-
-def test_pairing_rejects_misalignment_and_absence_of_cross_cluster_training_data():
-    for field, replacement, message in (
-        ("indentor_positions", np.array([99., 99.]), "XY mismatch"),
-        ("time_arrays", np.linspace(0, .03, 5), "Time grids differ"),
-    ):
-        data = training_metadata(designs=(0, 4), locations=2)
-        getattr(data, field)[2] = replacement
-        with pytest.raises(ValueError, match=message):
-            MatchedDesignDataset(data, 2)
-    with pytest.raises(ValueError, match="No matched-location"):
-        MatchedDesignDataset(training_metadata(designs=(0, 1), locations=2), 2)
-    with pytest.raises(ValueError, match="even batch_size"):
-        MatchedDesignBatchSampler(None, 3, 42)
-    with pytest.raises(ValueError, match="euroncap1704"):
-        matched_training_loader(None, SimpleNamespace(data_format="legacy"))
-
-
-def test_difference_loss_detects_geometry_collapse_and_cancels_common_error():
-    target = torch.tensor([1., 3., 5., 7.])
-    time_batch = torch.tensor([0, 0, 1, 1])
-    prediction = torch.tensor([2., 4., 2., 4.], requires_grad=True)
-    loss = difference_loss(prediction, target, time_batch, [(0, 1)])
-    assert loss.item() == 16
-    loss.backward()
-    torch.testing.assert_close(prediction.grad, torch.tensor([4., 4., -4., -4.]))
-    assert difference_loss(target + 100, target, time_batch, [(0, 1)]).item() == 0
-    assert difference_loss(prediction, target, time_batch, []).item() == 0
-    # Same-cluster and different-location examples never enter the pair set.
-    items = [dict(mesh=torch.zeros(1, 3), indentor=torch.zeros(2), time=torch.zeros(2),
-                  acceleration=torch.zeros(2), location=loc, cluster=cluster)
-             for loc, cluster in [(0, "A"), (0, "A"), (0, "B"), (1, "C")]]
-    assert collate_matched_designs(items)["design_pairs"] == [(0, 2), (1, 2)]
-
-
-def test_both_additions_train_save_and_reload_with_train_only_scalers():
+def test_neighborhood_mse_train_save_and_reload_with_train_only_scalers():
     from train_mesh_impact_history import DataPreprocessor, HistoryPredictor, main
 
     # Four locations per design; training A/C/D, validation 11, test whole B.
@@ -193,7 +123,7 @@ def test_both_additions_train_save_and_reload_with_train_only_scalers():
               "--epochs", "2", "--batch-size", "4", "--width", "16", "--num-heads", "2", "--num-latents", "4",
               "--latent-layers", "1", "--temporal-layers", "1", "--neighborhood-layers", "2", "--neighborhood-k", "3",
               "--impactor-nodes", "2",
-              "--design-difference-weight", "1", "--device", "cpu", "--wandb-mode", "disabled", "--output-dir", folder])
+              "--device", "cpu", "--wandb-mode", "disabled", "--output-dir", folder])
         root = Path(folder)
         saved = json.loads((root / "config.json").read_text())
         history = json.loads((root / "training_history.json").read_text())
@@ -201,11 +131,10 @@ def test_both_additions_train_save_and_reload_with_train_only_scalers():
         assert splits["train"]["design_ids"] == [0, 6, 10]
         assert splits["validation"]["design_ids"] == [11]
         assert splits["test"]["design_ids"] == [4, 5]
-        assert saved["training"]["design_difference_weight"] == 1
+        assert saved["training"]["loss"] == "normalized_acceleration_mse"
+        assert saved["training"]["batch_sampling"] == "shuffle"
         assert saved["architecture"]["kwargs"]["neighborhood_layers"] == 2
         assert saved["architecture"]["kwargs"]["impactor_nodes"] == 2
-        assert len(history["train_difference_losses"]) == 2
-        assert min(history["train_pair_counts"]) >= 4
         assert np.isfinite(history["train_losses"]).all()
         predictor = HistoryPredictor.from_run(folder)
         np.testing.assert_allclose(predictor.preprocessor.mesh_scaler.mean_,
@@ -216,8 +145,8 @@ def test_both_additions_train_save_and_reload_with_train_only_scalers():
             np.testing.assert_allclose(predicted, exported.loc[exported.run_number == data["run_numbers"][i], "acceleration_pred_g"],
                                        atol=3e-5, rtol=3e-5)
         frame = pd.read_csv(root / "training_history.csv")
-        np.testing.assert_allclose(frame.train_mse_normalized, history["train_mse_losses"])
-        np.testing.assert_allclose(frame.train_objective, history["train_losses"])
+        np.testing.assert_allclose(frame.train_mse_normalized, history["train_losses"])
+        assert "train_objective" not in frame
 
 
 # The leading nodes of a 1704 .inp *NODE block are the rigid headform. It moves

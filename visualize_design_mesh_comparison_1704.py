@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parent
 
 
 def read_clusters():
-    for node in ast.parse((ROOT / "mesh_design_sensitivity.py").read_text()).body:
+    for node in ast.parse((ROOT / "mesh_design_clusters.py").read_text()).body:
         if isinstance(node, ast.Assign) and any(
             isinstance(t, ast.Name) and t.id == "GEOMETRY_CLUSTERS" for t in node.targets
         ):

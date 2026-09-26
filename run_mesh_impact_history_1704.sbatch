@@ -74,7 +74,7 @@ PREFLIGHT_ARGS=(--data-root "${DATA_ROOT}" --require-cuda
 EXPERIMENT_ARGS=()
 for option in NEIGHBORHOOD_LAYERS:neighborhood-layers NEIGHBORHOOD_K:neighborhood-k \
     NEIGHBORHOOD_SCALE_MM:neighborhood-scale-mm NEIGHBORHOOD_CHUNK_SIZE:neighborhood-chunk-size \
-    IMPACTOR_NODES:impactor-nodes DESIGN_DIFFERENCE_WEIGHT:design-difference-weight \
+    IMPACTOR_NODES:impactor-nodes \
     BATCH_SIZE:batch-size; do
     variable="HOOD_MESH_${option%%:*}"
     if [[ -n "${!variable}" ]]; then
@@ -148,4 +148,19 @@ printf 'Training command:'
 printf ' %q' "${PYTHON_BIN}" -u train_mesh_impact_history.py "${TRAIN_ARGS[@]}"
 printf '\n'
 "${PYTHON_BIN}" -u train_mesh_impact_history.py "${TRAIN_ARGS[@]}"
+if [[ "${HOOD_MESH_EXPORT_ATTENTION:-0}" == "1" ]]; then
+    ATTENTION_ARGS=("${OUTPUT_DIR}" --device cuda
+        --split "${HOOD_MESH_ATTENTION_SPLIT:-test}")
+    if [[ -n "${HOOD_MESH_DATA_ROOT:-}" ]]; then
+        ATTENTION_ARGS+=(--data-root "${DATA_ROOT}")
+    fi
+    if [[ "${HOOD_MESH_ATTENTION_SUMMARY_ONLY:-0}" == "1" ]]; then
+        ATTENTION_ARGS+=(--summary-only)
+    fi
+    if [[ -n "${HOOD_MESH_ATTENTION_RUNS:-}" ]]; then
+        read -r -a ATTENTION_RUNS <<< "${HOOD_MESH_ATTENTION_RUNS}"
+        ATTENTION_ARGS+=(--runs "${ATTENTION_RUNS[@]}")
+    fi
+    "${PYTHON_BIN}" -u export_mesh_pooling_attention.py "${ATTENTION_ARGS[@]}"
+fi
 printf 'Finished. Checkpoints, metrics and acceleration histories: %s\n' "${OUTPUT_DIR}"

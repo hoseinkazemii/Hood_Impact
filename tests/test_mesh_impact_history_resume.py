@@ -39,15 +39,15 @@ def toy_data():
     return data
 
 
-def training_args(path, weight=1):
+def training_args(path):
     return ["--data-format", "euroncap1704", "--num-samples", "12", "--samples-per-design", "2",
             "--epochs", "4", "--batch-size", "4", "--width", "8", "--num-heads", "2", "--num-latents", "2",
             "--latent-layers", "1", "--temporal-layers", "1", "--neighborhood-layers", "2", "--neighborhood-k", "3",
-            "--impactor-nodes", "2", "--dropout", "0.1", "--design-difference-weight", str(weight),
+            "--impactor-nodes", "2", "--dropout", "0.1",
             "--device", "cpu", "--wandb-mode", "disabled", "--output-dir", str(path)]
 
 
-def interrupt_after_two_epochs(path, weight=1):
+def interrupt_after_two_epochs(path):
     original = Trainer.save_checkpoint
 
     def save_then_interrupt(trainer, filename):
@@ -57,20 +57,20 @@ def interrupt_after_two_epochs(path, weight=1):
 
     with mock.patch.object(Trainer, "save_checkpoint", save_then_interrupt):
         with pytest.raises(RuntimeError, match="simulated job timeout"):
-            main(training_args(path, weight))
+            main(training_args(path))
 
 
-@pytest.mark.parametrize("weight,legacy", [(0, False), (1, False), (1, True)])
-def test_resume_preserves_training_state_and_finishes_original_target(tmp_path, toy_data, weight, legacy):
+@pytest.mark.parametrize("legacy", [False, True])
+def test_resume_preserves_training_state_and_finishes_original_target(tmp_path, toy_data, legacy):
     source, resumed, baseline = (tmp_path / name for name in ("source", "resumed", "baseline"))
     with mock.patch.object(DataPreprocessor, "load_all_data", return_value=toy_data):
-        interrupt_after_two_epochs(source, weight)
+        interrupt_after_two_epochs(source)
         selected = source / (CHECKPOINT_NAME if legacy else LAST_CHECKPOINT_NAME)
         checkpoint = torch.load(selected, weights_only=True)
         completed = len(checkpoint["train_losses"])
         if legacy:
             for key in ("completed_epochs", "torch_rng_state", "cuda_rng_states", "numpy_rng_state",
-                        "python_rng_state", "train_mse_losses", "train_difference_losses", "train_pair_counts"):
+                        "python_rng_state"):
                 checkpoint.pop(key, None)
             torch.save(checkpoint, selected)
             (source / LAST_CHECKPOINT_NAME).unlink()
@@ -101,20 +101,14 @@ def test_resume_preserves_training_state_and_finishes_original_target(tmp_path, 
         assert saved["training"]["resumed_after_epoch"] == completed
         assert saved["training"]["initialization"] == "checkpoint"
         assert saved["architecture"]["kwargs"]["neighborhood_layers"] == 2
-        assert saved["training"]["design_difference_weight"] == weight
+        assert saved["training"]["loss"] == "normalized_acceleration_mse"
         assert (resumed / "test_acceleration_histories.csv").is_file()
         final = torch.load(resumed / LAST_CHECKPOINT_NAME, weights_only=True)
         assert final["completed_epochs"] == final["scheduler_state_dict"]["last_epoch"] == 4
-        if legacy:
-            assert history["train_mse_losses"][:completed] == [None] * completed
-            assert all(np.isfinite(history["train_mse_losses"][completed:]))
-            frame = pd.read_csv(resumed / "training_history.csv")
-            assert frame.train_mse_normalized.iloc[:completed].isna().all()
-            assert frame.epoch.tolist() == [1, 2, 3, 4]
-        else:
+        if not legacy:
             # Fresh checkpoint resume must reproduce uninterrupted optimization,
-            # including dropout RNG, shuffled batches and matched sampler epoch.
-            main(training_args(baseline, weight))
+            # including dropout RNG, shuffled batches.
+            main(training_args(baseline))
             expected = torch.load(baseline / LAST_CHECKPOINT_NAME, weights_only=True)
             assert final["train_losses"] == expected["train_losses"]
             assert final["val_losses"] == expected["val_losses"]
@@ -156,6 +150,25 @@ def test_checkpoint_write_failure_preserves_previous_file(tmp_path):
     assert not path.with_suffix(".pt.tmp").exists()
 
 
+def test_resume_rejects_former_combined_objective(tmp_path, toy_data):
+    source = tmp_path / "source"
+    with mock.patch.object(DataPreprocessor, "load_all_data", return_value=toy_data):
+        interrupt_after_two_epochs(source)
+    path = source / "config.json"
+    saved = json.loads(path.read_text())
+    saved["training"]["loss"] = "normalized_acceleration_mse_plus_design_difference_mse"
+    path.write_text(json.dumps(saved))
+    with pytest.raises(SystemExit):
+        parse_args(["--resume-from", str(source)])
+
+
+def test_removed_loss_option_is_not_accepted():
+    from preflight_mesh_impact_history_1704 import parse_args as preflight_args
+    for parser in (parse_args, preflight_args):
+        with pytest.raises(SystemExit):
+            parser(["--design-difference-weight", "0"])
+
+
 def test_resume_recovers_timeout_between_best_and_latest_writes(tmp_path, toy_data):
     source = tmp_path / "source"
     original = Trainer.save_checkpoint
@@ -195,7 +208,6 @@ def test_resume_preflight_reads_saved_experiment_and_dataset_location(tmp_path, 
     assert args.batch_size == 4
     assert args.neighborhood_layers == 2
     assert args.impactor_nodes == 2
-    assert args.design_difference_weight == 1
     assert Path(args.data_root) == tmp_path / "data"
 
 

@@ -118,7 +118,7 @@ class TemporalDeepONetTests(unittest.TestCase):
             saved = json.loads((run_dir / "config.json").read_text())
             self.assertEqual(saved["architecture"]["name"], "LegacyHoodImpactNeuralOperator")
             self.assertEqual(saved["training"]["initialization"], "from_scratch")
-            self.assertEqual(saved["training"]["design_difference_weight"], 0)
+            self.assertEqual(saved["training"]["loss"], "normalized_acceleration_mse")
             splits = json.loads((run_dir / "splits.json").read_text())
             self.assertEqual([len(splits[key]["run_numbers"]) for key in ("train", "validation", "test")],
                              [1278, 142, 284])

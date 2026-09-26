@@ -45,8 +45,6 @@ def load_history(run_dir):
         }
         if "train_objective" in frame:
             history["train_mse_losses"] = frame["train_mse_normalized"].tolist()
-            history["train_difference_losses"] = frame["train_design_difference_mse"].tolist()
-            history["train_pair_counts"] = frame["train_design_pairs"].tolist()
     _loss_arrays(history)
     return history
 

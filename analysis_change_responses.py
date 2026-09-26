@@ -26,7 +26,7 @@ COLORS = ["#2878b5", "#d8782b", "#278368", "#7857a1"]
 
 
 def cluster_mapping():
-    tree = ast.parse((ROOT / "mesh_design_sensitivity.py").read_text(encoding="utf-8"))
+    tree = ast.parse((ROOT / "mesh_design_clusters.py").read_text(encoding="utf-8"))
     for node in tree.body:
         if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "GEOMETRY_CLUSTERS" for t in node.targets):
             return ast.literal_eval(node.value)

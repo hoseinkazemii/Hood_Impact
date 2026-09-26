@@ -43,7 +43,7 @@ MODEL_DEFAULTS = {
     # mesh_only remains available to reload and reproduce ablation runs.
     "decoder": "temporal",
     "neighborhood_layers": 0,
-    "neighborhood_k": 16,
+    "neighborhood_k": 256,
     "neighborhood_scale_mm": 20.0,
     "neighborhood_chunk_size": 1024,
     # Leading rigid-headform nodes held out of local attention only. The
@@ -72,8 +72,6 @@ def parse_args(argv=None):
     parser.add_argument("--lr", type=float)
     parser.add_argument("--weight-decay", type=float)
     parser.add_argument("--seed", type=int)
-    parser.add_argument("--design-difference-weight", type=float, default=0.0,
-                        help="Add matched-location cross-cluster difference MSE; 0 keeps ordinary training.")
     parser.add_argument("--hic-range-threshold-percent", type=float,
                         help="Keep locations with 100*(max-min)/mean HIC15 >= this value across all 12 designs.")
     parser.add_argument("--max-train-time", type=float, help="Optional cutoff before the configured time stride is applied.")
@@ -125,6 +123,8 @@ def restore_resume_arguments(args, parser, argv):
     saved = json.loads((source_dir / "config.json").read_text(encoding="utf-8"))
     if saved.get("format_version") != 1 or saved.get("architecture", {}).get("name") != "MeshImpactHistoryNet":
         parser.error("Resume requires a supported MeshImpactHistoryNet run")
+    if saved["training"].get("loss", "normalized_acceleration_mse") != "normalized_acceleration_mse":
+        parser.error("This checkpoint used a different training objective; start a fresh acceleration-MSE run")
     splits = json.loads((source_dir / "splits.json").read_text(encoding="utf-8"))
     settings = {**MODEL_DEFAULTS, **saved["architecture"]["kwargs"],
                 **{key: saved["data"][key] for key in ("data_format", "num_samples", "samples_per_design")},
@@ -132,7 +132,6 @@ def restore_resume_arguments(args, parser, argv):
                 "epochs": saved["training"]["num_epochs"],
                 "lr": saved["training"]["learning_rate"],
                 "max_train_time": saved["preprocessing"]["max_train_time"],
-                "design_difference_weight": saved["training"].get("design_difference_weight", 0.0),
                 "hic_range_threshold_percent": (saved.get("location_filter") or {}).get("threshold_percent"),
                 "test_designs": splits["test"]["design_ids"],
                 "val_designs": splits["validation"]["design_ids"]}
@@ -181,18 +180,11 @@ def build_config(args):
         raise ValueError("max_train_time must be finite and positive")
     if config.device.type == "cuda" and not torch.cuda.is_available():
         raise ValueError("CUDA was requested but is unavailable; use --device cpu")
-    if not np.isfinite(args.design_difference_weight) or args.design_difference_weight < 0:
-        raise ValueError("design_difference_weight must be finite and nonnegative")
     if args.hic_range_threshold_percent is not None:
         if not np.isfinite(args.hic_range_threshold_percent) or args.hic_range_threshold_percent < 0:
             raise ValueError("HIC range threshold must be finite and nonnegative")
         if config.data_format != "euroncap1704" or config.samples_per_design != 142 or config.num_samples != 1704:
             raise ValueError("HIC location filtering requires the complete 12 x 142 euroncap1704 dataset")
-    if args.design_difference_weight > 0:
-        if config.data_format != "euroncap1704":
-            raise ValueError("Design sensitivity is defined only for --data-format euroncap1704")
-        if config.batch_size < 2 or config.batch_size % 2:
-            raise ValueError("Design sensitivity requires an even batch_size >= 2")
     return config
 
 
@@ -277,11 +269,8 @@ def resolved_config(config, args, model_kwargs, prediction_grid):
             "initialization": "checkpoint" if args.resume_from else "from_scratch",
             "resume_from": args.resume_from,
             "optimizer": "AdamW",
-            "loss": ("normalized_acceleration_mse_plus_design_difference_mse"
-                     if args.design_difference_weight else "normalized_acceleration_mse"),
-            "design_difference_weight": args.design_difference_weight,
-            "batch_sampling": "matched_location_cross_cluster" if args.design_difference_weight else "shuffle",
-            "difference_pairs_from": "train_only" if args.design_difference_weight else None,
+            "loss": "normalized_acceleration_mse",
+            "batch_sampling": "shuffle",
             "scheduler": "CosineAnnealingLR",
             "gradient_clip_norm": 1.0,
         },
@@ -321,8 +310,7 @@ def initialize_wandb(args, initial_config, output_dir, logger):
             dir=str(output_dir), mode=args.wandb_mode,
         )
         run.define_metric("epoch")
-        for metric in ("train/loss", "train/acceleration_mse", "train/design_difference_mse",
-                       "train/design_pairs", "val/loss", "val/mae_g", "lr"):
+        for metric in ("train/loss", "val/loss", "val/mae_g", "lr"):
             run.define_metric(metric, step_metric="epoch")
         actual_mode = run.settings.mode
         metadata = {
@@ -509,11 +497,6 @@ def main(argv=None):
         )
         train_loader, val_loader, test_loader, test_dataset = loaders
         train_dataset = train_loader.dataset
-        if args.design_difference_weight:
-            from mesh_design_sensitivity import matched_training_loader
-            train_loader = matched_training_loader(train_dataset, config)
-            logger.info("Matched training batches: %s runs, %s batches/epoch, difference weight=%s",
-                        len(train_dataset), len(train_loader), args.design_difference_weight)
         if source_dir is not None:
             preprocessor.load_scalers(str(source_dir / "scalers.joblib"))
         else:
@@ -551,18 +534,11 @@ def main(argv=None):
         np.save(output_dir / "prediction_times.npy", first_times, allow_pickle=False)
         logger.info("Saved train-only scalers and sampled prediction grid (%s points); parameters: %s", len(first_times), sum(parameter.numel() for parameter in model.parameters()))
         run.config.update(saved_config, allow_val_change=True)
-        if args.design_difference_weight:
-            from mesh_design_sensitivity import DesignSensitivityTrainer
-            trainer = DesignSensitivityTrainer(model, train_loader, val_loader, config, preprocessor,
-                                               difference_weight=args.design_difference_weight)
-        else:
-            trainer = Trainer(model, train_loader, val_loader, config, preprocessor)
+        trainer = Trainer(model, train_loader, val_loader, config, preprocessor)
         if source_dir is not None:
             restored = trainer.load_checkpoint(args.resume_from)
             if "torch_rng_state" not in restored:
                 logger.info("Legacy checkpoint has no random-generator state; stochastic draws restart from seed %s", config.seed)
-            if args.design_difference_weight and "train_mse_losses" not in restored:
-                logger.info("Legacy checkpoint omitted separate design-loss metrics; previous component values remain missing")
             run.summary["resumed_after_epoch"] = completed
             run.summary["best_val_loss"] = trainer.best_val_loss
             del restored
@@ -570,13 +546,9 @@ def main(argv=None):
         write_json(output_dir / "training_history.json", history)
         history_columns = {
             "epoch": np.arange(1, len(history["train_losses"]) + 1),
-            "train_mse_normalized": history.get("train_mse_losses", history["train_losses"]),
+            "train_mse_normalized": history["train_losses"],
             "validation_mse_normalized": history["val_losses"],
         }
-        if args.design_difference_weight:
-            history_columns.update(train_objective=history["train_losses"],
-                                   train_design_difference_mse=history["train_difference_losses"],
-                                   train_design_pairs=history["train_pair_counts"])
         pd.DataFrame(history_columns).to_csv(output_dir / "training_history.csv", index=False)
         history_plot = export_training_history_plot(history, output_dir)
         logger.info("Saved training history plot: %s", history_plot)
