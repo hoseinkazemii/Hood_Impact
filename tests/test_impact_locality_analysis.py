@@ -1,5 +1,6 @@
 """Checks that the analysis interventions and statistics mean what they claim."""
 import numpy as np
+import pytest
 import torch
 
 from analyze_impact_locality_1704 import (
@@ -37,13 +38,14 @@ def test_location_control_removes_a_shared_location_pattern():
     assert abs(rank_association(geometry, response, location_control=True)) < 1e-10
 
 
-def test_factor_one_reproduces_model_and_other_factors_act_without_weight_changes():
+@pytest.mark.parametrize("impact_conditioning", ["film", "legacy_additive"])
+def test_factor_one_reproduces_model_and_other_factors_act_without_weight_changes(impact_conditioning):
     torch.manual_seed(4)
     torch.set_num_threads(1)
     model = MeshImpactHistoryNet(width=16, num_heads=2, num_latents=6,
                                 latent_layers=1, temporal_layers=1, neighborhood_layers=1,
                                 neighborhood_k=3, neighborhood_chunk_size=5,
-                                impactor_nodes=2, dropout=0).eval()
+                                impactor_nodes=2, dropout=0, impact_conditioning=impact_conditioning).eval()
     mesh, impact, times = torch.randn(15,3), torch.randn(2), torch.linspace(-1,1,9)
     before = {k:v.clone() for k,v in model.state_dict().items()}
     actual = frozen_prior_predictions(model,mesh,impact,times,[0.,1.,4.])

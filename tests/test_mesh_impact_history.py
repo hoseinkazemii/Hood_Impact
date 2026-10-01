@@ -216,7 +216,7 @@ class MeshImpactHistoryTests(unittest.TestCase):
         self.assertTrue(all(torch.isfinite(gradient).all() for gradient in parameter_gradients))
         self.assertGreater(sum(gradient.abs().sum().item() for gradient in parameter_gradients), 0.0)
 
-    def test_relative_features_put_independently_normalized_impact_in_mesh_units(self):
+    def test_xyz_features_and_pooling_prior_use_independent_scalers_correctly(self):
         mesh_mean = np.array([100.0, -30.0, 500.0], dtype=np.float32)
         mesh_scale = np.array([10.0, 5.0, 20.0], dtype=np.float32)
         impact_mean = np.array([80.0, -20.0], dtype=np.float32)
@@ -226,10 +226,14 @@ class MeshImpactHistoryTests(unittest.TestCase):
         impact = torch.tensor([2.0, -1.0])
         # Physical impact=(88,-22), hence normalized mesh-space impact=(-1.2,1.6).
         relative = mesh[:, :2] - torch.tensor([-1.2, 1.6])
-        expected = torch.cat((mesh, relative, relative.square().sum(-1, keepdim=True)), dim=-1)
         actual = self.model.node_features(mesh, impact)
-        self.assertEqual(actual.shape, (2, 6))
-        torch.testing.assert_close(actual, expected)
+        self.assertEqual(actual.shape, (2, 3))
+        torch.testing.assert_close(actual, mesh)
+        torch.testing.assert_close(self.model.impact_relative_xy(mesh, impact), relative)
+        *_, bias = self.model._mesh_pooling_inputs(mesh, impact, self.model.impact_embedding(impact))
+        torch.testing.assert_close(bias[:2], torch.zeros(2, 2))
+        precision = torch.nn.functional.softplus(self.model.local_log_precision)
+        torch.testing.assert_close(bias[2:], -precision[:, None] * relative.square().sum(-1)[None])
 
     def test_cpu_autocast_forward_and_backward_are_finite(self):
         self.model.train()
@@ -409,6 +413,7 @@ class TrainingRoundTripTests(unittest.TestCase):
             saved = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
             self.assertEqual(saved["architecture"]["name"], "MeshImpactHistoryNet")
             self.assertEqual(saved["architecture"]["kwargs"]["decoder"], decoder)
+            self.assertEqual(saved["architecture"]["kwargs"]["impact_conditioning"], "film")
             self.assertEqual(saved["preprocessing"]["time_subsample_stride"], Config.time_subsample_stride)
             self.assertEqual(saved["preprocessing"]["acceleration_units"], "g")
             self.assertEqual(saved["training"]["initialization"], "from_scratch")

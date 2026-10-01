@@ -70,7 +70,7 @@ def main():
                         print(f"SHAPE {name}: {shapes[name]}", flush=True)
                 return record
             for name, module in self.named_modules():
-                if name in ("node_embedding", "impact_embedding", "memory_norm", "time_embedding",
+                if name in ("node_embedding", "impact_embedding", "impact_film", "memory_norm", "time_embedding",
                             "acceleration_head") or name in {
                                 "neighborhood_blocks.0", "neighborhood_blocks.1",
                                 "latent_blocks.0", "latent_blocks.1", "latent_blocks.2",

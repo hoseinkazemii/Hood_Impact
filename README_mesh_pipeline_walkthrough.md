@@ -1,7 +1,8 @@
 # Mesh acceleration pipeline: from submission to predictions
 
 This is the current neighborhood-attention experiment: two neighborhood layers,
-256 nearest structural nodes, a temporal decoder, and **ordinary acceleration
+256 nearest structural nodes, XYZ-only node inputs, FiLM-conditioned pooling,
+a temporal decoder with time-only queries, and **ordinary acceleration
 MSE only**. The HIC threshold selects examples; it is not a loss term.
 
 ## Execution map
@@ -147,17 +148,17 @@ Definitions: [mesh_impact_history.py](mesh_impact_history.py),
 | Stage | Shape for one example | Operation |
 |---|---|---|
 | Raw mesh | N x 3 | Standardized XYZ |
-| Node features | N x 6 | XYZ, impact-relative XY, squared relative XY distance |
-| Embedding | N x 128 | Linear 6->128->128, GELU, LayerNorm |
+| Node features | N x 3 | XYZ only, with the existing training-only normalization |
+| Embedding | N x 128 | Linear 3->128->128, GELU, LayerNorm |
 | Two neighborhood blocks | (N-286) x 128 | 256 nearest structural neighbors, four attention heads, relative XYZ scores/messages |
 | Reattach headform embeddings | N x 128 | Leading 286 nodes bypass local updates |
-| Attention pooling | 256 x 128 | 128 global queries + 128 queries with learned radial impact bias |
+| Attention pooling | 256 x 128 | FiLM conditions normalized tokens before cross-attention; 128 global queries + 128 queries with learned radial impact bias |
 | Three latent blocks | 256 x 128 | Self-attention among pooled mesh tokens |
-| Time queries | T x 128 | Five continuous time features embedded and conditioned on impact XY |
+| Time queries | T x 128 | Five continuous time features embedded; no direct impact embedding |
 | Two decoder blocks | T x 128 | Cross-attend to mesh memory, then self-attend across requested times |
 | Acceleration head | T x 1 | LayerNorm, linear 128->128->1 with GELU |
 
-Default model size: **1,558,921 trainable parameters**. Width 128, four heads,
+Default model size: **1,591,561 trainable parameters**. Width 128, four heads,
 dropout 0.1. Local feedforward width is 256; latent and decoder feedforward
 width is 512. Neighbor graphs use physical XYZ, with relative positions scaled
 by 20 mm. Both local layers reuse the same graph. Node chunks of 1024 and
@@ -165,6 +166,14 @@ activation recomputation limit memory use. The graph is cached per geometry.
 
 The 256 neighbors and 256 pooled tokens are independent settings. The full
 production network keeps all structural nodes. The demo reduces their count.
+
+FiLM applies `(1 + delta_gamma) * LayerNorm(tokens) + beta`, with scale and
+shift generated from an XY impact embedding and broadcast over the tokens.
+It starts at identity modulation. The local distance bias, 20 mm neighborhood
+position scaling, and headform participation in pooling remain unchanged.
+Saved configs record `impact_conditioning: film`. Older checkpoints are loaded
+with their original `legacy_additive` architecture; resume preserves that mode.
+The demonstration results below predate this FiLM revision.
 
 ## 7. Training and model selection
 

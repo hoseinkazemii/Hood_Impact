@@ -44,7 +44,7 @@ mkdir -p "${PROJECT_DIR}/runs/slurm"
 exec sbatch \
     --chdir="${PROJECT_DIR}" \
     --job-name="mesh_change_k${HOOD_CHANGE_K}" \
-    --time=48:00:00 \
+    --time=18:00:00 \
     --export=ALL \
     --output="${PROJECT_DIR}/runs/slurm/${HOOD_MESH_RUN_NAME}_%j.out" \
     --error="${PROJECT_DIR}/runs/slurm/${HOOD_MESH_RUN_NAME}_%j.err" \

@@ -244,21 +244,12 @@ def frozen_prior_predictions(model, mesh, impact, times, factors=FACTORS):
     from torch.nn import functional as F
     with torch.inference_mode():
         condition = model.impact_embedding(impact[None])[0]
-        features = model.node_features(mesh, impact)
-        nodes = model.node_embedding(features)
-        if model.neighborhood_blocks:
-            nodes = model._encode_neighborhoods(mesh, nodes)
-        tokens = model.latent_queries + condition[None]
-        w, heads, count = model.width // model.num_heads, model.num_heads, model.num_latents
-        query = model.mesh_query(model.query_norm(tokens)).reshape(count, heads, w).transpose(0, 1)
-        key, value = model.mesh_key_value(nodes).chunk(2, dim=-1)
-        key = key.reshape(-1, heads, w).transpose(0, 1)
-        value = value.reshape(-1, heads, w).transpose(0, 1)
-        precision = torch.cat((model.local_log_precision.new_zeros(model.num_global_latents),
-                               F.softplus(model.local_log_precision)))
-        spatial_bias = -precision[:, None] * features[:, 5][None]
+        tokens, query, key, value, spatial_bias = model._mesh_pooling_inputs(mesh, impact, condition)
+        count = model.num_latents
         tf = torch.stack((times, times.square(), times.pow(3), times.tanh(), torch.exp(-times.square())), dim=-1)
-        tq = model.time_embedding(tf)[None] + condition[None, None]
+        tq = model.time_embedding(tf)[None]
+        if model.impact_conditioning == "legacy_additive":
+            tq = tq + condition[None, None]
         mask = torch.zeros(1, len(times), dtype=torch.bool, device=times.device)
         predictions = []
         for factor in factors:
@@ -290,7 +281,8 @@ def model_diagnostic(data_dir, run_dir, out_dir, arrays, device):
     from visualize_design_sensitivity_1704 import load_nodes
     config = json.loads((run_dir / "config.json").read_text())
     splits = json.loads((run_dir / "splits.json").read_text())
-    model = MeshImpactHistoryNet(**config["architecture"]["kwargs"])
+    from mesh_impact_history import saved_model_kwargs
+    model = MeshImpactHistoryNet(**saved_model_kwargs(config["architecture"]["kwargs"]))
     checkpoint = torch.load(run_dir / "hood_impact_best_model.pt", map_location="cpu", weights_only=True)
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     model.to(device).eval()

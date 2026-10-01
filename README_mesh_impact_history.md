@@ -1,6 +1,6 @@
 # Mesh and impact location to acceleration history
 
-For the **neighborhood encoder + design-sensitivity training** experiment on
+For the **neighborhood encoder + FiLM pooling** experiment on
 the cluster-B holdout, see [the architecture and training derivation](README_mesh_local_sensitivity.md).
 Submit it with `bash submit_mesh_impact_history_1704_local_sensitivity.sh`.
 The ordinary launcher and Python defaults retain the temporal baseline architecture
@@ -14,11 +14,13 @@ Mesh connectivity is not read: the geometry is an unordered set of all mesh
 nodes, with no rasterization or regular mesh requirement. The network contains
 no convolution layers and imports no previous model classes or checkpoints.
 
-The architecture projects each node's coordinates and impact-relative geometry
-into features. Impact-conditioned latent queries attend to all mesh nodes;
+The architecture projects each node's XYZ coordinates into features, using the
+existing training-only scaling. FiLM applies impact-dependent feature-wise
+scales and shifts to normalized latent tokens before they attend to all nodes;
 global queries and queries with learned distance priors describe the whole hood
 and the impact neighborhood. Attention among the latent tokens combines their
-information. Sampled output-time queries attend to those tokens, then temporal
+information. Sampled output-time queries contain time features only and attend
+to those tokens, then temporal
 self-attention couples the requested times before a scalar acceleration head.
 Training defaults to the original `--decoder temporal` architecture, including
 global/local mesh attention, latent-token attention, decoder cross-attention,
@@ -34,6 +36,12 @@ preprocessing, design splitting, optimizer/training loop, and evaluation.
 Coordinate scalers are fitted on training designs only; their statistics are
 also stored in the model so the separately normalized mesh and impact remain
 aligned when computing relative geometry.
+
+New runs record `impact_conditioning: film`. Older saved runs without that
+setting retain their original six-feature/additive architecture when loaded or
+resumed. Start a fresh run to train the FiLM revision; the existing neighborhood
+launchers select it by default. The local pooling distance prior, 20 mm
+neighborhood position scaling, and headform handling are unchanged.
 
 ## Train
 

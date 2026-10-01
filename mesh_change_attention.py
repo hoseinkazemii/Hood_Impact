@@ -37,6 +37,10 @@ class MeshChangeAttentionNet(MeshImpactHistoryNet):
             raise ValueError("change_scale_mm must be finite and positive")
         if kwargs.get("neighborhood_layers", 0):
             raise ValueError("Use change_layers for change patches; neighborhood_layers must be zero")
+        # This separate experiment retains its original six-feature patch input.
+        kwargs.setdefault("impact_conditioning", "legacy_additive")
+        if kwargs["impact_conditioning"] != "legacy_additive":
+            raise ValueError("FiLM is currently supported by MeshImpactHistoryNet, not the change-patch model")
         super().__init__(**kwargs)
         self.change_anchors, self.change_k = change_anchors, change_k
         self.change_scale_mm = change_scale_mm

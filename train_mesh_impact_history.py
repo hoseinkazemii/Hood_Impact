@@ -19,7 +19,7 @@ import pandas as pd
 import torch
 import wandb
 
-from mesh_impact_history import DECODER_BLOCKS, MeshImpactHistoryNet
+from mesh_impact_history import DECODER_BLOCKS, IMPACT_CONDITIONING, MeshImpactHistoryNet, saved_model_kwargs
 from mesh_impact_history_reporting import export_training_history_plot
 from utils.utils import (
     Config,
@@ -42,6 +42,7 @@ MODEL_DEFAULTS = {
     # Restore temporal attention after the cluster-D ablation comparison.
     # mesh_only remains available to reload and reproduce ablation runs.
     "decoder": "temporal",
+    "impact_conditioning": "film",
     "neighborhood_layers": 0,
     "neighborhood_k": 256,
     "neighborhood_scale_mm": 20.0,
@@ -77,11 +78,15 @@ def parse_args(argv=None):
     parser.add_argument("--max-train-time", type=float, help="Optional cutoff before the configured time stride is applied.")
     parser.add_argument("--device", help="PyTorch device, e.g. cpu, cuda, or cuda:0.")
     for key, default in MODEL_DEFAULTS.items():
-        if key != "decoder":
+        if key not in ("decoder", "impact_conditioning"):
             parser.add_argument(f"--{key.replace('_', '-')}", type=type(default), default=default)
     parser.add_argument(
         "--decoder", choices=sorted(DECODER_BLOCKS), default=MODEL_DEFAULTS["decoder"],
         help="mesh_only removes temporal self-attention; temporal restores the original baseline.",
+    )
+    parser.add_argument(
+        "--impact-conditioning", choices=IMPACT_CONDITIONING, default=MODEL_DEFAULTS["impact_conditioning"],
+        help="film uses XYZ-only nodes and FiLM pooling; legacy_additive reproduces older runs.",
     )
     parser.add_argument("--output-dir", help="New run directory; defaults to runs/mesh_impact_history/<timestamp>.")
     parser.add_argument("--resume-from", help="Prior run directory (latest, else best checkpoint) or checkpoint file; writes a new run.")
@@ -126,7 +131,7 @@ def restore_resume_arguments(args, parser, argv):
     if saved["training"].get("loss", "normalized_acceleration_mse") != "normalized_acceleration_mse":
         parser.error("This checkpoint used a different training objective; start a fresh acceleration-MSE run")
     splits = json.loads((source_dir / "splits.json").read_text(encoding="utf-8"))
-    settings = {**MODEL_DEFAULTS, **saved["architecture"]["kwargs"],
+    settings = {**MODEL_DEFAULTS, **saved_model_kwargs(saved["architecture"]["kwargs"]),
                 **{key: saved["data"][key] for key in ("data_format", "num_samples", "samples_per_design")},
                 **{key: saved["training"][key] for key in ("batch_size", "weight_decay", "seed")},
                 "epochs": saved["training"]["num_epochs"],
@@ -383,7 +388,7 @@ class HistoryPredictor:
         if architecture_name == "MeshChangeAttentionNet":
             from mesh_change_attention import MeshChangeAttentionNet
             model_class = MeshChangeAttentionNet
-        model = model_class(**saved["architecture"]["kwargs"])
+        model = model_class(**saved_model_kwargs(saved["architecture"]["kwargs"]))
         checkpoint = torch.load(run_dir / CHECKPOINT_NAME, map_location="cpu", weights_only=True)
         model.load_state_dict(checkpoint["model_state_dict"], strict=True)
         times = np.load(run_dir / "prediction_times.npy", allow_pickle=False)

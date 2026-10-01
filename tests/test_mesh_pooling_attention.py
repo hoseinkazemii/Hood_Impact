@@ -12,11 +12,12 @@ from train_mesh_impact_history import HistoryPredictor
 from utils.utils import DataPreprocessor
 
 
-def model():
+def model(impact_conditioning="film"):
     torch.manual_seed(17)
     return MeshImpactHistoryNet(width=8, num_heads=2, num_latents=6, latent_layers=1,
                                 temporal_layers=1, neighborhood_layers=2, neighborhood_k=3,
-                                impactor_nodes=2, dropout=.1).eval()
+                                impactor_nodes=2, dropout=.1,
+                                impact_conditioning=impact_conditioning).eval()
 
 
 def test_exported_attention_reconstructs_actual_pooling_and_chunks():
@@ -72,8 +73,9 @@ def test_file_export_preserves_ids_summaries_and_full_weights(tmp_path):
     np.testing.assert_allclose(pd.read_csv(tmp_path / "summary/node_attention.csv").mean_all, frame.mean_all)
 
 
-def test_cli_reloads_checkpoint_and_restricts_to_saved_split(tmp_path):
-    m = model()
+@pytest.mark.parametrize("impact_conditioning", ["film", "legacy_additive"])
+def test_cli_reloads_checkpoint_and_restricts_to_saved_split(tmp_path, impact_conditioning):
+    m = model(impact_conditioning)
     inp = tmp_path / "data/inp_files"
     inp.mkdir(parents=True)
     xyz = np.random.default_rng(19).normal(size=(11, 3)).astype(np.float32)
@@ -95,6 +97,9 @@ def test_cli_reloads_checkpoint_and_restricts_to_saved_split(tmp_path):
     torch.save({"model_state_dict": m.state_dict()}, run / "hood_impact_best_model.pt")
     kwargs = dict(width=8, num_heads=2, num_latents=6, latent_layers=1, temporal_layers=1,
                   neighborhood_layers=2, neighborhood_k=3, impactor_nodes=2, dropout=.1)
+    if impact_conditioning == "film":
+        kwargs["impact_conditioning"] = "film"
+    # Missing mode deliberately exercises historical additive configs.
     (run / "config.json").write_text(json.dumps({"format_version": 1,
         "architecture": {"name": "MeshImpactHistoryNet", "kwargs": kwargs}, "preprocessing": {},
         "data": {"data_format": "euroncap1704", "samples_per_design": 142,

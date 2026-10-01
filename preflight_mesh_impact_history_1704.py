@@ -49,7 +49,7 @@ from mesh_design_clusters import GEOMETRY_CLUSTERS
 # Model knobs this experiment adds on top of the baseline architecture.
 EXPERIMENT_MODEL_KEYS = tuple(
     key for key in MODEL_DEFAULTS
-    if key.startswith("neighborhood_") or key == "impactor_nodes"
+    if key.startswith("neighborhood_") or key in ("impactor_nodes", "impact_conditioning")
 )
 
 

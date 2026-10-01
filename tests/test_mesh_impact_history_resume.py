@@ -47,7 +47,7 @@ def training_args(path):
             "--device", "cpu", "--wandb-mode", "disabled", "--output-dir", str(path)]
 
 
-def interrupt_after_two_epochs(path):
+def interrupt_after_two_epochs(path, extra_args=()):
     original = Trainer.save_checkpoint
 
     def save_then_interrupt(trainer, filename):
@@ -57,7 +57,7 @@ def interrupt_after_two_epochs(path):
 
     with mock.patch.object(Trainer, "save_checkpoint", save_then_interrupt):
         with pytest.raises(RuntimeError, match="simulated job timeout"):
-            main(training_args(path))
+            main(training_args(path) + list(extra_args))
 
 
 @pytest.mark.parametrize("legacy", [False, True])
@@ -114,6 +114,26 @@ def test_resume_preserves_training_state_and_finishes_original_target(tmp_path, 
             assert final["val_losses"] == expected["val_losses"]
             for key, value in final["model_state_dict"].items():
                 torch.testing.assert_close(value, expected["model_state_dict"][key], atol=0, rtol=0)
+
+
+def test_pre_film_config_resumes_original_architecture(tmp_path, toy_data):
+    source, resumed = tmp_path / "legacy", tmp_path / "resumed"
+    with mock.patch.object(DataPreprocessor, "load_all_data", return_value=toy_data):
+        interrupt_after_two_epochs(source, ["--impact-conditioning", "legacy_additive"])
+        config_path = source / "config.json"
+        saved = json.loads(config_path.read_text())
+        del saved["architecture"]["kwargs"]["impact_conditioning"]
+        config_path.write_text(json.dumps(saved))
+        assert parse_args(["--resume-from", str(source)]).impact_conditioning == "legacy_additive"
+        with pytest.raises(SystemExit):
+            parse_args(["--resume-from", str(source), "--impact-conditioning", "film"])
+        main(["--resume-from", str(source), "--output-dir", str(resumed),
+              "--device", "cpu", "--wandb-mode", "disabled"])
+    restored = json.loads((resumed / "config.json").read_text())
+    assert restored["architecture"]["kwargs"]["impact_conditioning"] == "legacy_additive"
+    state = torch.load(resumed / LAST_CHECKPOINT_NAME, weights_only=True)["model_state_dict"]
+    assert state["node_embedding.0.weight"].shape[1] == 6
+    assert not any("film" in key for key in state)
 
 
 def test_resume_rejects_changed_settings_splits_and_existing_output(tmp_path, toy_data):

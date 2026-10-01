@@ -74,7 +74,7 @@ PREFLIGHT_ARGS=(--data-root "${DATA_ROOT}" --require-cuda
 EXPERIMENT_ARGS=()
 for option in NEIGHBORHOOD_LAYERS:neighborhood-layers NEIGHBORHOOD_K:neighborhood-k \
     NEIGHBORHOOD_SCALE_MM:neighborhood-scale-mm NEIGHBORHOOD_CHUNK_SIZE:neighborhood-chunk-size \
-    IMPACTOR_NODES:impactor-nodes \
+    IMPACTOR_NODES:impactor-nodes IMPACT_CONDITIONING:impact-conditioning \
     BATCH_SIZE:batch-size; do
     variable="HOOD_MESH_${option%%:*}"
     if [[ -n "${!variable}" ]]; then

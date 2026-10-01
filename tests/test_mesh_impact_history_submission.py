@@ -263,6 +263,7 @@ printf 'ARG=%s\\n' "$@"
     def test_new_options_reach_both_direct_preflight_and_training(self):
         self.env.update(HOOD_MESH_NEIGHBORHOOD_LAYERS="2", HOOD_MESH_NEIGHBORHOOD_K="16",
                         HOOD_MESH_DESIGN_DIFFERENCE_WEIGHT="1.0", HOOD_MESH_BATCH_SIZE="8",
+                        HOOD_MESH_IMPACT_CONDITIONING="film",
                         HOOD_MESH_NEIGHBORHOOD_SCALE_MM="20", HOOD_MESH_NEIGHBORHOOD_CHUNK_SIZE="1024")
         output = self.launch("run_mesh_impact_history_1704.sbatch")
         commands = [line for line in output.splitlines() if line.startswith("PYTHON")]
@@ -270,7 +271,7 @@ printf 'ARG=%s\\n' "$@"
         for command in commands:
             self.assertNotIn("--design-difference-weight", command)
             for expected in ("<--neighborhood-layers> <2>", "<--neighborhood-k> <16>",
-                             "<--batch-size> <8>",
+                             "<--batch-size> <8>", "<--impact-conditioning> <film>",
                              "<--neighborhood-scale-mm> <20>", "<--neighborhood-chunk-size> <1024>"):
                 self.assertIn(expected, command)
 

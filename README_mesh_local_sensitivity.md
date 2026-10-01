@@ -1,7 +1,8 @@
 # Neighborhood attention with ordinary acceleration MSE
 
 The neighborhood model predicts acceleration histories from mesh XYZ, impact XY,
-and requested times. Training uses only ordinary normalized acceleration MSE:
+and requested times. New runs use **XYZ-only node features, FiLM-conditioned
+pooling tokens, and time-only decoder queries**. Training uses only ordinary normalized acceleration MSE:
 
 \[
 \mathcal L = \frac{1}{\sum_b T_b}\sum_{b,t}
@@ -97,20 +98,31 @@ Current defaults, unless overridden through the shared batch script:
 
 | Stage | Configuration |
 |---|---|
-| Node inputs | XYZ, impact-relative XY, squared XY distance: 6 features |
-| Node embedding | 6 -> 128 -> 128, GELU, LayerNorm |
+| Node inputs | XYZ only: 3 features, using the existing training-only coordinate scaler |
+| Node embedding | 3 -> 128 -> 128, GELU, LayerNorm |
 | Neighborhood encoder | 2 layers; 4 heads; k=256 in the k256 launchers |
 | Neighborhood feedforward | 128 -> 256 -> 128 |
 | Mesh pooling | 256 tokens: 128 global, 128 impact-local |
+| Impact conditioning | XY -> 128 -> 128; FiLM generates 128 scales and 128 shifts for pooling tokens |
 | Latent mixing | 3 self-attention blocks; 4 heads; feedforward 128 -> 512 -> 128 |
 | Time features | t, t squared, t cubed, tanh(t), exp(-t squared), using normalized t |
-| Time embedding | 5 -> 128 -> 128, plus impact embedding |
+| Time embedding | 5 -> 128 -> 128; no added impact embedding |
 | Decoder | 2 blocks, each with mesh cross-attention and temporal self-attention |
 | Acceleration head | LayerNorm, 128 -> 128 -> 1 |
 | Dropout | 0.1 |
 
-This configuration has **1,558,921 trainable parameters**. Neighbors and mesh
+This configuration has **1,591,561 trainable parameters**. Neighbors and mesh
 tokens are independent settings, even though both default to 256 in this run.
+
+For learned tokens `z` and impact embedding `e(p)`, pooling starts from
+`z_film = (1 + delta_gamma(e(p))) * LayerNorm(z) + beta(e(p))`.
+The feature-wise scale and shift are shared across the tokens of one example.
+The affine generator is initialized to zero, giving identity modulation at
+initialization. Normalization precedes FiLM so it does not immediately remove
+the modulation. The conditioned tokens supply the cross-attention queries and
+the pooling residual. Node embeddings and neighborhood updates do not receive
+impact-relative features. The local pooling distance prior is computed
+separately from XYZ and impact XY, in the same scaler units as before.
 
 Neighborhood selection uses physical XYZ Euclidean distance, including self.
 Each head learns feature attention plus a relative-position score and message.
@@ -145,6 +157,16 @@ Scalers are fitted only on retained training examples. `config.json` records
 validation losses. Test exports contain only retained test runs.
 
 ## Resume
+
+`architecture.kwargs.impact_conditioning` records `film` in every new run.
+The existing launchers use this default automatically. Start a **fresh run**
+to train the revised architecture: resuming an older run retains its original
+additive conditioning and six-feature node input. Older configs without this
+field are reconstructed as `legacy_additive` for inference, attention export,
+and resume. The separate `MeshChangeAttentionNet` experiment also retains its
+original architecture. `--impact-conditioning legacy_additive` (or
+`HOOD_MESH_IMPACT_CONDITIONING=legacy_additive` for the shared batch script)
+is available for explicit reproduction.
 
 ```bash
 bash submit_mesh_impact_history_1704_local_sensitivity_resume.sh RUN_DIRECTORY

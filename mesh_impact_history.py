@@ -132,6 +132,29 @@ class MeshOnlyDecoderBlock(nn.Module):
 DECODER_BLOCKS = {"temporal": HistoryDecoderBlock, "mesh_only": MeshOnlyDecoderBlock}
 
 
+IMPACT_CONDITIONING = ("film", "legacy_additive")
+
+
+def saved_model_kwargs(kwargs: dict) -> dict:
+    """Configs predating FiLM describe the six-feature additive architecture."""
+    return {"impact_conditioning": "legacy_additive", **kwargs}
+
+
+class ImpactFiLM(nn.Module):
+    """Apply impact-dependent scale and shift to every pooling token feature."""
+
+    def __init__(self, width: int):
+        super().__init__()
+        self.affine = nn.Linear(width, 2 * width)
+        # Start with identity modulation; learn deviations from scale=1, shift=0.
+        nn.init.zeros_(self.affine.weight)
+        nn.init.zeros_(self.affine.bias)
+
+    def forward(self, tokens: Tensor, condition: Tensor) -> Tensor:
+        scale_delta, shift = self.affine(condition).chunk(2, dim=-1)
+        return tokens * (1 + scale_delta) + shift
+
+
 class MeshImpactHistoryNet(nn.Module):
     """Impact-conditioned full-mesh attention, then a mesh-reading decoder.
 
@@ -156,9 +179,13 @@ class MeshImpactHistoryNet(nn.Module):
     activations and dropout are used; there are no convolution layers.
 
     ``neighborhood_layers > 0`` inserts sparse, physical-XYZ kNN attention
-    between the node embedding and global/local pooling. The zero default
-    preserves old checkpoints. See README_mesh_local_sensitivity.md for the
+    between the node embedding and global/local pooling. See
+    README_mesh_local_sensitivity.md for the
     two-layer experiment with ordinary acceleration MSE.
+
+    New models embed XYZ only and FiLM-condition normalized pooling tokens.
+    Time queries contain time only. ``legacy_additive`` reconstructs historical
+    checkpoints with six node features and additive impact conditioning.
 
     ``impactor_nodes`` holds the leading rigid-headform nodes out of that local
     attention. They still reach the pooled memory unchanged; only the local
@@ -179,6 +206,7 @@ class MeshImpactHistoryNet(nn.Module):
         neighborhood_scale_mm: float = 20.0,
         neighborhood_chunk_size: int = 1024,
         impactor_nodes: int = 0,
+        impact_conditioning: str = "film",
     ):
         super().__init__()
         integer_options = {
@@ -199,6 +227,8 @@ class MeshImpactHistoryNet(nn.Module):
         # raise TypeError instead of the intended ValueError.
         if not isinstance(decoder, str) or decoder not in DECODER_BLOCKS:
             raise ValueError(f"decoder must be one of {sorted(DECODER_BLOCKS)}")
+        if not isinstance(impact_conditioning, str) or impact_conditioning not in IMPACT_CONDITIONING:
+            raise ValueError(f"impact_conditioning must be one of {IMPACT_CONDITIONING}")
         if isinstance(neighborhood_layers, bool) or not isinstance(neighborhood_layers, int) or neighborhood_layers < 0:
             raise ValueError("neighborhood_layers must be a nonnegative integer")
         if not math.isfinite(neighborhood_scale_mm) or neighborhood_scale_mm <= 0:
@@ -207,6 +237,7 @@ class MeshImpactHistoryNet(nn.Module):
             raise ValueError("impactor_nodes must be a nonnegative integer")
 
         self.decoder = decoder
+        self.impact_conditioning = impact_conditioning
         self.width = width
         self.num_heads = num_heads
         self.num_latents = num_latents
@@ -224,7 +255,8 @@ class MeshImpactHistoryNet(nn.Module):
         self.register_buffer("impact_scale", torch.ones(2))
 
         self.node_embedding = nn.Sequential(
-            nn.Linear(6, width), nn.GELU(), nn.Linear(width, width),
+            nn.Linear(3 if impact_conditioning == "film" else 6, width),
+            nn.GELU(), nn.Linear(width, width),
             nn.LayerNorm(width),
         )
         self.impact_embedding = nn.Sequential(
@@ -276,6 +308,10 @@ class MeshImpactHistoryNet(nn.Module):
             # inputs, so it must not enter the checkpoint or a state dict.
             self.neighbor_cache = NeighborGraphCache()
 
+        # Append so legacy construction keeps the original parameter order/RNG.
+        if impact_conditioning == "film":
+            self.impact_film = ImpactFiLM(width)
+
     @torch.no_grad()
     def set_coordinate_scalers(
         self,
@@ -300,12 +336,18 @@ class MeshImpactHistoryNet(nn.Module):
         for name, value in converted.items():
             getattr(self, name).copy_(value)
 
-    def node_features(self, mesh: Tensor, impact: Tensor) -> Tensor:
-        """XYZ, node-minus-impact XY and XY distance squared in mesh units."""
+    def impact_relative_xy(self, mesh: Tensor, impact: Tensor) -> Tensor:
+        """Relative XY in common mesh-scaler units, used by the pooling prior."""
         impact_mesh_xy = (
             impact * self.impact_scale + self.impact_mean - self.mesh_mean[:2]
         ) / self.mesh_scale[:2]
-        relative_xy = mesh[:, :2] - impact_mesh_xy
+        return mesh[:, :2] - impact_mesh_xy
+
+    def node_features(self, mesh: Tensor, impact: Tensor) -> Tensor:
+        """Use XYZ only for FiLM; retain six features for historical runs."""
+        if self.impact_conditioning == "film":
+            return mesh
+        relative_xy = self.impact_relative_xy(mesh, impact)
         radius_squared = relative_xy.square().sum(dim=-1, keepdim=True)
         return torch.cat((mesh, relative_xy, radius_squared), dim=-1)
 
@@ -340,9 +382,15 @@ class MeshImpactHistoryNet(nn.Module):
         nodes = self.node_embedding(features)
         if self.neighborhood_blocks:
             nodes = self._encode_neighborhoods(mesh, nodes)
-        tokens = self.latent_queries + condition.unsqueeze(0)
+        if self.impact_conditioning == "film":
+            # Normalize before modulation so no immediate LayerNorm removes
+            # the FiLM scale/shift. Both query and residual use these tokens.
+            tokens = self.impact_film(self.query_norm(self.latent_queries), condition)
+            query = self.mesh_query(tokens)
+        else:
+            tokens = self.latent_queries + condition.unsqueeze(0)
+            query = self.mesh_query(self.query_norm(tokens))
         head_width = self.width // self.num_heads
-        query = self.mesh_query(self.query_norm(tokens))
         query = query.reshape(self.num_latents, self.num_heads, head_width).transpose(0, 1)
         key, value = self.mesh_key_value(nodes).chunk(2, dim=-1)
         key = key.reshape(-1, self.num_heads, head_width).transpose(0, 1)
@@ -354,7 +402,8 @@ class MeshImpactHistoryNet(nn.Module):
             self.local_log_precision.new_zeros(self.num_global_latents),
             F.softplus(self.local_log_precision),
         ))
-        spatial_bias = -precision[:, None] * features[:, 5].unsqueeze(0)
+        radius_squared = self.impact_relative_xy(mesh, impact).square().sum(dim=-1)
+        spatial_bias = -precision[:, None] * radius_squared.unsqueeze(0)
         return tokens, query, key, value, spatial_bias
 
     @torch.no_grad()
@@ -464,7 +513,9 @@ class MeshImpactHistoryNet(nn.Module):
             padded_time, padded_time.square(), padded_time.pow(3),
             padded_time.tanh(), torch.exp(-padded_time.square()),
         ), dim=-1)
-        queries = self.time_embedding(time_features) + condition[:, None, :]
+        queries = self.time_embedding(time_features)
+        if self.impact_conditioning == "legacy_additive":
+            queries = queries + condition[:, None, :]
         for block in self.decoder_blocks:
             queries = block(queries, memory, padding_mask)
         padded_acceleration = self.acceleration_head(queries).squeeze(-1)
