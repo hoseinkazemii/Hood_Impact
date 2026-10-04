@@ -101,3 +101,35 @@ These files are ignored by Git. Generate them once on each machine, or copy the
 directory alongside the dataset. This saves graph construction at startup;
 the existing cache already avoided repeated searches within a run, and learned
 neighborhood attention still accounts for its usual training cost.
+
+To visualize the exact cached lists at 100 scattered centers:
+
+```bash
+python visualize_mesh_neighborhoods_1704.py --design 0 --samples 100 --k 256
+```
+
+Results are written to `figures/mesh_neighborhoods/design_00_k256/` by default.
+`neighborhood_viewer.html` contains two rotatable 3D views, a sample selector,
+panel background controls, a 100-image gallery and the selected node IDs/XYZ.
+It runs offline without external JavaScript libraries. Keep the output folder
+together for the static image gallery and downloads; the interactive geometry
+and neighbor tables are embedded in the HTML itself.
+
+The exporter also saves a common-scale 100-neighborhood overview, individual
+four-view PNGs, a 100-page PDF atlas, `neighborhood_metrics.csv`, and
+`selected_neighbors.csv` containing all 25,600 entries including each center.
+Centers are chosen by deterministic farthest-point sampling in physical XYZ,
+starting nearest the structural centroid. They are mesh nodes, not impact
+locations. Red marks the center, blue marks selected outer-panel nodes, orange
+marks selected inner-panel nodes, and purple marks other selected structure.
+Panel labels come from the original Abaqus element sets; graph selection still
+uses the existing XYZ kNN rule. All static local views have equal physical XYZ
+scale and a common extent. The dashed circle is the projection of the bounding
+sphere whose radius is the farthest selected distance; a small 20 mm reference
+circle is included separately. Colors identify candidates, not attention weights.
+
+On design 0, the saved 100-center export has radii from 56.3 to 116.0 mm,
+median 77.6 mm; 96 neighborhoods contain both outer- and inner-panel nodes.
+These are statistics of this spatially spread sample, not all nodes or all
+designs. The export was checked against all cached IDs/coordinates/distances,
+and the browser controls and both WebGL views were checked in a headless browser.

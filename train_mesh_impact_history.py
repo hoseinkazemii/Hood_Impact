@@ -49,7 +49,7 @@ MODEL_DEFAULTS = {
     "fourier_max_frequency_hz": 640.0,
     "neighborhood_layers": 0,
     "neighborhood_k": 256,
-    "neighborhood_scale_mm": 20.0,
+    "neighborhood_scale_mm": 1.0,
     "neighborhood_chunk_size": 1024,
     # Leading rigid-headform nodes held out of local attention only. The
     # 1704 .inp files put the 286 impactor nodes first; 0 disables the holdout.
