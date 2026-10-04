@@ -35,58 +35,8 @@ from numba import njit
 from sklearn.metrics import mean_squared_error, r2_score
 
 # repo imports
-import torch.nn as nn
 from utils.utils import Config, DataPreprocessor
-from temporal_deeponet import PointNetEncoder, FiLMLayer, TrunkNetwork, OutputNetwork
-
-
-class LegacyHoodImpactNeuralOperator(nn.Module):
-    """Replica of the architecture used for the 20260116_160228_best checkpoint.
-
-    Differs from the current temporal_deeponet.HoodImpactNeuralOperator only in
-    that it uses a SINGLE FiLM layer (the checkpoint has `film_layer.*`, not
-    `film_layer1/2.*`). Everything else is identical.
-    """
-
-    def __init__(self, config: Config):
-        super().__init__()
-        self.config = config
-        self.mesh_encoder = PointNetEncoder(
-            pointnet_input_dim=config.pointnet_input_dim,
-            pointnet_hidden_dims=config.pointnet_hidden_dims,
-            pointnet_output_dim=config.pointnet_output_dim,
-        )
-        self.film_layer = FiLMLayer(
-            film_feature_dim=config.pointnet_output_dim,
-            film_condition_dim=config.film_condition_dim,
-            film_hidden_dim=config.film_hidden_dim,
-        )
-        self.branch_transform = nn.Sequential(
-            nn.Linear(config.pointnet_output_dim, config.pointnet_output_dim),
-            nn.LayerNorm(config.pointnet_output_dim),
-            nn.GELU(),
-        )
-        self.trunk = TrunkNetwork(
-            trunk_output_dim=config.trunk_output_dim,
-            num_frequencies=config.num_fourier_frequencies,
-            trunk_hidden_dims=config.trunk_hidden_dims,
-            num_tcn_layers=config.num_tcn_layers,
-            dropout=0.1,
-        )
-        self.output_net = OutputNetwork(
-            operator_head_feature_dim=config.trunk_output_dim,
-            operator_head_hidden_dims=config.operator_head_hidden_dims,
-            dropout=0.1,
-        )
-
-    def forward(self, mesh, mesh_batch, indentor, time, time_batch, batch_size=1):
-        branch = self.mesh_encoder(mesh, mesh_batch, indentor, batch_size)
-        branch = self.film_layer(branch, indentor)
-        branch = self.branch_transform(branch)
-        trunk = self.trunk(time, time_batch, batch_size)
-        branch_expanded = branch[time_batch]
-        combined = branch_expanded * trunk
-        return self.output_net(combined)
+from temporal_deeponet import LegacyHoodImpactNeuralOperator
 
 # ----------------------------------------------------------------------------
 # Paths
