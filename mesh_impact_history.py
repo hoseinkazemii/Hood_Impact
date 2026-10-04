@@ -354,7 +354,7 @@ class MeshImpactHistoryNet(nn.Module):
     def time_features(self, normalized_time: Tensor) -> Tensor:
         """Map normalized output coordinates (...,) to features (..., C).
 
-        New runs use [sin(2*pi*f*t_seconds), cos(2*pi*f*t_seconds)] for each
+        use [sin(2*pi*f*t_seconds), cos(2*pi*f*t_seconds)] for each
         fixed frequency f, interleaved in ascending frequency order. The
         historical mapping is used only for explicitly selected/saved old runs.
         """
@@ -412,7 +412,8 @@ class MeshImpactHistoryNet(nn.Module):
         it is not hood structure, so it takes no part in the local graph. Every
         remaining node still attends, and the held-out rows reach pooling with
         their embedding intact. Excluding them also makes the graph identical
-        for every impact on a design, so it is built once and reused.
+        for every impact on a design, so it is built once and reused. Training
+        registers raw XYZ graphs for persistent reuse across scalers and runs.
         """
         # Undo anisotropic standardization; the omitted mean is a common
         # translation and cannot change distances or relative positions.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Continue a neighborhood run in a new output directory with a 48-hour limit.
+# Continue a neighborhood run in a new output directory with an 8-hour limit.
 set -euo pipefail
 
 PROJECT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -22,6 +22,6 @@ printf 'Resume source: %s\n' "${HOOD_MESH_RESUME_FROM}"
 printf 'Architecture and split will be restored from the source run.\n'
 # Use the neutral launcher: a resume must not adopt the fresh cluster-B split.
 exec bash "${PROJECT_DIR}/submit_mesh_impact_history_1704.sh" \
-    --job-name=mesh_hist_local_resume --time=48:00:00 --export=ALL \
+    --job-name=mesh_hist_local_resume --time=08:00:00 --export=ALL \
     --output="${PROJECT_DIR}/runs/slurm/mesh_history_1704_local_resume_%j.out" \
     --error="${PROJECT_DIR}/runs/slurm/mesh_history_1704_local_resume_%j.err" "$@"

@@ -135,6 +135,9 @@ The leading 286 rigid-headform nodes bypass neighborhood attention but still
 participate in pooling. Preflight checks their boundary against two runs.
 Structural graphs are cached across impacts on an identical geometry. Chunking
 and activation recomputation bound intermediate attention memory.
+The graphs now persist across training processes in the dataset's
+`neighbor_graphs` directory. See [neighbor graph caching](README_mesh_neighbor_cache.md)
+for the exact attention shapes, saved-file keys, and precomputation command.
 
 Global pooling queries have no distance bias. Local queries use a learned
 negative squared-XY-distance bias around the impact. Both banks see all nodes.

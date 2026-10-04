@@ -8,7 +8,7 @@
 #SBATCH --gpu-bind=verbose,closest
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=96g
-#SBATCH --time=06:00:00
+#SBATCH --time=08:00:00
 #SBATCH --output=mesh_history_1704_%j.out
 #SBATCH --error=mesh_history_1704_%j.err
 
@@ -83,6 +83,10 @@ for option in NEIGHBORHOOD_LAYERS:neighborhood-layers NEIGHBORHOOD_K:neighborhoo
         EXPERIMENT_ARGS+=("--${option#*:}" "${!variable}")
     fi
 done
+NEIGHBOR_CACHE_ARGS=()
+if [[ -n "${HOOD_MESH_NEIGHBOR_CACHE_DIR:-}" ]]; then
+    NEIGHBOR_CACHE_ARGS+=(--neighbor-cache-dir "${HOOD_MESH_NEIGHBOR_CACHE_DIR}")
+fi
 PREFLIGHT_ARGS+=("${EXPERIMENT_ARGS[@]}")
 if [[ "${HOOD_MESH_ALLOW_CLONE_LEAK:-0}" == "1" ]]; then
     PREFLIGHT_ARGS+=(--allow-clone-leak)
@@ -93,6 +97,7 @@ if [[ -n "${HOOD_MESH_RESUME_FROM:-}" ]]; then
         PREFLIGHT_ARGS+=(--data-root "${DATA_ROOT}")
     fi
 fi
+PREFLIGHT_ARGS+=("${NEIGHBOR_CACHE_ARGS[@]}")
 # This is one Python process on one allocated GPU. Run in Slurm's existing
 # batch step: an extra srun step can fail with "Error configuring interconnect"
 # before Python starts (job 3139891). Inherit Slurm's CUDA_VISIBLE_DEVICES.
@@ -146,6 +151,7 @@ if [[ -n "${HOOD_MESH_RESUME_FROM:-}" ]]; then
     fi
 fi
 
+TRAIN_ARGS+=("${NEIGHBOR_CACHE_ARGS[@]}")
 printf 'Training command:'
 printf ' %q' "${PYTHON_BIN}" -u train_mesh_impact_history.py "${TRAIN_ARGS[@]}"
 printf '\n'

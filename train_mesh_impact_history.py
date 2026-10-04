@@ -97,6 +97,7 @@ def parse_args(argv=None):
         help="fourier uses sine/cosine pairs in physical seconds; legacy_five replays historical checkpoints.",
     )
     parser.add_argument("--output-dir", help="New run directory; defaults to runs/mesh_impact_history/<timestamp>.")
+    parser.add_argument("--neighbor-cache-dir", help="Shared persistent kNN directory; defaults to neighbor_graphs beside inp_files.")
     parser.add_argument("--resume-from", help="Prior run directory (latest, else best checkpoint) or checkpoint file; writes a new run.")
     parser.add_argument(
         "--wandb-mode", choices=["disabled", "offline", "online"],
@@ -383,7 +384,7 @@ class HistoryPredictor:
         self.time_points = np.asarray(time_points, dtype=np.float32).copy()
 
     @classmethod
-    def from_run(cls, output_dir, device="cpu"):
+    def from_run(cls, output_dir, device="cpu", neighbor_cache_dir=None):
         run_dir = Path(output_dir)
         saved = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
         architecture_name = saved.get("architecture", {}).get("name")
@@ -399,6 +400,11 @@ class HistoryPredictor:
         model = model_class(**saved_model_kwargs(saved["architecture"]["kwargs"]))
         checkpoint = torch.load(run_dir / CHECKPOINT_NAME, map_location="cpu", weights_only=True)
         model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+        if model.neighborhood_blocks:
+            from mesh_neighborhood import default_neighbor_cache_directory
+            stored = (saved.get("neighbor_graph_cache") or {}).get("directory")
+            directory = neighbor_cache_dir or (stored if stored and Path(stored).is_dir() else None)
+            model.neighbor_cache.directory = Path(directory).expanduser() if directory else default_neighbor_cache_directory(saved["data"]["data_format"])
         times = np.load(run_dir / "prediction_times.npy", allow_pickle=False)
         return cls(model, preprocessor, times, device=device)
 
@@ -421,6 +427,11 @@ class HistoryPredictor:
 
         # Time slicing occurs only while loading training data, never here.
         normalized_mesh = tensor(self.preprocessor.transform_mesh(mesh))
+        if self.model.neighborhood_blocks:
+            start = self.model.impactor_nodes
+            self.model.neighbor_cache.register_geometry(
+                mesh[start:], normalized_mesh[start:] * self.model.mesh_scale, self.model.neighborhood_k,
+            )
         normalized_impact = tensor(self.preprocessor.transform_indentor(impact)).unsqueeze(0)
         normalized_times = tensor(self.preprocessor.transform_time(times))
         prediction = self.model(
@@ -575,6 +586,18 @@ def main(argv=None):
             run.summary["resumed_after_epoch"] = completed
             run.summary["best_val_loss"] = trainer.best_val_loss
             del restored
+        if model.neighborhood_blocks:
+            from mesh_neighborhood import default_neighbor_cache_directory, prepare_model_neighbor_graphs
+            directory = args.neighbor_cache_dir or default_neighbor_cache_directory(config.data_format, config.inp_dir)
+            saved_config["neighbor_graph_cache"] = prepare_model_neighbor_graphs(
+                model, preprocessor, data["mesh_geometries"], directory,
+                progress=lambda count, cache: logger.info(
+                    "Neighbor graphs prepared: %s unique | built=%s | loaded from disk=%s",
+                    count, cache.builds, cache.disk_hits,
+                ),
+            )
+            write_json(output_dir / "config.json", saved_config)
+            run.config.update({"neighbor_graph_cache": saved_config["neighbor_graph_cache"]}, allow_val_change=True)
         history = trainer.train()
         write_json(output_dir / "training_history.json", history)
         history_columns = {

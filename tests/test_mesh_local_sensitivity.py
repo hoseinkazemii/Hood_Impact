@@ -122,7 +122,7 @@ def test_neighborhood_mse_train_save_and_reload_with_train_only_scalers():
         main(["--data-format", "euroncap1704", "--num-samples", "24", "--samples-per-design", "4",
               "--epochs", "2", "--batch-size", "4", "--width", "16", "--num-heads", "2", "--num-latents", "4",
               "--latent-layers", "1", "--temporal-layers", "1", "--neighborhood-layers", "2", "--neighborhood-k", "3",
-              "--impactor-nodes", "2",
+              "--impactor-nodes", "2", "--neighbor-cache-dir", str(Path(folder) / "neighbor_graphs"),
               "--device", "cpu", "--wandb-mode", "disabled", "--output-dir", folder])
         root = Path(folder)
         saved = json.loads((root / "config.json").read_text())
@@ -135,6 +135,8 @@ def test_neighborhood_mse_train_save_and_reload_with_train_only_scalers():
         assert saved["training"]["batch_sampling"] == "shuffle"
         assert saved["architecture"]["kwargs"]["neighborhood_layers"] == 2
         assert saved["architecture"]["kwargs"]["impactor_nodes"] == 2
+        assert saved["neighbor_graph_cache"]["unique_structural_geometries"] == 24
+        assert saved["neighbor_graph_cache"]["built"] == 24
         sensitivity = json.loads((root / "test_design_sensitivity.json").read_text())
         assert sensitivity["num_matched_locations"] == 4
         assert sensitivity["impact_xy_checked"] is True
@@ -146,10 +148,13 @@ def test_neighborhood_mse_train_save_and_reload_with_train_only_scalers():
         np.testing.assert_allclose(predictor.preprocessor.mesh_scaler.mean_,
                                    np.concatenate(data["mesh_geometries"][:12]).astype(np.float64).mean(0))
         exported = pd.read_csv(root / "test_acceleration_histories.csv")
-        for i in range(16, 24):
-            predicted = predictor.predict(data["mesh_geometries"][i], data["indentor_positions"][i])
-            np.testing.assert_allclose(predicted, exported.loc[exported.run_number == data["run_numbers"][i], "acceleration_pred_g"],
-                                       atol=3e-5, rtol=3e-5)
+        with mock.patch("mesh_neighborhood.geometric_neighbors", side_effect=AssertionError("Unexpected repeated search")):
+            for i in range(16, 24):
+                predicted = predictor.predict(data["mesh_geometries"][i], data["indentor_positions"][i])
+                np.testing.assert_allclose(predicted, exported.loc[exported.run_number == data["run_numbers"][i], "acceleration_pred_g"],
+                                           atol=3e-5, rtol=3e-5)
+        assert predictor.model.neighbor_cache.builds == 0
+        assert predictor.model.neighbor_cache.disk_hits == 8
         frame = pd.read_csv(root / "training_history.csv")
         np.testing.assert_allclose(frame.train_mse_normalized, history["train_losses"])
         assert "train_objective" not in frame

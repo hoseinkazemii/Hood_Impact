@@ -5,6 +5,9 @@ Fresh runs now use **Fourier time features**: sine/cosine pairs at
 See [Fourier-time training](README_mesh_fourier_time.md) for the feature definition,
 submission command, configurable frequency band and checkpoint compatibility.
 
+See [neighbor graph caching](README_mesh_neighbor_cache.md) for persistent kNN
+lists shared across training runs and the neighborhood-attention computation.
+
 Post-training acceleration and HIC15 metrics now include matched-location
 design-difference skill and amplitude, with per-location CSV/plots. See
 [design-sensitivity diagnostics](README_mesh_design_sensitivity.md) for interpretation,

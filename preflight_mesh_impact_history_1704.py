@@ -233,7 +233,7 @@ def validate_runtime(require_cuda):
         raise ValueError("CUDA was requested but is unavailable in this Python environment")
 
 
-def validate_cuda_model(data, decoder=MODEL_DEFAULTS["decoder"], **neighborhood_options):
+def validate_cuda_model(data, decoder=MODEL_DEFAULTS["decoder"], neighbor_cache_dir=None, **neighborhood_options):
     """Exercise the selected decoder and learned spatial-bias gradients."""
     # Standardize this one example only for numerical stability in the probe.
     # These temporary statistics never reach training or a saved checkpoint.
@@ -254,6 +254,11 @@ def validate_cuda_model(data, decoder=MODEL_DEFAULTS["decoder"], **neighborhood_
     ).to("cuda")
     model.set_coordinate_scalers(mean, scale, mean[:2], scale[:2])
     model.set_time_scaler(time_mean, time_scale)
+    if model.neighborhood_blocks and neighbor_cache_dir is not None:
+        model.neighbor_cache.directory = Path(neighbor_cache_dir)
+        start = model.impactor_nodes
+        model.neighbor_cache.register_geometry(data["mesh_geometries"][0][start:],
+                                              mesh[start:] * model.mesh_scale, model.neighborhood_k)
     prediction = model(
         mesh=mesh,
         mesh_batch=torch.zeros(len(mesh), device="cuda", dtype=torch.long),
@@ -276,11 +281,14 @@ def validate_cuda_model(data, decoder=MODEL_DEFAULTS["decoder"], **neighborhood_
     print(f"GPU: {torch.cuda.get_device_name(0)} | decoder={decoder} | "
           f"time_encoding={model.time_encoding} ({model.time_feature_count} features) | "
           f"neighborhood_layers={len(model.neighborhood_blocks)} forward/backward: passed")
+    if model.neighborhood_blocks:
+        print(f"Neighbor graph cache: built={model.neighbor_cache.builds} | loaded from disk={model.neighbor_cache.disk_hits}")
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root")
+    parser.add_argument("--neighbor-cache-dir")
     parser.add_argument("--resume-from", help="Read experiment settings from the checkpoint's run.")
     parser.add_argument("--require-cuda", action="store_true")
     parser.add_argument("--test-designs", type=int, nargs="+", default=list(DEFAULT_TEST_DESIGNS))
@@ -332,7 +340,8 @@ def main(argv=None):
                   "so the neighbor graph is rebuilt for every run instead of once per design")
         data, source_count, cutoff_count = validate_first_run(root, impact_xy)
         if args.require_cuda:
-            validate_cuda_model(data, decoder=args.decoder, **{
+            validate_cuda_model(data, decoder=args.decoder,
+                                neighbor_cache_dir=args.neighbor_cache_dir or root / "neighbor_graphs", **{
                 key: getattr(args, key) for key in EXPERIMENT_MODEL_KEYS
             })
         print(f"Dataset: {root} | {NUM_RUNS} mesh/history pairs and impact XY rows")

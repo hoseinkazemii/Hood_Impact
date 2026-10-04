@@ -180,11 +180,11 @@ printf 'ARG=%s\\n' "$@"
         self.env.update(HOOD_MESH_DECODER="mesh_only", HOOD_MESH_TEST_DESIGNS="2",
                         HOOD_MESH_VAL_DESIGNS="10", HOOD_MESH_ALLOW_CLONE_LEAK="1",
                         HOOD_MESH_NEIGHBORHOOD_LAYERS="0", HOOD_MESH_DESIGN_DIFFERENCE_WEIGHT="0")
-        output = self.launch("submit_mesh_impact_history_1704_local_sensitivity.sh", ["--time=08:00:00"])
+        output = self.launch("submit_mesh_impact_history_1704_local_sensitivity.sh", ["--time=00:30:00"])
         for expected in ("DECODER=temporal", "TEST=4 5", "VAL=11", "LEAK=0",
-                         "LOCAL=2", "K=16", "ARG=--time=18:00:00", "ARG=--time=08:00:00"):
+                         "LOCAL=2", "K=16", "ARG=--time=08:00:00", "ARG=--time=00:30:00"):
             self.assertIn(expected, output)
-        self.assertLess(output.index("ARG=--time=18:00:00"), output.index("ARG=--time=08:00:00"))
+        self.assertLess(output.index("ARG=--time=08:00:00"), output.index("ARG=--time=00:30:00"))
 
     def test_hic_filtered_launcher_and_training_argument(self):
         for threshold in ("10", "20"):
@@ -208,7 +208,7 @@ printf 'ARG=%s\\n' "$@"
         for expected in ("HIC=30", "SPLIT=test", "SUMMARY=0",
                          "RUNS=577 622 670 693 710 719 764 812 835 852"):
             self.assertIn(expected, output)
-        self.assertIn("ARG=--time=18:00:00", output)
+        self.assertIn("ARG=--time=08:00:00", output)
         self.env.update(HOOD_MESH_EXPORT_ATTENTION="1", HOOD_MESH_ATTENTION_SPLIT="test",
                         HOOD_MESH_ATTENTION_RUNS="572 714", HOOD_MESH_ATTENTION_SUMMARY_ONLY="1")
         output = self.launch("run_mesh_impact_history_1704.sbatch")
@@ -229,7 +229,7 @@ printf 'ARG=%s\\n' "$@"
             output = self.launch(script, expected_returncode=2)
             self.assertNotIn("ARG=", output)
 
-    def test_resume_launcher_passes_source_and_dependency_with_48_hours(self):
+    def test_resume_launcher_passes_source_and_dependency_with_8_hours(self):
         source = self.root / "old run with spaces"
         source.mkdir()
         checkpoint = source / "hood_impact_best_model.pt"
@@ -237,7 +237,7 @@ printf 'ARG=%s\\n' "$@"
         for selected in (source, checkpoint):
             output = self.launch("submit_mesh_impact_history_1704_local_sensitivity_resume.sh",
                                  [self.shell_path(selected), "--dependency=afterany:12345"])
-            for expected in ("ARG=--time=48:00:00", "ARG=--dependency=afterany:12345",
+            for expected in ("ARG=--time=08:00:00", "ARG=--dependency=afterany:12345",
                              "ARG=--job-name=mesh_hist_local_resume", f"RESUME={self.shell_path(selected)}"):
                 self.assertIn(expected, output)
 
@@ -250,12 +250,15 @@ printf 'ARG=%s\\n' "$@"
     def test_resume_batch_uses_saved_settings_instead_of_stale_training_exports(self):
         source = self.shell_path(self.root / "old run")
         self.env.update(HOOD_MESH_RESUME_FROM=source, HOOD_MESH_EPOCHS="999",
-                        HOOD_MESH_WIDTH="256", HOOD_MESH_DESIGN_DIFFERENCE_WEIGHT="0")
+                        HOOD_MESH_WIDTH="256", HOOD_MESH_DESIGN_DIFFERENCE_WEIGHT="0",
+                        HOOD_MESH_NEIGHBOR_CACHE_DIR="/shared/neighbor-graphs")
         output = self.launch("run_mesh_impact_history_1704.sbatch")
         commands = [line for line in output.splitlines() if line.startswith("PYTHON")]
         self.assertEqual(len(commands), 2)
         self.assertIn(f"<--resume-from> <{source}>", commands[0])
         self.assertIn(f"<--resume-from> <{source}>", commands[1])
+        for command in commands:
+            self.assertIn("<--neighbor-cache-dir> </shared/neighbor-graphs>", command)
         for option in ("--epochs", "--width", "--design-difference-weight", "--test-designs"):
             self.assertNotIn(f"<{option}>", commands[1])
         self.assertIn("<--output-dir>", commands[1])
@@ -268,6 +271,7 @@ printf 'ARG=%s\\n' "$@"
                         HOOD_MESH_IMPACT_CONDITIONING="film",
                         HOOD_MESH_TIME_ENCODING="fourier", HOOD_MESH_FOURIER_NUM_FREQUENCIES="8",
                         HOOD_MESH_FOURIER_MIN_FREQUENCY_HZ="10", HOOD_MESH_FOURIER_MAX_FREQUENCY_HZ="800",
+                        HOOD_MESH_NEIGHBOR_CACHE_DIR="/shared/neighbor-graphs",
                         HOOD_MESH_NEIGHBORHOOD_SCALE_MM="20", HOOD_MESH_NEIGHBORHOOD_CHUNK_SIZE="1024")
         output = self.launch("run_mesh_impact_history_1704.sbatch")
         commands = [line for line in output.splitlines() if line.startswith("PYTHON")]
@@ -278,6 +282,7 @@ printf 'ARG=%s\\n' "$@"
                              "<--batch-size> <8>", "<--impact-conditioning> <film>",
                              "<--time-encoding> <fourier>", "<--fourier-num-frequencies> <8>",
                              "<--fourier-min-frequency-hz> <10>", "<--fourier-max-frequency-hz> <800>",
+                             "<--neighbor-cache-dir> </shared/neighbor-graphs>",
                              "<--neighborhood-scale-mm> <20>", "<--neighborhood-chunk-size> <1024>"):
                 self.assertIn(expected, command)
 
