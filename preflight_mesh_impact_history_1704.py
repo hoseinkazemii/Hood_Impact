@@ -50,6 +50,7 @@ from mesh_design_clusters import GEOMETRY_CLUSTERS
 EXPERIMENT_MODEL_KEYS = tuple(
     key for key in MODEL_DEFAULTS
     if key.startswith("neighborhood_") or key in ("impactor_nodes", "impact_conditioning")
+    or key == "time_encoding" or key.startswith("fourier_")
 )
 
 
@@ -245,12 +246,14 @@ def validate_cuda_model(data, decoder=MODEL_DEFAULTS["decoder"], **neighborhood_
         device="cuda", dtype=torch.float32,
     ).unsqueeze(0)
     time = np.asarray(data["time_arrays"][0], dtype=np.float32)
-    time = torch.as_tensor((time - time.mean()) / max(float(time.std()), 1e-6), device="cuda")
+    time_mean, time_scale = float(time.mean()), max(float(time.std()), 1e-6)
+    time = torch.as_tensor((time - time_mean) / time_scale, device="cuda")
     model = MeshImpactHistoryNet(
         width=16, num_heads=2, num_latents=4, latent_layers=1,
         temporal_layers=1, dropout=0.0, decoder=decoder, **neighborhood_options,
     ).to("cuda")
     model.set_coordinate_scalers(mean, scale, mean[:2], scale[:2])
+    model.set_time_scaler(time_mean, time_scale)
     prediction = model(
         mesh=mesh,
         mesh_batch=torch.zeros(len(mesh), device="cuda", dtype=torch.long),
@@ -271,6 +274,7 @@ def validate_cuda_model(data, decoder=MODEL_DEFAULTS["decoder"], **neighborhood_
         raise ValueError("CUDA model probe produced missing neighborhood gradients")
     torch.cuda.synchronize()
     print(f"GPU: {torch.cuda.get_device_name(0)} | decoder={decoder} | "
+          f"time_encoding={model.time_encoding} ({model.time_feature_count} features) | "
           f"neighborhood_layers={len(model.neighborhood_blocks)} forward/backward: passed")
 
 

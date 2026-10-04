@@ -119,12 +119,17 @@ def test_resume_preserves_training_state_and_finishes_original_target(tmp_path, 
 def test_pre_film_config_resumes_original_architecture(tmp_path, toy_data):
     source, resumed = tmp_path / "legacy", tmp_path / "resumed"
     with mock.patch.object(DataPreprocessor, "load_all_data", return_value=toy_data):
-        interrupt_after_two_epochs(source, ["--impact-conditioning", "legacy_additive"])
+        interrupt_after_two_epochs(source, ["--impact-conditioning", "legacy_additive", "--time-encoding", "legacy_five"])
         config_path = source / "config.json"
         saved = json.loads(config_path.read_text())
         del saved["architecture"]["kwargs"]["impact_conditioning"]
+        for key in ("time_encoding", "fourier_num_frequencies", "fourier_min_frequency_hz", "fourier_max_frequency_hz"):
+            del saved["architecture"]["kwargs"][key]
         config_path.write_text(json.dumps(saved))
         assert parse_args(["--resume-from", str(source)]).impact_conditioning == "legacy_additive"
+        assert parse_args(["--resume-from", str(source)]).time_encoding == "legacy_five"
+        with pytest.raises(SystemExit):
+            parse_args(["--resume-from", str(source), "--time-encoding", "fourier"])
         with pytest.raises(SystemExit):
             parse_args(["--resume-from", str(source), "--impact-conditioning", "film"])
         main(["--resume-from", str(source), "--output-dir", str(resumed),
@@ -134,6 +139,24 @@ def test_pre_film_config_resumes_original_architecture(tmp_path, toy_data):
     state = torch.load(resumed / LAST_CHECKPOINT_NAME, weights_only=True)["model_state_dict"]
     assert state["node_embedding.0.weight"].shape[1] == 6
     assert not any("film" in key for key in state)
+    assert state["time_embedding.0.weight"].shape[1] == 5
+
+
+def test_pre_fourier_film_run_resumes_its_original_time_encoding(tmp_path, toy_data):
+    source, resumed = tmp_path/"old_film", tmp_path/"resumed"
+    with mock.patch.object(DataPreprocessor, "load_all_data", return_value=toy_data):
+        interrupt_after_two_epochs(source,["--time-encoding","legacy_five"])
+        path=source/"config.json"
+        saved=json.loads(path.read_text())
+        for key in ("time_encoding", "fourier_num_frequencies", "fourier_min_frequency_hz", "fourier_max_frequency_hz"):
+            del saved["architecture"]["kwargs"][key]
+        path.write_text(json.dumps(saved))
+        args=parse_args(["--resume-from",str(source)])
+        assert args.impact_conditioning == "film" and args.time_encoding == "legacy_five"
+        main(["--resume-from",str(source),"--output-dir",str(resumed),"--device","cpu","--wandb-mode","disabled"])
+    state=torch.load(resumed/LAST_CHECKPOINT_NAME,weights_only=True)["model_state_dict"]
+    assert state["time_embedding.0.weight"].shape[1] == 5
+    assert state["node_embedding.0.weight"].shape[1] == 3
 
 
 def test_resume_rejects_changed_settings_splits_and_existing_output(tmp_path, toy_data):

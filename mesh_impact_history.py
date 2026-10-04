@@ -133,11 +133,12 @@ DECODER_BLOCKS = {"temporal": HistoryDecoderBlock, "mesh_only": MeshOnlyDecoderB
 
 
 IMPACT_CONDITIONING = ("film", "legacy_additive")
+TIME_ENCODINGS = ("fourier", "legacy_five")
 
 
 def saved_model_kwargs(kwargs: dict) -> dict:
-    """Configs predating FiLM describe the six-feature additive architecture."""
-    return {"impact_conditioning": "legacy_additive", **kwargs}
+    """Reconstruct the original conditioning/time features of older configs."""
+    return {"impact_conditioning": "legacy_additive", "time_encoding": "legacy_five", **kwargs}
 
 
 class ImpactFiLM(nn.Module):
@@ -184,7 +185,9 @@ class MeshImpactHistoryNet(nn.Module):
     two-layer experiment with ordinary acceleration MSE.
 
     New models embed XYZ only and FiLM-condition normalized pooling tokens.
-    Time queries contain time only. ``legacy_additive`` reconstructs historical
+    Time queries use sine/cosine pairs in physical seconds by default.
+    ``legacy_five`` reconstructs older time embeddings without adding buffers.
+    ``legacy_additive`` reconstructs historical
     checkpoints with six node features and additive impact conditioning.
 
     ``impactor_nodes`` holds the leading rigid-headform nodes out of that local
@@ -207,12 +210,17 @@ class MeshImpactHistoryNet(nn.Module):
         neighborhood_chunk_size: int = 1024,
         impactor_nodes: int = 0,
         impact_conditioning: str = "film",
+        time_encoding: str = "fourier",
+        fourier_num_frequencies: int = 6,
+        fourier_min_frequency_hz: float = 20.0,
+        fourier_max_frequency_hz: float = 640.0,
     ):
         super().__init__()
         integer_options = {
             "width": width, "num_heads": num_heads, "num_latents": num_latents,
             "latent_layers": latent_layers, "temporal_layers": temporal_layers,
             "neighborhood_k": neighborhood_k, "neighborhood_chunk_size": neighborhood_chunk_size,
+            "fourier_num_frequencies": fourier_num_frequencies,
         }
         for name, value in integer_options.items():
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -229,6 +237,16 @@ class MeshImpactHistoryNet(nn.Module):
             raise ValueError(f"decoder must be one of {sorted(DECODER_BLOCKS)}")
         if not isinstance(impact_conditioning, str) or impact_conditioning not in IMPACT_CONDITIONING:
             raise ValueError(f"impact_conditioning must be one of {IMPACT_CONDITIONING}")
+        if not isinstance(time_encoding, str) or time_encoding not in TIME_ENCODINGS:
+            raise ValueError(f"time_encoding must be one of {TIME_ENCODINGS}")
+        for name, frequency in (("fourier_min_frequency_hz", fourier_min_frequency_hz),
+                                ("fourier_max_frequency_hz", fourier_max_frequency_hz)):
+            if isinstance(frequency, bool) or not math.isfinite(frequency) or frequency <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        if fourier_max_frequency_hz < fourier_min_frequency_hz:
+            raise ValueError("fourier_max_frequency_hz must be at least fourier_min_frequency_hz")
+        if fourier_num_frequencies == 1 and fourier_min_frequency_hz != fourier_max_frequency_hz:
+            raise ValueError("A single Fourier frequency requires equal minimum and maximum frequencies")
         if isinstance(neighborhood_layers, bool) or not isinstance(neighborhood_layers, int) or neighborhood_layers < 0:
             raise ValueError("neighborhood_layers must be a nonnegative integer")
         if not math.isfinite(neighborhood_scale_mm) or neighborhood_scale_mm <= 0:
@@ -238,6 +256,7 @@ class MeshImpactHistoryNet(nn.Module):
 
         self.decoder = decoder
         self.impact_conditioning = impact_conditioning
+        self.time_encoding = time_encoding
         self.width = width
         self.num_heads = num_heads
         self.num_latents = num_latents
@@ -278,10 +297,21 @@ class MeshImpactHistoryNet(nn.Module):
         ])
         self.memory_norm = nn.LayerNorm(width)
 
-        # Continuous time embeddings describe the existing sampled output grid.
-        # No learned sequence-length limit or additional time subsampling.
+        # Fourier phases use physical seconds, reconstructed from the same
+        # training-only scaler used by the dataset. No old features are appended.
+        # Old modes retain exactly their parameter/buffer keys for strict replay.
+        self.time_feature_count = 2 * fourier_num_frequencies if time_encoding == "fourier" else 5
+        if time_encoding == "fourier":
+            frequencies = [fourier_min_frequency_hz * (fourier_max_frequency_hz / fourier_min_frequency_hz)
+                           ** (i / max(fourier_num_frequencies - 1, 1)) for i in range(fourier_num_frequencies)]
+            frequency_tensor = torch.tensor(frequencies, dtype=torch.float32)
+            if not torch.isfinite(frequency_tensor).all() or not (frequency_tensor > 0).all():
+                raise ValueError("Fourier frequencies must be finite and positive in float32")
+            self.register_buffer("time_frequencies_hz", frequency_tensor)
+            self.register_buffer("time_mean", torch.zeros(()))
+            self.register_buffer("time_scale", torch.ones(()))
         self.time_embedding = nn.Sequential(
-            nn.Linear(5, width), nn.GELU(), nn.Linear(width, width),
+            nn.Linear(self.time_feature_count, width), nn.GELU(), nn.Linear(width, width),
         )
         # temporal_layers is the decoder depth: how many times the time queries
         # re-read the mesh memory. Under decoder="mesh_only" that is all it is,
@@ -311,6 +341,29 @@ class MeshImpactHistoryNet(nn.Module):
         # Append so legacy construction keeps the original parameter order/RNG.
         if impact_conditioning == "film":
             self.impact_film = ImpactFiLM(width)
+
+    @torch.no_grad()
+    def set_time_scaler(self, mean: float, scale: float) -> None:
+        """Save the training time scaler so Fourier frequencies remain in Hz."""
+        if not math.isfinite(mean) or not math.isfinite(scale) or scale <= 0:
+            raise ValueError("Time scaler must have a finite mean and finite positive scale")
+        if self.time_encoding == "fourier":
+            self.time_mean.fill_(float(mean))
+            self.time_scale.fill_(float(scale))
+
+    def time_features(self, normalized_time: Tensor) -> Tensor:
+        """Map normalized output coordinates (...,) to features (..., C).
+
+        New runs use [sin(2*pi*f*t_seconds), cos(2*pi*f*t_seconds)] for each
+        fixed frequency f, interleaved in ascending frequency order. The
+        historical mapping is used only for explicitly selected/saved old runs.
+        """
+        if self.time_encoding == "legacy_five":
+            return torch.stack((normalized_time, normalized_time.square(), normalized_time.pow(3),
+                                normalized_time.tanh(), torch.exp(-normalized_time.square())), dim=-1)
+        physical_time = normalized_time * self.time_scale + self.time_mean
+        phases = 2 * math.pi * physical_time.unsqueeze(-1) * self.time_frequencies_hz
+        return torch.stack((phases.sin(), phases.cos()), dim=-1).flatten(-2)
 
     @torch.no_grad()
     def set_coordinate_scalers(
@@ -509,10 +562,7 @@ class MeshImpactHistoryNet(nn.Module):
         padded_time = pad_sequence(sequences, batch_first=True)
         lengths = torch.tensor([seq.numel() for seq in sequences], device=time.device)
         padding_mask = torch.arange(padded_time.shape[1], device=time.device)[None, :] >= lengths[:, None]
-        time_features = torch.stack((
-            padded_time, padded_time.square(), padded_time.pow(3),
-            padded_time.tanh(), torch.exp(-padded_time.square()),
-        ), dim=-1)
+        time_features = self.time_features(padded_time)
         queries = self.time_embedding(time_features)
         if self.impact_conditioning == "legacy_additive":
             queries = queries + condition[:, None, :]

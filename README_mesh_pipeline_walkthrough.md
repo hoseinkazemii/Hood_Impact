@@ -2,7 +2,7 @@
 
 This is the current neighborhood-attention experiment: two neighborhood layers,
 256 nearest structural nodes, XYZ-only node inputs, FiLM-conditioned pooling,
-a temporal decoder with time-only queries, and **ordinary acceleration
+a temporal decoder with Fourier time-only queries, and **ordinary acceleration
 MSE only**. The HIC threshold selects examples; it is not a loss term.
 
 ## Execution map
@@ -154,11 +154,11 @@ Definitions: [mesh_impact_history.py](mesh_impact_history.py),
 | Reattach headform embeddings | N x 128 | Leading 286 nodes bypass local updates |
 | Attention pooling | 256 x 128 | FiLM conditions normalized tokens before cross-attention; 128 global queries + 128 queries with learned radial impact bias |
 | Three latent blocks | 256 x 128 | Self-attention among pooled mesh tokens |
-| Time queries | T x 128 | Five continuous time features embedded; no direct impact embedding |
+| Time queries | T x 128 | 12 sine/cosine features at 20, 40, 80, 160, 320, 640 Hz embedded by 12->128->128 MLP; no direct impact embedding |
 | Two decoder blocks | T x 128 | Cross-attend to mesh memory, then self-attend across requested times |
 | Acceleration head | T x 1 | LayerNorm, linear 128->128->1 with GELU |
 
-Default model size: **1,591,561 trainable parameters**. Width 128, four heads,
+Default model size: **1,592,457 trainable parameters**. Width 128, four heads,
 dropout 0.1. Local feedforward width is 256; latent and decoder feedforward
 width is 512. Neighbor graphs use physical XYZ, with relative positions scaled
 by 20 mm. Both local layers reuse the same graph. Node chunks of 1024 and
@@ -171,9 +171,13 @@ FiLM applies `(1 + delta_gamma) * LayerNorm(tokens) + beta`, with scale and
 shift generated from an XY impact embedding and broadcast over the tokens.
 It starts at identity modulation. The local distance bias, 20 mm neighborhood
 position scaling, and headform participation in pooling remain unchanged.
-Saved configs record `impact_conditioning: film`. Older checkpoints are loaded
+Saved configs record `impact_conditioning: film` and `time_encoding: fourier`.
+Fourier phases use physical seconds, reconstructed from the saved training-only
+time scaler. See [the Fourier-time guide](README_mesh_fourier_time.md).
+Saved runs without `time_encoding` retain their original five time features.
+Older checkpoints are loaded
 with their original `legacy_additive` architecture; resume preserves that mode.
-The demonstration results below predate this FiLM revision.
+The demonstration results below predate the FiLM and Fourier revisions.
 
 ## 7. Training and model selection
 

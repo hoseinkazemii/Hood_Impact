@@ -135,6 +135,12 @@ def test_neighborhood_mse_train_save_and_reload_with_train_only_scalers():
         assert saved["training"]["batch_sampling"] == "shuffle"
         assert saved["architecture"]["kwargs"]["neighborhood_layers"] == 2
         assert saved["architecture"]["kwargs"]["impactor_nodes"] == 2
+        sensitivity = json.loads((root / "test_design_sensitivity.json").read_text())
+        assert sensitivity["num_matched_locations"] == 4
+        assert sensitivity["impact_xy_checked"] is True
+        assert np.isfinite(sensitivity["design_difference_skill"])
+        assert (root / "test_design_sensitivity_by_location.csv").is_file()
+        assert (root / "test_design_sensitivity.png").is_file()
         assert np.isfinite(history["train_losses"]).all()
         predictor = HistoryPredictor.from_run(folder)
         np.testing.assert_allclose(predictor.preprocessor.mesh_scaler.mean_,

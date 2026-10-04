@@ -2,7 +2,9 @@
 
 The neighborhood model predicts acceleration histories from mesh XYZ, impact XY,
 and requested times. New runs use **XYZ-only node features, FiLM-conditioned
-pooling tokens, and time-only decoder queries**. Training uses only ordinary normalized acceleration MSE:
+pooling tokens, and Fourier time-only decoder queries**. See
+[Fourier-time training](README_mesh_fourier_time.md) for the current revision.
+Training uses only ordinary normalized acceleration MSE:
 
 \[
 \mathcal L = \frac{1}{\sum_b T_b}\sum_{b,t}
@@ -33,7 +35,7 @@ The neighborhood launchers pin the temporal decoder, two neighborhood layers,
 designs **4 and 5**, and validation design **11**. Training designs are
 **0, 1, 2, 3, 6, 7, 8, 9, 10**. Unset `HOOD_MESH_RESUME_FROM` before a fresh run.
 
-The k256 wrapper requests 24 hours on one GPU; the k16 wrapper requests 48 hours.
+The k256 wrapper requests 24 hours on one GPU; the k16 wrapper requests 18 hours.
 A trailing Slurm option overrides that limit. W&B uses the existing login and project.
 The shared batch script runs Python directly in the Slurm allocation.
 
@@ -105,13 +107,13 @@ Current defaults, unless overridden through the shared batch script:
 | Mesh pooling | 256 tokens: 128 global, 128 impact-local |
 | Impact conditioning | XY -> 128 -> 128; FiLM generates 128 scales and 128 shifts for pooling tokens |
 | Latent mixing | 3 self-attention blocks; 4 heads; feedforward 128 -> 512 -> 128 |
-| Time features | t, t squared, t cubed, tanh(t), exp(-t squared), using normalized t |
-| Time embedding | 5 -> 128 -> 128; no added impact embedding |
+| Time features | 6 sine/cosine pairs at 20, 40, 80, 160, 320, 640 Hz, using physical time in seconds |
+| Time embedding | 12 -> 128 -> 128; no added impact embedding |
 | Decoder | 2 blocks, each with mesh cross-attention and temporal self-attention |
 | Acceleration head | LayerNorm, 128 -> 128 -> 1 |
 | Dropout | 0.1 |
 
-This configuration has **1,591,561 trainable parameters**. Neighbors and mesh
+This configuration has **1,592,457 trainable parameters**. Neighbors and mesh
 tokens are independent settings, even though both default to 256 in this run.
 
 For learned tokens `z` and impact embedding `e(p)`, pooling starts from

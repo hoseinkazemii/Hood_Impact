@@ -22,6 +22,8 @@ class SubmissionSplitTests(unittest.TestCase):
             self.assertEqual(args.decoder, "temporal")
             self.assertEqual(args.test_designs, [4, 5])
             self.assertEqual(args.val_designs, [11])
+            self.assertEqual(args.time_encoding, "fourier")
+            self.assertEqual(args.fourier_num_frequencies, 6)
         splits = preflight.validate_splits([4, 5], [11])
         self.assertEqual(splits["train"]["design_ids"], [0, 1, 2, 3, 6, 7, 8, 9, 10])
         self.assertEqual(len(splits["train"]["run_numbers"]), 1278)
@@ -180,9 +182,9 @@ printf 'ARG=%s\\n' "$@"
                         HOOD_MESH_NEIGHBORHOOD_LAYERS="0", HOOD_MESH_DESIGN_DIFFERENCE_WEIGHT="0")
         output = self.launch("submit_mesh_impact_history_1704_local_sensitivity.sh", ["--time=08:00:00"])
         for expected in ("DECODER=temporal", "TEST=4 5", "VAL=11", "LEAK=0",
-                         "LOCAL=2", "K=16", "ARG=--time=48:00:00", "ARG=--time=08:00:00"):
+                         "LOCAL=2", "K=16", "ARG=--time=18:00:00", "ARG=--time=08:00:00"):
             self.assertIn(expected, output)
-        self.assertLess(output.index("ARG=--time=48:00:00"), output.index("ARG=--time=08:00:00"))
+        self.assertLess(output.index("ARG=--time=18:00:00"), output.index("ARG=--time=08:00:00"))
 
     def test_hic_filtered_launcher_and_training_argument(self):
         for threshold in ("10", "20"):
@@ -206,7 +208,7 @@ printf 'ARG=%s\\n' "$@"
         for expected in ("HIC=30", "SPLIT=test", "SUMMARY=0",
                          "RUNS=577 622 670 693 710 719 764 812 835 852"):
             self.assertIn(expected, output)
-        self.assertIn("ARG=--time=48:00:00", output)
+        self.assertIn("ARG=--time=18:00:00", output)
         self.env.update(HOOD_MESH_EXPORT_ATTENTION="1", HOOD_MESH_ATTENTION_SPLIT="test",
                         HOOD_MESH_ATTENTION_RUNS="572 714", HOOD_MESH_ATTENTION_SUMMARY_ONLY="1")
         output = self.launch("run_mesh_impact_history_1704.sbatch")
@@ -264,6 +266,8 @@ printf 'ARG=%s\\n' "$@"
         self.env.update(HOOD_MESH_NEIGHBORHOOD_LAYERS="2", HOOD_MESH_NEIGHBORHOOD_K="16",
                         HOOD_MESH_DESIGN_DIFFERENCE_WEIGHT="1.0", HOOD_MESH_BATCH_SIZE="8",
                         HOOD_MESH_IMPACT_CONDITIONING="film",
+                        HOOD_MESH_TIME_ENCODING="fourier", HOOD_MESH_FOURIER_NUM_FREQUENCIES="8",
+                        HOOD_MESH_FOURIER_MIN_FREQUENCY_HZ="10", HOOD_MESH_FOURIER_MAX_FREQUENCY_HZ="800",
                         HOOD_MESH_NEIGHBORHOOD_SCALE_MM="20", HOOD_MESH_NEIGHBORHOOD_CHUNK_SIZE="1024")
         output = self.launch("run_mesh_impact_history_1704.sbatch")
         commands = [line for line in output.splitlines() if line.startswith("PYTHON")]
@@ -272,8 +276,25 @@ printf 'ARG=%s\\n' "$@"
             self.assertNotIn("--design-difference-weight", command)
             for expected in ("<--neighborhood-layers> <2>", "<--neighborhood-k> <16>",
                              "<--batch-size> <8>", "<--impact-conditioning> <film>",
+                             "<--time-encoding> <fourier>", "<--fourier-num-frequencies> <8>",
+                             "<--fourier-min-frequency-hz> <10>", "<--fourier-max-frequency-hz> <800>",
                              "<--neighborhood-scale-mm> <20>", "<--neighborhood-chunk-size> <1024>"):
                 self.assertIn(expected, command)
+
+    def test_fourier_launcher_pins_encoding_and_retains_the_filtered_k256_experiment(self):
+        self.stub("sbatch", """printf 'TIME=%s\\nBANDS=%s\\nFMIN=%s\\nFMAX=%s\\nHIC=%s\\nK=%s\\nTEST=%s\\nVAL=%s\\nNAME=%s\\nIMPACT=%s\\n' \\
+    "$HOOD_MESH_TIME_ENCODING" "$HOOD_MESH_FOURIER_NUM_FREQUENCIES" "$HOOD_MESH_FOURIER_MIN_FREQUENCY_HZ" \\
+    "$HOOD_MESH_FOURIER_MAX_FREQUENCY_HZ" "$HOOD_MESH_HIC_RANGE_THRESHOLD_PERCENT" "$HOOD_MESH_NEIGHBORHOOD_K" \\
+    "$HOOD_MESH_TEST_DESIGNS" "$HOOD_MESH_VAL_DESIGNS" "$HOOD_MESH_RUN_NAME" "$HOOD_MESH_IMPACT_CONDITIONING"
+printf 'ARG=%s\\n' "$@"
+""")
+        self.env.update(HOOD_MESH_TIME_ENCODING="legacy_five", HOOD_MESH_IMPACT_CONDITIONING="legacy_additive",
+                        HOOD_MESH_HIC_RANGE_THRESHOLD_PERCENT="30")
+        output=self.launch("submit_mesh_impact_history_1704_fourier_k256.sh", ["--time=12:00:00"])
+        for expected in ("TIME=fourier", "IMPACT=film", "BANDS=6", "FMIN=20", "FMAX=640", "HIC=30", "K=256",
+                         "TEST=4 5", "VAL=11", "NAME=mesh_history_clusterB_k256_fourier_hic30pct",
+                         "ARG=--job-name=mesh_hist_fourier_k256", "ARG=--time=12:00:00"):
+            self.assertIn(expected,output)
 
     def test_batch_runs_directly_with_broken_srun_and_preserves_gpu_decoder_and_split(self):
         self.env["CUDA_VISIBLE_DEVICES"] = "GPU-allocated-by-slurm"

@@ -19,7 +19,7 @@ import pandas as pd
 import torch
 import wandb
 
-from mesh_impact_history import DECODER_BLOCKS, IMPACT_CONDITIONING, MeshImpactHistoryNet, saved_model_kwargs
+from mesh_impact_history import DECODER_BLOCKS, IMPACT_CONDITIONING, TIME_ENCODINGS, MeshImpactHistoryNet, saved_model_kwargs
 from mesh_impact_history_reporting import export_training_history_plot
 from utils.utils import (
     Config,
@@ -43,6 +43,10 @@ MODEL_DEFAULTS = {
     # mesh_only remains available to reload and reproduce ablation runs.
     "decoder": "temporal",
     "impact_conditioning": "film",
+    "time_encoding": "fourier",
+    "fourier_num_frequencies": 6,
+    "fourier_min_frequency_hz": 20.0,
+    "fourier_max_frequency_hz": 640.0,
     "neighborhood_layers": 0,
     "neighborhood_k": 256,
     "neighborhood_scale_mm": 20.0,
@@ -78,7 +82,7 @@ def parse_args(argv=None):
     parser.add_argument("--max-train-time", type=float, help="Optional cutoff before the configured time stride is applied.")
     parser.add_argument("--device", help="PyTorch device, e.g. cpu, cuda, or cuda:0.")
     for key, default in MODEL_DEFAULTS.items():
-        if key not in ("decoder", "impact_conditioning"):
+        if key not in ("decoder", "impact_conditioning", "time_encoding"):
             parser.add_argument(f"--{key.replace('_', '-')}", type=type(default), default=default)
     parser.add_argument(
         "--decoder", choices=sorted(DECODER_BLOCKS), default=MODEL_DEFAULTS["decoder"],
@@ -87,6 +91,10 @@ def parse_args(argv=None):
     parser.add_argument(
         "--impact-conditioning", choices=IMPACT_CONDITIONING, default=MODEL_DEFAULTS["impact_conditioning"],
         help="film uses XYZ-only nodes and FiLM pooling; legacy_additive reproduces older runs.",
+    )
+    parser.add_argument(
+        "--time-encoding", choices=TIME_ENCODINGS, default=MODEL_DEFAULTS["time_encoding"],
+        help="fourier uses sine/cosine pairs in physical seconds; legacy_five replays historical checkpoints.",
     )
     parser.add_argument("--output-dir", help="New run directory; defaults to runs/mesh_impact_history/<timestamp>.")
     parser.add_argument("--resume-from", help="Prior run directory (latest, else best checkpoint) or checkpoint file; writes a new run.")
@@ -515,6 +523,7 @@ def main(argv=None):
             preprocessor.mesh_scaler.mean_, preprocessor.mesh_scaler.scale_,
             preprocessor.indentor_scaler.mean_, preprocessor.indentor_scaler.scale_,
         )
+        model.set_time_scaler(preprocessor.time_scaler.mean_[0], preprocessor.time_scaler.scale_[0])
         first_times = np.asarray(train_dataset.time_arrays[0], dtype=np.float32)
         if source_dir is not None and not np.array_equal(
                 first_times, np.load(source_dir / "prediction_times.npy", allow_pickle=False)):
@@ -527,7 +536,26 @@ def main(argv=None):
             "same_grid_for_all_loaded_runs": matching_grid,
             "already_subsampled": True,
             "time_units": "source Time column (seconds for the supplied datasets)",
+            "time_encoding": model.time_encoding,
+            "time_feature_count": model.time_feature_count,
         }
+        if model.time_encoding == "fourier":
+            nyquist = min((.5 / float(np.diff(times).max()) for times in data["time_arrays"]
+                           if len(times) > 1), default=None)
+            frequencies = model.time_frequencies_hz.tolist()
+            prediction_grid["fourier"] = {
+                "frequencies_hz": frequencies,
+                "feature_order": "sin(f0), cos(f0), sin(f1), cos(f1), ...",
+                "phase_definition": "2*pi*frequency_hz*(normalized_time*time_scale_seconds+time_mean_seconds)",
+                "time_mean_seconds": float(model.time_mean),
+                "time_scale_seconds": float(model.time_scale),
+                "minimum_sampled_nyquist_hz": nyquist,
+            }
+            logger.info("Fourier time encoding: %s Hz | %s features | minimum sampled Nyquist: %s Hz",
+                        frequencies, model.time_feature_count, nyquist)
+            if nyquist is not None and frequencies[-1] >= nyquist:
+                logger.warning("Fourier maximum frequency %s Hz reaches/exceeds sampled Nyquist %s Hz; "
+                               "use a lower --fourier-max-frequency-hz for this grid", frequencies[-1], nyquist)
         if not matching_grid:
             logger.warning("Loaded runs have different sampled time grids. Default inference uses training run %s; pass sampled_time_points for another already-subsampled grid.", train_dataset.run_numbers[0])
         saved_config = resolved_config(config, args, model_kwargs, prediction_grid)
@@ -569,6 +597,16 @@ def main(argv=None):
         metrics, predictions, targets = evaluator.evaluate(test_loader)
         write_json(output_dir / "metrics.json", metrics)
         export_predictions(output_dir / "test_acceleration_histories.csv", test_dataset, predictions, targets)
+        from mesh_change_metrics import design_sensitivity_metrics
+        from evaluate_design_sensitivity import write_sensitivity_report, sensitivity_log_values
+        sensitivity = design_sensitivity_metrics(test_dataset, predictions, targets, config.samples_per_design)
+        write_sensitivity_report(output_dir, sensitivity)
+        sensitivity_values = sensitivity_log_values(sensitivity)
+        run.summary.update(sensitivity_values)
+        run.log(sensitivity_values)
+        logger.info("Matched-location design sensitivity: skill=%s, amplitude ratio=%s, alignment=%s; HIC15 skill=%s",
+                    sensitivity["design_difference_skill"], sensitivity["difference_amplitude_ratio"],
+                    sensitivity["difference_alignment_cosine"], sensitivity["hic15"]["design_difference_skill"])
         wandb.log({f"test/{key}": value for key, value in metrics.items() if np.isfinite(value)})
         logger.info("Best-checkpoint test metrics (acceleration in g): %s", metrics)
         logger.info("Finished. Run artifacts: %s", output_dir)

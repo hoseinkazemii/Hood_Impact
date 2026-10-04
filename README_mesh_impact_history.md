@@ -1,5 +1,15 @@
 # Mesh and impact location to acceleration history
 
+Fresh runs now use **Fourier time features**: sine/cosine pairs at
+20, 40, 80, 160, 320 and 640 Hz, followed by the existing time MLP and decoder.
+See [Fourier-time training](README_mesh_fourier_time.md) for the feature definition,
+submission command, configurable frequency band and checkpoint compatibility.
+
+Post-training acceleration and HIC15 metrics now include matched-location
+design-difference skill and amplitude, with per-location CSV/plots. See
+[design-sensitivity diagnostics](README_mesh_design_sensitivity.md) for interpretation,
+W&B keys, and backfilling saved runs.
+
 For the **neighborhood encoder + FiLM pooling** experiment on
 the cluster-B holdout, see [the architecture and training derivation](README_mesh_local_sensitivity.md).
 Submit it with `bash submit_mesh_impact_history_1704_local_sensitivity.sh`.
@@ -19,7 +29,7 @@ existing training-only scaling. FiLM applies impact-dependent feature-wise
 scales and shifts to normalized latent tokens before they attend to all nodes;
 global queries and queries with learned distance priors describe the whole hood
 and the impact neighborhood. Attention among the latent tokens combines their
-information. Sampled output-time queries contain time features only and attend
+information. Sampled output-time queries contain Fourier time features only and attend
 to those tokens, then temporal
 self-attention couples the requested times before a scalar acceleration head.
 Training defaults to the original `--decoder temporal` architecture, including
@@ -37,7 +47,9 @@ Coordinate scalers are fitted on training designs only; their statistics are
 also stored in the model so the separately normalized mesh and impact remain
 aligned when computing relative geometry.
 
-New runs record `impact_conditioning: film`. Older saved runs without that
+New runs record `impact_conditioning: film` and `time_encoding: fourier`.
+Saved runs without `time_encoding` retain the original five time features;
+resuming a run preserves its recorded encoding. Older saved runs without the conditioning
 setting retain their original six-feature/additive architecture when loaded or
 resumed. Start a fresh run to train the FiLM revision; the existing neighborhood
 launchers select it by default. The local pooling distance prior, 20 mm

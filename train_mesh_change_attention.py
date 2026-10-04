@@ -282,7 +282,8 @@ def evaluate_run(args):
     metrics, predictions, targets = Evaluator(predictor.model, config, preprocessor).evaluate(sequential_loader(dataset, config))
     sensitivity = design_sensitivity_metrics(dataset, predictions, targets, config.samples_per_design)
     write_json(run_dir / "metrics.json", metrics)
-    write_json(run_dir / "test_design_sensitivity.json", sensitivity)
+    from evaluate_design_sensitivity import write_sensitivity_report
+    write_sensitivity_report(run_dir, sensitivity)
     export_predictions(run_dir / "test_acceleration_histories.csv", dataset, predictions, targets)
     # The shared postprocessor integrates the exact sampled grid, in seconds.
     from hic15 import batched_hic

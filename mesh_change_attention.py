@@ -39,6 +39,7 @@ class MeshChangeAttentionNet(MeshImpactHistoryNet):
             raise ValueError("Use change_layers for change patches; neighborhood_layers must be zero")
         # This separate experiment retains its original six-feature patch input.
         kwargs.setdefault("impact_conditioning", "legacy_additive")
+        kwargs.setdefault("time_encoding", "legacy_five")
         if kwargs["impact_conditioning"] != "legacy_additive":
             raise ValueError("FiLM is currently supported by MeshImpactHistoryNet, not the change-patch model")
         super().__init__(**kwargs)

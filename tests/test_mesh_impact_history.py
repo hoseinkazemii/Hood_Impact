@@ -414,6 +414,9 @@ class TrainingRoundTripTests(unittest.TestCase):
             self.assertEqual(saved["architecture"]["name"], "MeshImpactHistoryNet")
             self.assertEqual(saved["architecture"]["kwargs"]["decoder"], decoder)
             self.assertEqual(saved["architecture"]["kwargs"]["impact_conditioning"], "film")
+            self.assertEqual(saved["architecture"]["kwargs"]["time_encoding"], "fourier")
+            self.assertEqual(saved["prediction_grid"]["time_feature_count"], 12)
+            self.assertEqual(saved["prediction_grid"]["fourier"]["frequencies_hz"], [20.,40.,80.,160.,320.,640.])
             self.assertEqual(saved["preprocessing"]["time_subsample_stride"], Config.time_subsample_stride)
             self.assertEqual(saved["preprocessing"]["acceleration_units"], "g")
             self.assertEqual(saved["training"]["initialization"], "from_scratch")
@@ -441,6 +444,8 @@ class TrainingRoundTripTests(unittest.TestCase):
             # Held-out designs have deliberately shifted inputs and targets.
             # Check every fitted scaler against only design 0's samples.
             preprocessor = predictor.preprocessor
+            self.assertAlmostEqual(float(predictor.model.time_mean), float(preprocessor.time_scaler.mean_[0]), places=8)
+            self.assertAlmostEqual(float(predictor.model.time_scale), float(preprocessor.time_scaler.scale_[0]), places=8)
             for scaler, training_values in (
                 (preprocessor.mesh_scaler, np.concatenate(meshes[:2]).astype(np.float64)),
                 (preprocessor.indentor_scaler, np.asarray(impacts[:2], dtype=np.float64)),
