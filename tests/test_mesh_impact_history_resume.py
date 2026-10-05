@@ -41,7 +41,8 @@ def toy_data():
 
 def training_args(path):
     return ["--data-format", "euroncap1704", "--num-samples", "12", "--samples-per-design", "2",
-            "--epochs", "4", "--batch-size", "4", "--width", "8", "--num-heads", "2", "--num-latents", "2",
+            "--epochs", "4", "--batch-size", "4", "--time-subsample-stride", "4",
+            "--width", "8", "--num-heads", "2", "--num-latents", "2",
             "--latent-layers", "1", "--temporal-layers", "1", "--neighborhood-layers", "2", "--neighborhood-k", "3",
             "--impactor-nodes", "2", "--dropout", "0.1",
             "--device", "cpu", "--wandb-mode", "disabled", "--output-dir", str(path)]
@@ -102,6 +103,7 @@ def test_resume_preserves_training_state_and_finishes_original_target(tmp_path, 
         assert saved["training"]["initialization"] == "checkpoint"
         assert saved["architecture"]["kwargs"]["neighborhood_layers"] == 2
         assert saved["training"]["loss"] == "normalized_acceleration_mse"
+        assert saved["preprocessing"]["time_subsample_stride"] == 4
         assert (resumed / "test_acceleration_histories.csv").is_file()
         final = torch.load(resumed / LAST_CHECKPOINT_NAME, weights_only=True)
         assert final["completed_epochs"] == final["scheduler_state_dict"]["last_epoch"] == 4
@@ -163,7 +165,8 @@ def test_resume_rejects_changed_settings_splits_and_existing_output(tmp_path, to
     source = tmp_path / "source"
     with mock.patch.object(DataPreprocessor, "load_all_data", return_value=toy_data):
         interrupt_after_two_epochs(source)
-        for option, value in (("--epochs", "100"), ("--neighborhood-layers", "0"), ("--design-difference-weight", "0")):
+        for option, value in (("--epochs", "100"), ("--time-subsample-stride", "16"),
+                              ("--neighborhood-layers", "0"), ("--design-difference-weight", "0")):
             with pytest.raises(SystemExit):
                 parse_args(["--resume-from", str(source), option, value])
         with pytest.raises(FileExistsError):

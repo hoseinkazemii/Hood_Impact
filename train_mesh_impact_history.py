@@ -80,6 +80,8 @@ def parse_args(argv=None):
     parser.add_argument("--hic-range-threshold-percent", type=float,
                         help="Keep locations with 100*(max-min)/mean HIC15 >= this value across all 12 designs.")
     parser.add_argument("--max-train-time", type=float, help="Optional cutoff before the configured time stride is applied.")
+    parser.add_argument("--time-subsample-stride", type=int,
+                        help="Keep every Nth source time/target sample (16 by default; 4 gives 250 of 1000 points).")
     parser.add_argument("--device", help="PyTorch device, e.g. cpu, cuda, or cuda:0.")
     for key, default in MODEL_DEFAULTS.items():
         if key not in ("decoder", "impact_conditioning", "time_encoding"):
@@ -146,6 +148,7 @@ def restore_resume_arguments(args, parser, argv):
                 "epochs": saved["training"]["num_epochs"],
                 "lr": saved["training"]["learning_rate"],
                 "max_train_time": saved["preprocessing"]["max_train_time"],
+                "time_subsample_stride": saved["preprocessing"]["time_subsample_stride"],
                 "hic_range_threshold_percent": (saved.get("location_filter") or {}).get("threshold_percent"),
                 "test_designs": splits["test"]["design_ids"],
                 "val_designs": splits["validation"]["design_ids"]}
@@ -172,7 +175,7 @@ def build_config(args):
     for key in (
         "data_format", "inp_dir", "impact_coords_path", "mesh_geometry_dir", "doe_path",
         "acceleration_dir", "num_samples", "samples_per_design", "epochs", "batch_size",
-        "lr", "weight_decay", "seed", "max_train_time",
+        "lr", "weight_decay", "seed", "max_train_time", "time_subsample_stride",
     ):
         value = getattr(args, key)
         if value is not None:

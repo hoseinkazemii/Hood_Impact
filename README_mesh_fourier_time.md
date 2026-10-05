@@ -92,6 +92,34 @@ encoding during resume is rejected because the first linear layer has a
 different shape. Start a fresh run for the Fourier comparison. The separate
 change-attention experiment retains its historical time-feature default.
 
+For the time-resolution comparison against the all-location October 4 run
+`20261004_050747_3303364_1704`, use:
+
+```bash
+unset HOOD_MESH_RESUME_FROM
+bash submit_mesh_impact_history_1704_fourier_k256_t250.sh
+```
+
+This fresh launcher selects every fourth source time and acceleration value:
+1000 source points become **250 query/target points**, about **0.1001 ms** apart
+instead of 63 points at 0.4004 ms. It keeps all 142 locations (HIC threshold 0),
+the cluster-B test split, k256/two-layer neighborhood encoder, FiLM, and the
+20–640 Hz Fourier bank. Defaults remain 100 epochs, batch size 8, learning rate
+0.0003, weight decay 0.00001 and seed 42. The time limit is 24 hours because the
+63-point reference run took about 11.5 hours; extra Slurm options can override it.
+
+The general option is `--time-subsample-stride N`, or
+`HOOD_MESH_TIME_SUBSAMPLE_STRIDE=N` with the ordinary launchers. Strides 16, 4,
+2 and 1 give 63, 250, 500 and 1000 points for these histories. Preflight checks
+the same stride/cutoff as training, saved configs record the effective stride,
+and resume restores it and rejects conflicting explicit overrides. Shared
+preprocessing defaults remain stride 16. A denser grid adds supervision at more
+source times; querying an existing checkpoint more densely does not add that
+training supervision. Keep frequencies fixed for this first comparison so
+sampling is the experimental variable. Compare both runs on the same physical
+time grid, using full-source acceleration and HIC targets, as well as the saved
+design-difference diagnostics.
+
 The design-sensitivity JSON, per-location CSV, plot and W&B values are exported
 after training as before. Compare `design_difference_skill`,
 `difference_amplitude_ratio` and HIC15 sensitivity on the same held-out designs,

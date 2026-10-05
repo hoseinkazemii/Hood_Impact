@@ -271,6 +271,7 @@ printf 'ARG=%s\\n' "$@"
                         HOOD_MESH_IMPACT_CONDITIONING="film",
                         HOOD_MESH_TIME_ENCODING="fourier", HOOD_MESH_FOURIER_NUM_FREQUENCIES="8",
                         HOOD_MESH_FOURIER_MIN_FREQUENCY_HZ="10", HOOD_MESH_FOURIER_MAX_FREQUENCY_HZ="800",
+                        HOOD_MESH_TIME_SUBSAMPLE_STRIDE="4", HOOD_MESH_MAX_TRAIN_TIME="0.02",
                         HOOD_MESH_NEIGHBOR_CACHE_DIR="/shared/neighbor-graphs",
                         HOOD_MESH_NEIGHBORHOOD_SCALE_MM="20", HOOD_MESH_NEIGHBORHOOD_CHUNK_SIZE="1024")
         output = self.launch("run_mesh_impact_history_1704.sbatch")
@@ -282,6 +283,7 @@ printf 'ARG=%s\\n' "$@"
                              "<--batch-size> <8>", "<--impact-conditioning> <film>",
                              "<--time-encoding> <fourier>", "<--fourier-num-frequencies> <8>",
                              "<--fourier-min-frequency-hz> <10>", "<--fourier-max-frequency-hz> <800>",
+                             "<--time-subsample-stride> <4>", "<--max-train-time> <0.02>",
                              "<--neighbor-cache-dir> </shared/neighbor-graphs>",
                              "<--neighborhood-scale-mm> <20>", "<--neighborhood-chunk-size> <1024>"):
                 self.assertIn(expected, command)
@@ -300,6 +302,19 @@ printf 'ARG=%s\\n' "$@"
                          "TEST=4 5", "VAL=11", "NAME=mesh_history_clusterB_k256_fourier_hic30pct",
                          "ARG=--job-name=mesh_hist_fourier_k256", "ARG=--time=12:00:00"):
             self.assertIn(expected,output)
+
+    def test_dense_fourier_launcher_uses_all_locations_and_250_queries(self):
+        self.stub("sbatch", """printf 'STRIDE=%s\\nHIC=%s\\nNAME=%s\\nTIME=%s\\nBATCH=%s\\n' \\
+    "$HOOD_MESH_TIME_SUBSAMPLE_STRIDE" "$HOOD_MESH_HIC_RANGE_THRESHOLD_PERCENT" \\
+    "$HOOD_MESH_RUN_NAME" "$HOOD_MESH_TIME_ENCODING" "$HOOD_MESH_BATCH_SIZE"
+printf 'ARG=%s\\n' "$@"
+""")
+        self.env.update(HOOD_MESH_TIME_SUBSAMPLE_STRIDE="16", HOOD_MESH_HIC_RANGE_THRESHOLD_PERCENT="30")
+        output = self.launch("submit_mesh_impact_history_1704_fourier_k256_t250.sh")
+        for expected in ("STRIDE=4", "HIC=0", "TIME=fourier", "BATCH=8",
+                         "NAME=mesh_history_clusterB_k256_fourier_hic0pct_t250",
+                         "ARG=--job-name=mesh_hist_fourier_k256_t250", "ARG=--time=24:00:00"):
+            self.assertIn(expected, output)
 
     def test_batch_runs_directly_with_broken_srun_and_preserves_gpu_decoder_and_split(self):
         self.env["CUDA_VISIBLE_DEVICES"] = "GPU-allocated-by-slurm"
@@ -407,6 +422,13 @@ class SubmissionDataTests(unittest.TestCase):
                 self.assertEqual(cutoff_count, int(selected.sum()))
                 np.testing.assert_array_equal(data["time_arrays"][0], source[selected][::stride])
                 np.testing.assert_array_equal(data["accelerations"][0], acceleration[selected][::stride])
+
+    def test_explicit_dense_preprocessing_overrides_shared_default(self):
+        args = preflight.parse_args(["--time-subsample-stride", "4"])
+        data, source_count, cutoff_count = preflight.validate_first_run(
+            self.root, self.coords.to_numpy(dtype=np.float32), args)
+        self.assertEqual((source_count, cutoff_count, len(data["time_arrays"][0])), (1000, 1000, 250))
+        np.testing.assert_array_equal(data["accelerations"][0], self.history["A(in g)"].to_numpy()[::4])
 
     def test_rejects_nonmonotonic_source_before_subsampling_hides_it(self):
         history = self.history.copy()

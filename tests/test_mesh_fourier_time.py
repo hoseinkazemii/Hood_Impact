@@ -13,20 +13,21 @@ def small_model(**options):
         latent_layers=1, temporal_layers=1, dropout=0, **options)
 
 
-def test_fourier_features_match_physical_sine_cosine_on_the_63_point_grid():
+@pytest.mark.parametrize("stride", [16, 4, 1])
+def test_fourier_features_match_physical_sine_cosine_on_sampled_grids(stride):
     model = small_model()
-    times = torch.linspace(0, .025, 1000)[::16]
+    times = torch.linspace(0, .025, 1000)[::stride]
     mean, scale = float(times.mean()), float(times.std(correction=0))
     model.set_time_scaler(mean, scale)
     features = model.time_features((times-mean)/scale)
     frequencies = torch.tensor([20., 40., 80., 160., 320., 640.])
     phase = times[:, None] * (2 * math.pi * frequencies)
     expected = torch.stack((phase.sin(), phase.cos()), dim=-1).flatten(-2)
-    assert features.shape == (63, 12)
+    assert features.shape == (len(times), 12)
     torch.testing.assert_close(model.time_frequencies_hz, frequencies)
     torch.testing.assert_close(features, expected, atol=2e-5, rtol=0)
     # Every consecutive pair represents a point on the unit circle.
-    torch.testing.assert_close(features.reshape(63, 6, 2).square().sum(-1), torch.ones(63, 6))
+    torch.testing.assert_close(features.reshape(len(times), 6, 2).square().sum(-1), torch.ones(len(times), 6))
     torch.testing.assert_close(features[0], torch.tensor([0., 1.] * 6), atol=3e-6, rtol=0)
     assert model.time_embedding[0].in_features == 12
 
@@ -103,19 +104,20 @@ def test_custom_frequency_band_and_scaler_survive_strict_state_reload():
 
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA unavailable"))])
-def test_fourier_channels_and_decoder_receive_finite_training_gradients(device):
+@pytest.mark.parametrize("stride", [16, 4])
+def test_fourier_channels_and_decoder_receive_finite_training_gradients(device, stride):
     torch.manual_seed(4)
     model = small_model(neighborhood_layers=2, neighborhood_k=4).to(device).train()
-    times = torch.linspace(0,.025,1000,device=device)[::16]
+    times = torch.linspace(0,.025,1000,device=device)[::stride]
     mean,scale = float(times.mean()),float(times.std(correction=0))
     model.set_time_scaler(mean,scale)
     mesh = torch.randn(10,3,device=device)
     prediction = model(mesh,torch.zeros(10,dtype=torch.long,device=device),
         torch.tensor([[.1,.2]],device=device),(times-mean)/scale,
-        torch.zeros(63,dtype=torch.long,device=device))
+        torch.zeros(len(times),dtype=torch.long,device=device))
     target = torch.sin(2*math.pi*320*times)
     (prediction-target).square().mean().backward()
-    assert prediction.shape == (63,) and torch.isfinite(prediction).all()
+    assert prediction.shape == (len(times),) and torch.isfinite(prediction).all()
     weights = model.time_embedding[0].weight
     assert torch.isfinite(weights.grad).all()
     assert torch.all(weights.grad.abs().sum(0) > 0)  # Every sine/cosine input is trainable downstream.

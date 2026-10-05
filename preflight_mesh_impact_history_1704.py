@@ -181,16 +181,17 @@ def validate_impactor_boundary(root, impactor_nodes):
           f"the remaining {len(first) - impactor_nodes} structural nodes are identical")
 
 
-def validate_first_run(root, impact_xy):
+def validate_first_run(root, impact_xy, preprocessing=None):
     """Check mesh parsing and the configured cutoff/stride against source data."""
-    stride = Config.time_subsample_stride
+    preprocessing = Config if preprocessing is None else preprocessing
+    stride = preprocessing.time_subsample_stride
     if isinstance(stride, bool) or not isinstance(stride, int) or stride < 1:
         raise ValueError(f"Config.time_subsample_stride must be a positive integer; got {stride!r}")
-    cutoff = Config.max_train_time
+    cutoff = preprocessing.max_train_time
     if cutoff is not None and (not np.isfinite(cutoff) or cutoff <= 0):
         raise ValueError("Config.max_train_time must be None or finite and positive")
     # Config() creates its output directory. Only the preprocessor fields are
-    # needed for this read-only check, so use the shared class defaults directly.
+    # needed for this read-only check, so use a lightweight settings object.
     config = SimpleNamespace(
         data_format="euroncap1704",
         inp_dir=str(root / "inp_files"),
@@ -298,6 +299,8 @@ def parse_args(argv=None):
         parser.add_argument(f"--{key.replace('_', '-')}", type=type(MODEL_DEFAULTS[key]),
                             default=MODEL_DEFAULTS[key])
     parser.add_argument("--batch-size", type=int, default=Config.batch_size)
+    parser.add_argument("--time-subsample-stride", type=int, default=Config.time_subsample_stride)
+    parser.add_argument("--max-train-time", type=float, default=Config.max_train_time)
     parser.add_argument("--allow-clone-leak", action="store_true",
                         help="Permit a holdout that leaves near-clones of a held-out "
                              "design in training. Scores from such a run measure "
@@ -308,7 +311,7 @@ def parse_args(argv=None):
         if saved.data_format != "euroncap1704" or saved.num_samples != NUM_RUNS or saved.samples_per_design != SAMPLES_PER_DESIGN:
             parser.error("The 1704 resume launcher requires a full euroncap1704 run")
         for key in (*EXPERIMENT_MODEL_KEYS, "decoder", "test_designs", "val_designs",
-                    "batch_size"):
+                    "batch_size", "time_subsample_stride", "max_train_time"):
             setattr(args, key, getattr(saved, key))
         if args.data_root is None:
             args.data_root = str(Path(saved.inp_dir).parent)
@@ -338,7 +341,7 @@ def main(argv=None):
         elif args.neighborhood_layers:
             print("WARNING: --impactor-nodes 0 keeps the moving headform in the local graph, "
                   "so the neighbor graph is rebuilt for every run instead of once per design")
-        data, source_count, cutoff_count = validate_first_run(root, impact_xy)
+        data, source_count, cutoff_count = validate_first_run(root, impact_xy, args)
         if args.require_cuda:
             validate_cuda_model(data, decoder=args.decoder,
                                 neighbor_cache_dir=args.neighbor_cache_dir or root / "neighbor_graphs", **{
@@ -350,8 +353,8 @@ def main(argv=None):
         print(
             f"First run: {len(data['mesh_geometries'][0])} mesh nodes | "
             f"history {source_count} source -> {cutoff_count} after cutoff -> "
-            f"{len(data['time_arrays'][0])} sampled | Config.time_subsample_stride="
-            f"{Config.time_subsample_stride}"
+            f"{len(data['time_arrays'][0])} sampled | time_subsample_stride="
+            f"{args.time_subsample_stride}"
         )
         print("Preflight passed.")
     except (ValueError, OSError, KeyError, RuntimeError) as error:

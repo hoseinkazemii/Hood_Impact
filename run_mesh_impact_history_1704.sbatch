@@ -77,7 +77,7 @@ for option in NEIGHBORHOOD_LAYERS:neighborhood-layers NEIGHBORHOOD_K:neighborhoo
     IMPACTOR_NODES:impactor-nodes IMPACT_CONDITIONING:impact-conditioning \
     TIME_ENCODING:time-encoding FOURIER_NUM_FREQUENCIES:fourier-num-frequencies \
     FOURIER_MIN_FREQUENCY_HZ:fourier-min-frequency-hz FOURIER_MAX_FREQUENCY_HZ:fourier-max-frequency-hz \
-    BATCH_SIZE:batch-size; do
+    BATCH_SIZE:batch-size TIME_SUBSAMPLE_STRIDE:time-subsample-stride MAX_TRAIN_TIME:max-train-time; do
     variable="HOOD_MESH_${option%%:*}"
     if [[ -n "${!variable}" ]]; then
         EXPERIMENT_ARGS+=("--${option#*:}" "${!variable}")
@@ -106,7 +106,7 @@ printf 'Launch: direct Python in Slurm batch allocation | CUDA_VISIBLE_DEVICES=%
 printf 'Starting dataset and CUDA preflight.\n'
 "${PYTHON_BIN}" -u preflight_mesh_impact_history_1704.py "${PREFLIGHT_ARGS[@]}"
 
-# Dataset selection is explicit; time subsampling remains in utils.utils.Config.
+# Dataset selection is explicit; optional time stride/cutoff reach both checks and training.
 # Optional settings override the Python defaults only when explicitly provided.
 TRAIN_ARGS=(
     --data-format euroncap1704 --num-samples 1704 --samples-per-design 142

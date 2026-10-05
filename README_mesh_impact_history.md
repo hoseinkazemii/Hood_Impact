@@ -275,8 +275,11 @@ commit, resolved interpreter, dataset path, and complete training command.
 
 The existing preprocessing truncates at `Config.max_train_time` if configured,
 then applies `time[::Config.time_subsample_stride]` and the identical slice to
-acceleration **once**. The current stride is **16**, so a 1,000-point source
-history produces 63 output points. No extra resampling or slicing is introduced.
+acceleration **once**. The default stride is **16**, so a 1,000-point source
+history produces 63 output points. Fresh runs can set `--time-subsample-stride`
+(or `HOOD_MESH_TIME_SUBSAMPLE_STRIDE` in Slurm); stride 4 gives 250 points and
+stride 1 retains all 1000. See the [250-point Fourier comparison](README_mesh_fourier_time.md).
+No extra resampling or slicing is introduced.
 The cutoff retains the shared preprocessing behavior, including its two-point
 fallback when fewer than two source points fall before the cutoff.
 
