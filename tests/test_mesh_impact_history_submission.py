@@ -304,17 +304,21 @@ printf 'ARG=%s\\n' "$@"
             self.assertIn(expected,output)
 
     def test_dense_fourier_launcher_uses_all_locations_and_250_queries(self):
-        self.stub("sbatch", """printf 'STRIDE=%s\\nHIC=%s\\nNAME=%s\\nTIME=%s\\nBATCH=%s\\n' \\
+        self.env.pop("WANDB_MODE", None)
+        self.stub("sbatch", """printf 'STRIDE=%s\\nHIC=%s\\nNAME=%s\\nTIME=%s\\nBATCH=%s\\nTRACKING=%s\\n' \\
     "$HOOD_MESH_TIME_SUBSAMPLE_STRIDE" "$HOOD_MESH_HIC_RANGE_THRESHOLD_PERCENT" \\
-    "$HOOD_MESH_RUN_NAME" "$HOOD_MESH_TIME_ENCODING" "$HOOD_MESH_BATCH_SIZE"
+    "$HOOD_MESH_RUN_NAME" "$HOOD_MESH_TIME_ENCODING" "$HOOD_MESH_BATCH_SIZE" "$WANDB_MODE"
 printf 'ARG=%s\\n' "$@"
 """)
         self.env.update(HOOD_MESH_TIME_SUBSAMPLE_STRIDE="16", HOOD_MESH_HIC_RANGE_THRESHOLD_PERCENT="30")
         output = self.launch("submit_mesh_impact_history_1704_fourier_k256_t250.sh")
         for expected in ("STRIDE=4", "HIC=0", "TIME=fourier", "BATCH=8",
+                         "TRACKING=offline",
                          "NAME=mesh_history_clusterB_k256_fourier_hic0pct_t250",
                          "ARG=--job-name=mesh_hist_fourier_k256_t250", "ARG=--time=24:00:00"):
             self.assertIn(expected, output)
+        self.env["WANDB_MODE"] = "online"
+        self.assertIn("TRACKING=online", self.launch("submit_mesh_impact_history_1704_fourier_k256_t250.sh"))
 
     def test_batch_runs_directly_with_broken_srun_and_preserves_gpu_decoder_and_split(self):
         self.env["CUDA_VISIBLE_DEVICES"] = "GPU-allocated-by-slurm"

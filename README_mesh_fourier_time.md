@@ -108,6 +108,28 @@ the cluster-B test split, k256/two-layer neighborhood encoder, FiLM, and the
 0.0003, weight decay 0.00001 and seed 42. The time limit is 24 hours because the
 63-point reference run took about 11.5 hours; extra Slurm options can override it.
 
+Job 3317059 failed before dataset loading because online W&B initialization
+timed out while contacting `api.wandb.ai`. This experiment launcher now defaults
+to **offline W&B tracking** when `WANDB_MODE` is unset. To ensure an old exported
+online setting cannot affect the retry, submit a fresh job explicitly:
+
+```bash
+unset HOOD_MESH_RESUME_FROM
+WANDB_MODE=offline bash submit_mesh_impact_history_1704_fourier_k256_t250.sh
+```
+
+Checkpoints, local training reports, and W&B records are still saved in the new
+run directory. Offline records do not appear on the W&B website until synced.
+From a machine with working W&B access, activate the training environment and run:
+
+```bash
+python -m wandb sync /path/to/new_run/wandb/offline-run-*
+```
+
+For live tracking after service access is restored, explicitly set
+`WANDB_MODE=online`; other experiment launchers retain their existing default.
+The failed directory contains no checkpoint, so it cannot be resumed.
+
 The general option is `--time-subsample-stride N`, or
 `HOOD_MESH_TIME_SUBSAMPLE_STRIDE=N` with the ordinary launchers. Strides 16, 4,
 2 and 1 give 63, 250, 500 and 1000 points for these histories. Preflight checks
