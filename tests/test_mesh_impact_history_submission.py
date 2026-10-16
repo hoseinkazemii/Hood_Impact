@@ -323,6 +323,36 @@ printf 'ARG=%s\\n' "$@"
         self.env["WANDB_MODE"] = "online"
         self.assertIn("TRACKING=online", self.launch("submit_mesh_impact_history_1704_fourier_k256_t250.sh"))
 
+    def test_no_shortcut_launcher_closes_both_paths_and_otherwise_matches_the_20261004_run(self):
+        self.env.pop("WANDB_MODE", None)
+        self.stub("sbatch", """printf 'RESIDUAL=%s\\nPOOL_HEADFORM=%s\\nIMPACTOR=%s\\nSTRIDE=%s\\nHIC=%s\\nCUTOFF=[%s]\\n' \\
+    "$HOOD_MESH_POOLING_QUERY_RESIDUAL" "$HOOD_MESH_POOL_IMPACTOR_NODES" "$HOOD_MESH_IMPACTOR_NODES" \\
+    "$HOOD_MESH_TIME_SUBSAMPLE_STRIDE" "$HOOD_MESH_HIC_RANGE_THRESHOLD_PERCENT" "$HOOD_MESH_MAX_TRAIN_TIME"
+printf 'K=%s\\nLAYERS=%s\\nTIME=%s\\nIMPACT=%s\\nTEST=%s\\nVAL=%s\\nEPOCHS=%s\\nBATCH=%s\\nNAME=%s\\nTRACKING=%s\\n' \\
+    "$HOOD_MESH_NEIGHBORHOOD_K" "$HOOD_MESH_NEIGHBORHOOD_LAYERS" "$HOOD_MESH_TIME_ENCODING" \\
+    "$HOOD_MESH_IMPACT_CONDITIONING" "$HOOD_MESH_TEST_DESIGNS" "$HOOD_MESH_VAL_DESIGNS" \\
+    "$HOOD_MESH_EPOCHS" "$HOOD_MESH_BATCH_SIZE" "$HOOD_MESH_RUN_NAME" "$WANDB_MODE"
+printf 'ARG=%s\\n' "$@"
+""")
+        # Stale exports from other experiments must not leak into the comparison.
+        self.env.update(HOOD_MESH_POOLING_QUERY_RESIDUAL="true", HOOD_MESH_POOL_IMPACTOR_NODES="true",
+                        HOOD_MESH_TIME_SUBSAMPLE_STRIDE="4", HOOD_MESH_HIC_RANGE_THRESHOLD_PERCENT="30",
+                        HOOD_MESH_MAX_TRAIN_TIME="0.02", HOOD_MESH_NEIGHBORHOOD_K="16",
+                        HOOD_MESH_IMPACTOR_NODES="0")
+        output = self.launch("submit_mesh_impact_history_1704_no_location_shortcuts.sh")
+        for expected in ("RESIDUAL=false", "POOL_HEADFORM=false", "IMPACTOR=286", "STRIDE=16", "HIC=0",
+                         "CUTOFF=[]", "K=256", "LAYERS=2", "TIME=fourier", "IMPACT=film", "TEST=4 5",
+                         "VAL=11", "EPOCHS=100", "BATCH=8", "TRACKING=offline",
+                         "NAME=mesh_history_clusterB_k256_fourier_hic0pct_no_shortcuts",
+                         "ARG=--job-name=mesh_hist_no_shortcuts", "ARG=--time=24:00:00"):
+            self.assertIn(expected, output)
+        self.assertIn("mesh_history_1704_no_location_shortcuts_%j.out", output)
+        # Our job name, wall time and log names come after the chained defaults, so sbatch uses them.
+        arguments = [line[4:] for line in output.splitlines() if line.startswith("ARG=")]
+        self.assertGreater(arguments.index("--time=24:00:00"), arguments.index("--time=08:00:00"))
+        self.assertGreater(arguments.index("--job-name=mesh_hist_no_shortcuts"),
+                           arguments.index("--job-name=mesh_hist_clusterB_k256"))
+
     def test_batch_runs_directly_with_broken_srun_and_preserves_gpu_decoder_and_split(self):
         self.env["CUDA_VISIBLE_DEVICES"] = "GPU-allocated-by-slurm"
         for decoder in ("", "temporal", "mesh_only"):
