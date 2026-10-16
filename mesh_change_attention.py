@@ -40,6 +40,8 @@ class MeshChangeAttentionNet(MeshImpactHistoryNet):
         # This separate experiment retains its original six-feature patch input.
         kwargs.setdefault("impact_conditioning", "legacy_additive")
         kwargs.setdefault("time_encoding", "legacy_five")
+        kwargs.setdefault("pooling_query_residual", True)
+        kwargs.setdefault("pool_impactor_nodes", True)
         if kwargs["impact_conditioning"] != "legacy_additive":
             raise ValueError("FiLM is currently supported by MeshImpactHistoryNet, not the change-patch model")
         super().__init__(**kwargs)

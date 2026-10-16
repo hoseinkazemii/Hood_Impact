@@ -80,7 +80,7 @@ def test_training_filters_before_scaling_and_exports_only_selected(tmp_path, mon
         training.main(["--data-format", "euroncap1704", "--device", "cpu", "--epochs", "1",
                        "--batch-size", "4", "--width", "8", "--num-heads", "2", "--num-latents", "2",
                        "--latent-layers", "1", "--temporal-layers", "1", "--neighborhood-layers", "2",
-                       "--neighborhood-k", "256", "--hic-range-threshold-percent", "10",
+                       "--neighborhood-k", "256", "--impactor-nodes", "2", "--hic-range-threshold-percent", "10",
                        "--wandb-mode", "disabled", "--output-dir", str(tmp_path / "run")])
         saved = json.loads((tmp_path / "run/config.json").read_text())
         assert saved["location_filter"]["selected_locations"] == [1]

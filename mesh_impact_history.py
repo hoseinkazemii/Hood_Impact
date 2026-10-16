@@ -137,8 +137,13 @@ TIME_ENCODINGS = ("fourier", "legacy_five")
 
 
 def saved_model_kwargs(kwargs: dict) -> dict:
-    """Reconstruct the original conditioning/time features of older configs."""
-    return {"impact_conditioning": "legacy_additive", "time_encoding": "legacy_five", **kwargs}
+    """Reconstruct the original conditioning/time features of older configs.
+
+    Configs written before the location-shortcut switches existed pooled the
+    headform rows and kept the query residual, so they replay with both on.
+    """
+    return {"impact_conditioning": "legacy_additive", "time_encoding": "legacy_five",
+            "pooling_query_residual": True, "pool_impactor_nodes": True, **kwargs}
 
 
 class ImpactFiLM(nn.Module):
@@ -191,8 +196,23 @@ class MeshImpactHistoryNet(nn.Module):
     checkpoints with six node features and additive impact conditioning.
 
     ``impactor_nodes`` holds the leading rigid-headform nodes out of that local
-    attention. They still reach the pooled memory unchanged; only the local
-    graph skips them. See ``_encode_neighborhoods``.
+    attention. See ``_encode_neighborhoods``.
+
+    Location shortcuts. The impact location should choose *where* the model
+    reads the hood, never supply content of its own. Two switches, both off for
+    new models, control the paths that bypass geometry:
+
+    * ``pooling_query_residual`` adds the FiLM-conditioned learned queries back
+      to the pooled update. At a fixed impact those tokens are identical for
+      every design, so the memory carries a geometry-free location code.
+    * ``pool_impactor_nodes`` lets the leading ``impactor_nodes`` headform rows
+      enter pooling as keys/values. The rigid headform is placed at the impact
+      point, so its rows encode location rather than hood structure. Excluding
+      them needs ``impactor_nodes > 0``; with 0 no row is known to be headform.
+
+    With both off, every memory token is an attention-weighted sum of hood-node
+    values. ``legacy_additive`` still adds the impact embedding to the time
+    queries; that mode exists to replay historical checkpoints.
     """
 
     def __init__(
@@ -214,6 +234,8 @@ class MeshImpactHistoryNet(nn.Module):
         fourier_num_frequencies: int = 6,
         fourier_min_frequency_hz: float = 20.0,
         fourier_max_frequency_hz: float = 640.0,
+        pooling_query_residual: bool = False,
+        pool_impactor_nodes: bool = False,
     ):
         super().__init__()
         integer_options = {
@@ -253,6 +275,10 @@ class MeshImpactHistoryNet(nn.Module):
             raise ValueError("neighborhood_scale_mm must be finite and positive")
         if isinstance(impactor_nodes, bool) or not isinstance(impactor_nodes, int) or impactor_nodes < 0:
             raise ValueError("impactor_nodes must be a nonnegative integer")
+        for name, value in (("pooling_query_residual", pooling_query_residual),
+                            ("pool_impactor_nodes", pool_impactor_nodes)):
+            if not isinstance(value, bool):
+                raise ValueError(f"{name} must be True or False")
 
         self.decoder = decoder
         self.impact_conditioning = impact_conditioning
@@ -264,6 +290,8 @@ class MeshImpactHistoryNet(nn.Module):
         self.attention_dropout = dropout
         self.neighborhood_k = neighborhood_k
         self.impactor_nodes = impactor_nodes
+        self.pooling_query_residual = pooling_query_residual
+        self.pool_impactor_nodes = pool_impactor_nodes
 
         # The shared preprocessor fits mesh and impact scalers independently.
         # Store their affine maps in the checkpoint so relative coordinates
@@ -458,6 +486,12 @@ class MeshImpactHistoryNet(nn.Module):
         ))
         radius_squared = self.impact_relative_xy(mesh, impact).square().sum(dim=-1)
         spatial_bias = -precision[:, None] * radius_squared.unsqueeze(0)
+        if not self.pool_impactor_nodes and self.impactor_nodes:
+            # A -inf bias gives the headform rows exactly zero attention, so
+            # memory is built from hood nodes only while weights keep one
+            # column per mesh row for attention export.
+            headform = torch.arange(len(mesh), device=mesh.device) < self.impactor_nodes
+            spatial_bias = spatial_bias.masked_fill(headform, float("-inf"))
         return tokens, query, key, value, spatial_bias
 
     @torch.no_grad()
@@ -465,7 +499,8 @@ class MeshImpactHistoryNet(nn.Module):
         """Yield (first_token, weights[heads, chunk_tokens, nodes]) in eval mode.
 
         Inputs use the saved training scalers, as in forward(). The weights
-        include the learned local radial bias and softmax over ALL mesh nodes.
+        include the learned local radial bias and softmax over ALL mesh nodes;
+        excluded headform rows get exactly zero weight.
         No dropout is applied. No weights are retained in the model/checkpoint.
         """
         if self.training:
@@ -490,7 +525,10 @@ class MeshImpactHistoryNet(nn.Module):
             dropout_p=self.attention_dropout if self.training else 0.0,
         )
         update = update.squeeze(0).transpose(0, 1).reshape(self.num_latents, self.width)
-        return tokens + self.mesh_dropout(self.mesh_output(update))
+        update = self.mesh_dropout(self.mesh_output(update))
+        # The query tokens depend only on the impact location; adding them
+        # back gives the decoder a location code that bypasses the geometry.
+        return tokens + update if self.pooling_query_residual else update
 
     def _validate_inputs(
         self, mesh: Tensor, mesh_batch: Tensor, indentor: Tensor,

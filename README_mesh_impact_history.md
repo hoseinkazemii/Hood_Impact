@@ -55,8 +55,26 @@ Saved runs without `time_encoding` retain the original five time features;
 resuming a run preserves its recorded encoding. Older saved runs without the conditioning
 setting retain their original six-feature/additive architecture when loaded or
 resumed. Start a fresh run to train the FiLM revision; the existing neighborhood
-launchers select it by default. The local pooling distance prior, 20 mm
-neighborhood position scaling, and headform handling are unchanged.
+launchers select it by default. The local pooling distance prior and 20 mm
+neighborhood position scaling are unchanged.
+
+### Location shortcuts
+
+The impact location chooses *where* pooling reads the hood; it should not
+supply content of its own. New runs close the two paths that bypassed geometry:
+
+| Option | New runs | Old behaviour |
+|---|---|---|
+| `--pooling-query-residual` | `false`: memory = attention-weighted hood-node values only | `true`: FiLM query tokens, identical for every design at a location, added back to memory |
+| `--pool-impactor-nodes` | `false`: the leading `--impactor-nodes` headform rows get zero pooling weight | `true`: headform rows, which encode only the impact point, pooled as keys/values |
+
+Excluding the headform requires `--impactor-nodes 286` for the 1704 decks; a
+fresh run with `--impactor-nodes 0` is refused unless `--pool-impactor-nodes true`
+is passed deliberately. Saved runs without these keys load and resume with both
+set to `true`, so existing checkpoints replay unchanged. On the cluster, restore
+either shortcut for an ablation with `HOOD_MESH_POOLING_QUERY_RESIDUAL=true` or
+`HOOD_MESH_POOL_IMPACTOR_NODES=true`. The `legacy_additive` mode still adds the
+impact embedding to the time queries, because it exists only to replay old runs.
 
 ## Train
 

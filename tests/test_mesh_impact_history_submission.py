@@ -273,12 +273,15 @@ printf 'ARG=%s\\n' "$@"
                         HOOD_MESH_FOURIER_MIN_FREQUENCY_HZ="10", HOOD_MESH_FOURIER_MAX_FREQUENCY_HZ="800",
                         HOOD_MESH_TIME_SUBSAMPLE_STRIDE="4", HOOD_MESH_MAX_TRAIN_TIME="0.02",
                         HOOD_MESH_NEIGHBOR_CACHE_DIR="/shared/neighbor-graphs",
-                        HOOD_MESH_NEIGHBORHOOD_SCALE_MM="20", HOOD_MESH_NEIGHBORHOOD_CHUNK_SIZE="1024")
+                        HOOD_MESH_NEIGHBORHOOD_SCALE_MM="20", HOOD_MESH_NEIGHBORHOOD_CHUNK_SIZE="1024",
+                        HOOD_MESH_POOLING_QUERY_RESIDUAL="false", HOOD_MESH_POOL_IMPACTOR_NODES="false")
         output = self.launch("run_mesh_impact_history_1704.sbatch")
         commands = [line for line in output.splitlines() if line.startswith("PYTHON")]
         self.assertEqual(len(commands), 2)
         for command in commands:
             self.assertNotIn("--design-difference-weight", command)
+            self.assertIn("<--pooling-query-residual> <false>", command)
+            self.assertIn("<--pool-impactor-nodes> <false>", command)
             for expected in ("<--neighborhood-layers> <2>", "<--neighborhood-k> <16>",
                              "<--batch-size> <8>", "<--impact-conditioning> <film>",
                              "<--time-encoding> <fourier>", "<--fourier-num-frequencies> <8>",
@@ -495,3 +498,29 @@ class ImpactorBoundaryTests(unittest.TestCase):
         for parse in (preflight.parse_args, training.parse_args):
             self.assertEqual(parse([]).impactor_nodes, 0)
             self.assertEqual(parse(["--impactor-nodes", "286"]).impactor_nodes, 286)
+
+    def test_location_shortcut_switches_parse_true_false_and_default_off(self):
+        sbatch = Path("run_mesh_impact_history_1704.sbatch").read_text()
+        for name in ("POOLING_QUERY_RESIDUAL:pooling-query-residual", "POOL_IMPACTOR_NODES:pool-impactor-nodes"):
+            self.assertIn(name, sbatch)
+        for parse in (preflight.parse_args, training.parse_args):
+            defaults = parse([])
+            self.assertIs(defaults.pooling_query_residual, False)
+            self.assertIs(defaults.pool_impactor_nodes, False)
+            for text, expected in (("true", True), ("false", False), ("1", True), ("0", False)):
+                with self.subTest(parser=parse.__module__, text=text):
+                    parsed = parse(["--pooling-query-residual", text, "--pool-impactor-nodes", text])
+                    self.assertIs(parsed.pooling_query_residual, expected)
+                    self.assertIs(parsed.pool_impactor_nodes, expected)
+            with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+                parse(["--pool-impactor-nodes", "maybe"])
+
+    def test_headform_must_be_identified_unless_pooling_it_on_purpose(self):
+        with self.assertRaisesRegex(ValueError, "location shortcut"):
+            training.validate_location_shortcuts(0, False)
+        training.validate_location_shortcuts(286, False)
+        training.validate_location_shortcuts(0, True)
+        with mock.patch("builtins.print"), mock.patch("sys.stderr"):
+            self.assertEqual(preflight.main(["--impactor-nodes", "0"]), 1)
+        archived = Path("submit_mesh_impact_history_1704_no_temporal.sh").read_text()
+        self.assertIn('export HOOD_MESH_POOL_IMPACTOR_NODES="true"', archived)

@@ -161,6 +161,37 @@ def test_pre_fourier_film_run_resumes_its_original_time_encoding(tmp_path, toy_d
     assert state["node_embedding.0.weight"].shape[1] == 3
 
 
+def test_pre_shortcut_switch_run_resumes_with_both_location_shortcuts(tmp_path, toy_data):
+    source, resumed = tmp_path / "old", tmp_path / "resumed"
+    with mock.patch.object(DataPreprocessor, "load_all_data", return_value=toy_data):
+        interrupt_after_two_epochs(source)
+        path = source / "config.json"
+        saved = json.loads(path.read_text())
+        assert saved["architecture"]["kwargs"]["pooling_query_residual"] is False
+        assert saved["architecture"]["kwargs"]["pool_impactor_nodes"] is False
+        for key in ("pooling_query_residual", "pool_impactor_nodes"):
+            del saved["architecture"]["kwargs"][key]
+        path.write_text(json.dumps(saved))
+        args = parse_args(["--resume-from", str(source)])
+        assert args.pooling_query_residual is True and args.pool_impactor_nodes is True
+        for option in ("--pooling-query-residual", "--pool-impactor-nodes"):
+            with pytest.raises(SystemExit):
+                parse_args(["--resume-from", str(source), option, "false"])
+        main(["--resume-from", str(source), "--output-dir", str(resumed),
+              "--device", "cpu", "--wandb-mode", "disabled"])
+    restored = json.loads((resumed / "config.json").read_text())["architecture"]["kwargs"]
+    assert restored["pooling_query_residual"] is True and restored["pool_impactor_nodes"] is True
+
+
+def test_fresh_run_without_known_headform_rows_is_refused(tmp_path, toy_data):
+    arguments = training_args(tmp_path / "run")
+    arguments[arguments.index("--impactor-nodes") + 1] = "0"
+    with mock.patch.object(DataPreprocessor, "load_all_data", return_value=toy_data):
+        with pytest.raises(ValueError, match="location shortcut"):
+            main(arguments)
+    assert not (tmp_path / "run" / "config.json").exists()
+
+
 def test_resume_rejects_changed_settings_splits_and_existing_output(tmp_path, toy_data):
     source = tmp_path / "source"
     with mock.patch.object(DataPreprocessor, "load_all_data", return_value=toy_data):

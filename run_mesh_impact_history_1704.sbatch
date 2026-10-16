@@ -75,6 +75,7 @@ EXPERIMENT_ARGS=()
 for option in NEIGHBORHOOD_LAYERS:neighborhood-layers NEIGHBORHOOD_K:neighborhood-k \
     NEIGHBORHOOD_SCALE_MM:neighborhood-scale-mm NEIGHBORHOOD_CHUNK_SIZE:neighborhood-chunk-size \
     IMPACTOR_NODES:impactor-nodes IMPACT_CONDITIONING:impact-conditioning \
+    POOLING_QUERY_RESIDUAL:pooling-query-residual POOL_IMPACTOR_NODES:pool-impactor-nodes \
     TIME_ENCODING:time-encoding FOURIER_NUM_FREQUENCIES:fourier-num-frequencies \
     FOURIER_MIN_FREQUENCY_HZ:fourier-min-frequency-hz FOURIER_MAX_FREQUENCY_HZ:fourier-max-frequency-hz \
     BATCH_SIZE:batch-size TIME_SUBSAMPLE_STRIDE:time-subsample-stride MAX_TRAIN_TIME:max-train-time; do

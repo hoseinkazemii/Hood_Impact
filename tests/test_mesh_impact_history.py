@@ -397,7 +397,7 @@ class TrainingRoundTripTests(unittest.TestCase):
                 "--batch-size", "2", "--width", "16", "--num-heads", "2",
                 "--num-latents", "4", "--latent-layers", "1", "--temporal-layers", "1",
                 "--dropout", "0", "--device", "cpu", "--wandb-mode", "disabled",
-                "--decoder", decoder,
+                "--decoder", decoder, "--impactor-nodes", "2",
                 "--output-dir", str(run_dir),
             ] + list(extra_args))
             self.assertEqual(set(metrics), {"mse", "rmse", "mae", "r2"})
@@ -415,6 +415,8 @@ class TrainingRoundTripTests(unittest.TestCase):
             self.assertEqual(saved["architecture"]["kwargs"]["decoder"], decoder)
             self.assertEqual(saved["architecture"]["kwargs"]["impact_conditioning"], "film")
             self.assertEqual(saved["architecture"]["kwargs"]["time_encoding"], "fourier")
+            self.assertIs(saved["architecture"]["kwargs"]["pooling_query_residual"], False)
+            self.assertIs(saved["architecture"]["kwargs"]["pool_impactor_nodes"], False)
             self.assertEqual(saved["prediction_grid"]["time_feature_count"], 12)
             self.assertEqual(saved["prediction_grid"]["fourier"]["frequencies_hz"], [20.,40.,80.,160.,320.,640.])
             self.assertEqual(saved["preprocessing"]["time_subsample_stride"], Config.time_subsample_stride)

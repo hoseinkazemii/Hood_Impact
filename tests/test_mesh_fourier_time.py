@@ -56,7 +56,9 @@ def test_feature_derivative_includes_the_physical_time_scale():
 def test_historical_configs_without_time_encoding_replay_the_five_feature_model(impact_conditioning):
     kwargs = dict(width=16, num_heads=2, num_latents=4, latent_layers=1,
                   temporal_layers=1, dropout=0, impact_conditioning=impact_conditioning)
-    old = MeshImpactHistoryNet(time_encoding="legacy_five", **kwargs).eval()
+    # Pre-Fourier networks also predate the location-shortcut switches.
+    old = MeshImpactHistoryNet(time_encoding="legacy_five", pooling_query_residual=True,
+                               pool_impactor_nodes=True, **kwargs).eval()
     restored = MeshImpactHistoryNet(**saved_model_kwargs(kwargs)).eval()
     restored.load_state_dict(old.state_dict(), strict=True)
     assert restored.time_encoding == "legacy_five"

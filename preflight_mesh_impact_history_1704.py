@@ -28,9 +28,11 @@ from train_mesh_impact_history import (
     DEFAULT_VAL_DESIGNS,
     MODEL_DEFAULTS,
     MeshImpactHistoryNet,
+    add_model_arguments,
     parse_args as parse_training_args,
     resolve_splits,
     validate_data,
+    validate_location_shortcuts,
 )
 
 
@@ -51,6 +53,7 @@ EXPERIMENT_MODEL_KEYS = tuple(
     key for key in MODEL_DEFAULTS
     if key.startswith("neighborhood_") or key in ("impactor_nodes", "impact_conditioning")
     or key == "time_encoding" or key.startswith("fourier_")
+    or key in ("pooling_query_residual", "pool_impactor_nodes")
 )
 
 
@@ -295,9 +298,7 @@ def parse_args(argv=None):
     parser.add_argument("--test-designs", type=int, nargs="+", default=list(DEFAULT_TEST_DESIGNS))
     parser.add_argument("--val-designs", type=int, nargs="+", default=list(DEFAULT_VAL_DESIGNS))
     parser.add_argument("--decoder", choices=sorted(DECODER_BLOCKS), default=MODEL_DEFAULTS["decoder"])
-    for key in EXPERIMENT_MODEL_KEYS:
-        parser.add_argument(f"--{key.replace('_', '-')}", type=type(MODEL_DEFAULTS[key]),
-                            default=MODEL_DEFAULTS[key])
+    add_model_arguments(parser, EXPERIMENT_MODEL_KEYS)
     parser.add_argument("--batch-size", type=int, default=Config.batch_size)
     parser.add_argument("--time-subsample-stride", type=int, default=Config.time_subsample_stride)
     parser.add_argument("--max-train-time", type=float, default=Config.max_train_time)
@@ -323,6 +324,7 @@ def main(argv=None):
     args = parse_args(argv)
     try:
         validate_runtime(args.require_cuda)
+        validate_location_shortcuts(args.impactor_nodes, args.pool_impactor_nodes)
         splits = validate_splits(args.test_designs, args.val_designs)
         if args.allow_clone_leak:
             print("Cluster check: SKIPPED (--allow-clone-leak); scores may measure retrieval")

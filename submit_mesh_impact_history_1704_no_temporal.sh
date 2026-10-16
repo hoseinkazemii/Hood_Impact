@@ -31,6 +31,10 @@ fi
 export HOOD_MESH_DECODER="mesh_only"
 export HOOD_MESH_NEIGHBORHOOD_LAYERS="0"
 export HOOD_MESH_IMPACTOR_NODES="0"
+# The matched baseline predates the location-shortcut switches: it pooled the
+# headform rows and kept the query residual.
+export HOOD_MESH_POOLING_QUERY_RESIDUAL="true"
+export HOOD_MESH_POOL_IMPACTOR_NODES="true"
 export HOOD_MESH_TEST_DESIGNS="10 11"
 export HOOD_MESH_VAL_DESIGNS="5"
 export HOOD_MESH_ALLOW_CLONE_LEAK="0"

@@ -51,15 +51,51 @@ MODEL_DEFAULTS = {
     "neighborhood_k": 256,
     "neighborhood_scale_mm": 20.0,
     "neighborhood_chunk_size": 1024,
-    # Leading rigid-headform nodes held out of local attention only. The
-    # 1704 .inp files put the 286 impactor nodes first; 0 disables the holdout.
+    # Leading rigid-headform nodes held out of local attention and, unless
+    # pool_impactor_nodes is set, of pooling. The 1704 .inp files put the 286
+    # impactor nodes first; 0 disables the holdout.
     "impactor_nodes": 0,
+    # Location shortcuts that bypass the hood geometry; see MeshImpactHistoryNet.
+    "pooling_query_residual": False,
+    "pool_impactor_nodes": False,
 }
+BOOLEAN_MODEL_KEYS = tuple(key for key, value in MODEL_DEFAULTS.items() if isinstance(value, bool))
 # Fresh experiments hold out the whole B cluster. Resumes restore saved splits.
 DEFAULT_TEST_DESIGNS = (4, 5)
 DEFAULT_VAL_DESIGNS = (11,)
 CHECKPOINT_NAME = "hood_impact_best_model.pt"  # Filename used by shared Trainer.
 LAST_CHECKPOINT_NAME = "hood_impact_last_model.pt"
+
+
+def parse_boolean(text):
+    """argparse type for explicit true/false values; bool("false") is True."""
+    value = str(text).strip().lower()
+    if value in ("true", "1", "yes"):
+        return True
+    if value in ("false", "0", "no"):
+        return False
+    raise argparse.ArgumentTypeError(f"expected true or false, got {text!r}")
+
+
+def add_model_arguments(parser, keys):
+    """Add one option per model key, with real true/false parsing for flags."""
+    for key in keys:
+        default = MODEL_DEFAULTS[key]
+        option = f"--{key.replace('_', '-')}"
+        if key in BOOLEAN_MODEL_KEYS:
+            parser.add_argument(option, type=parse_boolean, default=default, metavar="{true,false}")
+        else:
+            parser.add_argument(option, type=type(default), default=default)
+
+
+def validate_location_shortcuts(impactor_nodes, pool_impactor_nodes):
+    """Refuse a fresh run that cannot keep the headform out of pooling."""
+    if not pool_impactor_nodes and not impactor_nodes:
+        raise ValueError(
+            "--impactor-nodes 0 leaves the moving headform rows in pooling, where they act as a "
+            "location shortcut. Set --impactor-nodes 286 for the 1704 decks, or pass "
+            "--pool-impactor-nodes true to keep the headform in pooling deliberately."
+        )
 
 
 def parse_args(argv=None):
@@ -83,9 +119,8 @@ def parse_args(argv=None):
     parser.add_argument("--time-subsample-stride", type=int,
                         help="Keep every Nth source time/target sample (16 by default; 4 gives 250 of 1000 points).")
     parser.add_argument("--device", help="PyTorch device, e.g. cpu, cuda, or cuda:0.")
-    for key, default in MODEL_DEFAULTS.items():
-        if key not in ("decoder", "impact_conditioning", "time_encoding"):
-            parser.add_argument(f"--{key.replace('_', '-')}", type=type(default), default=default)
+    add_model_arguments(parser, [key for key in MODEL_DEFAULTS
+                                 if key not in ("decoder", "impact_conditioning", "time_encoding")])
     parser.add_argument(
         "--decoder", choices=sorted(DECODER_BLOCKS), default=MODEL_DEFAULTS["decoder"],
         help="mesh_only removes temporal self-attention; temporal restores the original baseline.",
@@ -450,6 +485,7 @@ class HistoryPredictor:
 
 def main(argv=None):
     args = parse_args(argv)
+    validate_location_shortcuts(args.impactor_nodes, args.pool_impactor_nodes)
     config = build_config(args)
     output_dir = Path(config.output_dir)
     # A new run cannot accidentally evaluate a leftover checkpoint from old work.

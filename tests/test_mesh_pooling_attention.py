@@ -33,8 +33,10 @@ def test_exported_attention_reconstructs_actual_pooling_and_chunks():
         torch.testing.assert_close(weights.sum(-1), torch.ones(2, 6))
         expected_weights = torch.softmax(q @ k.transpose(-1, -2) / 2 + bias[None], dim=-1)
         torch.testing.assert_close(weights, expected_weights)
-        reconstructed = tokens + m.mesh_output((weights @ v).transpose(0, 1).reshape(6, 8))
+        update = m.mesh_output((weights @ v).transpose(0, 1).reshape(6, 8))
+        reconstructed = tokens + update if m.pooling_query_residual else update
         torch.testing.assert_close(actual, reconstructed, atol=1e-6, rtol=1e-5)
+        assert (weights[..., :2] == 0).all()  # Headform rows are not pooled.
     m.train()
     with pytest.raises(ValueError, match="eval"):
         list(m.iter_pooling_attention(xyz, impact))
