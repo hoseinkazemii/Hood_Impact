@@ -353,6 +353,35 @@ printf 'ARG=%s\\n' "$@"
         self.assertGreater(arguments.index("--job-name=mesh_hist_no_shortcuts"),
                            arguments.index("--job-name=mesh_hist_clusterB_k256"))
 
+    def test_location_holdout_launcher_adds_the_split_to_the_no_shortcut_settings(self):
+        self.env.pop("WANDB_MODE", None)
+        self.stub("sbatch", """printf 'HOLDOUT=%s\\nRESIDUAL=%s\\nPOOL_HEADFORM=%s\\nIMPACTOR=%s\\nSTRIDE=%s\\nHIC=%s\\n' \\
+    "$HOOD_MESH_LOCATION_HOLDOUT" "$HOOD_MESH_POOLING_QUERY_RESIDUAL" "$HOOD_MESH_POOL_IMPACTOR_NODES" \\
+    "$HOOD_MESH_IMPACTOR_NODES" "$HOOD_MESH_TIME_SUBSAMPLE_STRIDE" "$HOOD_MESH_HIC_RANGE_THRESHOLD_PERCENT"
+printf 'K=%s\\nTIME=%s\\nTEST=%s\\nVAL=%s\\nEPOCHS=%s\\nNAME=%s\\nTRACKING=%s\\n' \\
+    "$HOOD_MESH_NEIGHBORHOOD_K" "$HOOD_MESH_TIME_ENCODING" "$HOOD_MESH_TEST_DESIGNS" "$HOOD_MESH_VAL_DESIGNS" \\
+    "$HOOD_MESH_EPOCHS" "$HOOD_MESH_RUN_NAME" "$WANDB_MODE"
+printf 'ARG=%s\\n' "$@"
+""")
+        self.env.update(HOOD_MESH_LOCATION_HOLDOUT="/stale/split.json", HOOD_MESH_POOLING_QUERY_RESIDUAL="true",
+                        HOOD_MESH_TIME_SUBSAMPLE_STRIDE="4", HOOD_MESH_HIC_RANGE_THRESHOLD_PERCENT="30",
+                        HOOD_MESH_TEST_DESIGNS="10 11")
+        output = self.launch("submit_mesh_impact_history_1704_location_holdout.sh")
+        split = self.shell_path(self.repo / "location_splits" / "euroncap1704_checkerboard.json")
+        for expected in (f"HOLDOUT={split}", "RESIDUAL=false", "POOL_HEADFORM=false", "IMPACTOR=286",
+                         "STRIDE=16", "HIC=0", "K=256", "TIME=fourier", "TEST=4 5", "VAL=11", "EPOCHS=100",
+                         "NAME=mesh_history_clusterB_k256_fourier_no_shortcuts_location_holdout",
+                         "TRACKING=offline", "ARG=--job-name=mesh_hist_location_holdout", "ARG=--time=16:00:00"):
+            self.assertIn(expected, output)
+        arguments = [line[4:] for line in output.splitlines() if line.startswith("ARG=")]
+        self.assertGreater(arguments.index("--time=16:00:00"), arguments.index("--time=08:00:00"))
+        # The batch job passes the split to training only; preflight checks designs, not locations.
+        self.env["HOOD_MESH_LOCATION_HOLDOUT"] = "/split dir/split.json"
+        output = self.launch("run_mesh_impact_history_1704.sbatch")
+        commands = [line for line in output.splitlines() if line.startswith("PYTHON")]
+        self.assertNotIn("--location-holdout", commands[0])
+        self.assertIn("<--location-holdout> </split dir/split.json>", commands[1])
+
     def test_batch_runs_directly_with_broken_srun_and_preserves_gpu_decoder_and_split(self):
         self.env["CUDA_VISIBLE_DEVICES"] = "GPU-allocated-by-slurm"
         for decoder in ("", "temporal", "mesh_only"):

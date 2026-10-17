@@ -76,6 +76,23 @@ either shortcut for an ablation with `HOOD_MESH_POOLING_QUERY_RESIDUAL=true` or
 `HOOD_MESH_POOL_IMPACTOR_NODES=true`. The `legacy_additive` mode still adds the
 impact embedding to the time queries, because it exists only to replay old runs.
 
+### Unseen-location test
+
+`--location-holdout location_splits/euroncap1704_checkerboard.json` gives the
+test designs impact locations the network never trained on. The 142 locations
+are split as a checkerboard on the Euro-NCAP lattice (parity of `wadh_mm/100 +
+col_k`): the 71 even locations are used only on training and validation designs,
+the 71 odd locations only on test designs. With the cluster-B holdout this is
+639 train / 71 validation / 142 test runs. Each test location has its lattice
+neighbours in training. The hood is nearly mirror-symmetric (HIC at `col_k` and
+`-col_k` differ by a median 2%, against 9% between lateral neighbours), and
+mirror images share parity, so a random split would leak them but this one
+does not. Both halves match in mean HIC (1253 vs 1293), edge locations (27
+each) and cross-design HIC range (median 20%). Regenerate the file with
+`python location_holdout.py`; training checks every kept run's impact XY against
+it. Submit with `bash submit_mesh_impact_history_1704_location_holdout.sh`,
+which otherwise keeps the no-location-shortcut settings.
+
 ## Train
 
 Run from the repository root using an environment with PyTorch, NumPy, pandas,

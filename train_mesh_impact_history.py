@@ -115,6 +115,9 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int)
     parser.add_argument("--hic-range-threshold-percent", type=float,
                         help="Keep locations with 100*(max-min)/mean HIC15 >= this value across all 12 designs.")
+    parser.add_argument("--location-holdout", metavar="SPLIT_JSON",
+                        help="Disjoint impact locations: test designs keep only the file's test locations, "
+                             "all other designs only its training/validation locations (see location_holdout.py).")
     parser.add_argument("--max-train-time", type=float, help="Optional cutoff before the configured time stride is applied.")
     parser.add_argument("--time-subsample-stride", type=int,
                         help="Keep every Nth source time/target sample (16 by default; 4 gives 250 of 1000 points).")
@@ -185,6 +188,7 @@ def restore_resume_arguments(args, parser, argv):
                 "max_train_time": saved["preprocessing"]["max_train_time"],
                 "time_subsample_stride": saved["preprocessing"]["time_subsample_stride"],
                 "hic_range_threshold_percent": (saved.get("location_filter") or {}).get("threshold_percent"),
+                "location_holdout": (saved.get("location_holdout") or {}).get("file"),
                 "test_designs": splits["test"]["design_ids"],
                 "val_designs": splits["validation"]["design_ids"]}
     explicit = {token.split("=", 1)[0] for token in argv if token.startswith("--")}
@@ -237,6 +241,8 @@ def build_config(args):
             raise ValueError("HIC range threshold must be finite and nonnegative")
         if config.data_format != "euroncap1704" or config.samples_per_design != 142 or config.num_samples != 1704:
             raise ValueError("HIC location filtering requires the complete 12 x 142 euroncap1704 dataset")
+    if args.location_holdout is not None and (config.data_format != "euroncap1704" or config.samples_per_design != 142):
+        raise ValueError("The location holdout is defined on the 142-location euroncap1704 grid")
     return config
 
 
@@ -306,6 +312,7 @@ def resolved_config(config, args, model_kwargs, prediction_grid):
         "architecture": {"name": "MeshImpactHistoryNet", "kwargs": model_kwargs},
         "data": data_config,
         "location_filter": getattr(args, "location_filter_report", None),
+        "location_holdout": getattr(args, "location_holdout_report", None),
         "preprocessing": {
             "prediction_target": "acceleration",
             "time_subsample_stride": config.time_subsample_stride,
@@ -527,6 +534,12 @@ def main(argv=None):
             logger.info("Resume: %s | completed epochs: %s | next epoch: %s/%s",
                         args.resume_from, completed, completed + 1, config.num_epochs)
         logger.info("Output: %s | device: %s | configured time stride: %s", output_dir, config.device, config.time_subsample_stride)
+        if args.location_holdout is not None:
+            # Read before the long data load; a resume reuses its saved lists.
+            from location_holdout import load_split
+            args.location_holdout_report = (args.resume_config["location_holdout"] if source_dir is not None
+                                            else load_split(args.location_holdout))
+            write_json(output_dir / "location_holdout.json", args.location_holdout_report)
         run = initialize_wandb(
             args, resolved_config(config, args, model_kwargs, prediction_grid=None), output_dir, logger,
         )
@@ -550,6 +563,13 @@ def main(argv=None):
             data = filter_data(data, report["selected_locations"])
             logger.info("HIC range >= %s%% across all 12 designs: %s/142 locations; %s retained runs",
                         report["threshold_percent"], len(report["selected_locations"]), len(data["run_numbers"]))
+        if args.location_holdout is not None:
+            from location_holdout import apply_split
+            report = args.location_holdout_report
+            data = apply_split(data, report, args.test_designs, config.samples_per_design)
+            logger.info("Location holdout (%s): %s training/validation locations, %s test-only locations; %s retained runs",
+                        report["scheme"], len(report["train_validation_locations"]),
+                        len(report["test_locations"]), len(data["run_numbers"]))
         splits = resolve_splits(data, config, args.test_designs, args.val_designs)
         if source_dir is not None and splits != args.resume_splits:
             raise ValueError("Loaded train/validation/test runs differ from the saved resume split")
