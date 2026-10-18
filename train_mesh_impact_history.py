@@ -20,7 +20,9 @@ import pandas as pd
 import torch
 import wandb
 
-from mesh_impact_history import DECODER_BLOCKS, IMPACT_CONDITIONING, TIME_ENCODINGS, MeshImpactHistoryNet, saved_model_kwargs
+from mesh_impact_history import (
+    DECODER_BLOCKS, GEOMETRY_FILM, IMPACT_CONDITIONING, TIME_ENCODINGS, MeshImpactHistoryNet, saved_model_kwargs,
+)
 from mesh_impact_history_reporting import export_training_history_plot
 from utils.utils import (
     Config,
@@ -59,6 +61,9 @@ MODEL_DEFAULTS = {
     # Location shortcuts that bypass the hood geometry; see MeshImpactHistoryNet.
     "pooling_query_residual": False,
     "pool_impactor_nodes": False,
+    # Geometry memory injection (FiLM); "none" adds no parameters.
+    "geometry_film": "none",
+    "geometry_fourier_octaves": 5,
 }
 BOOLEAN_MODEL_KEYS = tuple(key for key, value in MODEL_DEFAULTS.items() if isinstance(value, bool))
 # Fresh experiments hold out the whole B cluster. Resumes restore saved splits.
@@ -129,7 +134,7 @@ def parse_args(argv=None):
                         help="Keep every Nth source time/target sample (16 by default; 4 gives 250 of 1000 points).")
     parser.add_argument("--device", help="PyTorch device, e.g. cpu, cuda, or cuda:0.")
     add_model_arguments(parser, [key for key in MODEL_DEFAULTS
-                                 if key not in ("decoder", "impact_conditioning", "time_encoding")])
+                                 if key not in ("decoder", "impact_conditioning", "time_encoding", "geometry_film")])
     parser.add_argument(
         "--decoder", choices=sorted(DECODER_BLOCKS), default=MODEL_DEFAULTS["decoder"],
         help="mesh_only removes temporal self-attention; temporal restores the original baseline.",
@@ -141,6 +146,11 @@ def parse_args(argv=None):
     parser.add_argument(
         "--time-encoding", choices=TIME_ENCODINGS, default=MODEL_DEFAULTS["time_encoding"],
         help="fourier uses sine/cosine pairs in physical seconds; legacy_five replays historical checkpoints.",
+    )
+    parser.add_argument(
+        "--geometry-film", choices=GEOMETRY_FILM, default=MODEL_DEFAULTS["geometry_film"],
+        help="Geometry memory FiLM: latent re-injects after each latent mixing block; "
+             "all also after each neighborhood block; none is the uninjected network.",
     )
     parser.add_argument("--output-dir", help="New run directory; defaults to runs/mesh_impact_history/<timestamp>.")
     parser.add_argument("--neighbor-cache-dir", help="Shared persistent kNN directory; defaults to neighbor_graphs beside inp_files.")

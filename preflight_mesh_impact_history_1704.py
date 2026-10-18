@@ -54,6 +54,7 @@ EXPERIMENT_MODEL_KEYS = tuple(
     if key.startswith("neighborhood_") or key in ("impactor_nodes", "impact_conditioning")
     or key == "time_encoding" or key.startswith("fourier_")
     or key in ("pooling_query_residual", "pool_impactor_nodes")
+    or key.startswith("geometry_")
 )
 
 
@@ -281,10 +282,17 @@ def validate_cuda_model(data, decoder=MODEL_DEFAULTS["decoder"], neighbor_cache_
         raise ValueError("CUDA model probe produced missing spatial-bias or nonfinite gradients")
     if any(parameter.grad is None for parameter in model.neighborhood_blocks.parameters()):
         raise ValueError("CUDA model probe produced missing neighborhood gradients")
+    if model.geometry_film != "none":
+        # The heads start at zero, so the first update comes from their weight
+        # gradients; zero there means the injection is not wired into the loss.
+        heads = [*model.latent_geometry_film, *getattr(model, "node_geometry_film", ())]
+        if any(head.affine.weight.grad is None or not head.affine.weight.grad.abs().sum() > 0 for head in heads):
+            raise ValueError("CUDA model probe produced no gradient for a geometry FiLM head")
     torch.cuda.synchronize()
     print(f"GPU: {torch.cuda.get_device_name(0)} | decoder={decoder} | "
           f"time_encoding={model.time_encoding} ({model.time_feature_count} features) | "
-          f"neighborhood_layers={len(model.neighborhood_blocks)} forward/backward: passed")
+          f"neighborhood_layers={len(model.neighborhood_blocks)} | "
+          f"geometry_film={model.geometry_film} forward/backward: passed")
     if model.neighborhood_blocks:
         print(f"Neighbor graph cache: built={model.neighbor_cache.builds} | loaded from disk={model.neighbor_cache.disk_hits}")
 

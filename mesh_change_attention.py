@@ -44,6 +44,9 @@ class MeshChangeAttentionNet(MeshImpactHistoryNet):
         kwargs.setdefault("pool_impactor_nodes", True)
         if kwargs["impact_conditioning"] != "legacy_additive":
             raise ValueError("FiLM is currently supported by MeshImpactHistoryNet, not the change-patch model")
+        if kwargs.get("geometry_film", "none") != "none":
+            # Its _encode_mesh override would be bypassed by the injected path.
+            raise ValueError("geometry_film is supported by MeshImpactHistoryNet, not the change-patch model")
         super().__init__(**kwargs)
         self.change_anchors, self.change_k = change_anchors, change_k
         self.change_scale_mm = change_scale_mm
