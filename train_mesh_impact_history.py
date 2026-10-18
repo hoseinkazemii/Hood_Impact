@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import shutil
 import sys
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -63,6 +64,11 @@ BOOLEAN_MODEL_KEYS = tuple(key for key, value in MODEL_DEFAULTS.items() if isins
 # Fresh experiments hold out the whole B cluster. Resumes restore saved splits.
 DEFAULT_TEST_DESIGNS = (4, 5)
 DEFAULT_VAL_DESIGNS = (11,)
+# Job 3317059 died when api.wandb.ai answered slower than W&B's 90 s default.
+# Online starts get a longer timeout and retries, then fail before data loading.
+WANDB_INIT_ATTEMPTS = 3
+WANDB_INIT_TIMEOUT_SECONDS = 300
+WANDB_RETRY_DELAY_SECONDS = 60
 CHECKPOINT_NAME = "hood_impact_best_model.pt"  # Filename used by shared Trainer.
 LAST_CHECKPOINT_NAME = "hood_impact_last_model.pt"
 
@@ -363,11 +369,22 @@ def initialize_wandb(args, initial_config, output_dir, logger):
     try:
         logger.info("Initializing W&B: mode=%s | project=%s | entity=%s",
                     args.wandb_mode, args.wandb_project, args.wandb_entity or "default team")
-        run = wandb.init(
-            project=args.wandb_project, entity=args.wandb_entity,
-            name=args.run_name or output_dir.name, config=initial_config,
-            dir=str(output_dir), mode=args.wandb_mode,
-        )
+        attempts = WANDB_INIT_ATTEMPTS if args.wandb_mode == "online" else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                run = wandb.init(
+                    project=args.wandb_project, entity=args.wandb_entity,
+                    name=args.run_name or output_dir.name, config=initial_config,
+                    dir=str(output_dir), mode=args.wandb_mode,
+                    settings=wandb.Settings(init_timeout=WANDB_INIT_TIMEOUT_SECONDS),
+                )
+                break
+            except Exception as exc:
+                if attempt == attempts:
+                    raise
+                logger.warning("W&B initialization attempt %s/%s failed (%s); retrying in %s s",
+                               attempt, attempts, exc, WANDB_RETRY_DELAY_SECONDS)
+                time.sleep(WANDB_RETRY_DELAY_SECONDS)
         run.define_metric("epoch")
         for metric in ("train/loss", "val/loss", "val/mae_g", "lr"):
             run.define_metric(metric, step_metric="epoch")

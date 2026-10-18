@@ -35,7 +35,9 @@ export HOOD_MESH_LR="${HOOD_MESH_LR:-0.0003}"
 export HOOD_MESH_WEIGHT_DECAY="${HOOD_MESH_WEIGHT_DECAY:-0.00001}"
 export HOOD_MESH_SEED="${HOOD_MESH_SEED:-42}"
 export HOOD_MESH_RUN_NAME="${HOOD_MESH_RUN_NAME:-mesh_history_clusterB_k256_fourier_no_shortcuts_location_holdout}"
-export WANDB_MODE="${WANDB_MODE:-offline}"
+# Online by default so epochs and plots reach the W&B website; training retries
+# a slow W&B start (job 3317059 timed out) before failing ahead of data loading.
+export WANDB_MODE="${WANDB_MODE:-online}"
 
 printf 'Location holdout: %s\n' "${HOOD_MESH_LOCATION_HOLDOUT}"
 printf '  71 locations on designs 0-3,6-11 (train/validation) | other 71 on designs 4,5 (test)\n'
@@ -43,7 +45,7 @@ printf 'Location shortcuts: query residual OFF | headform rows excluded from poo
 printf 'Training: %s epochs | batch %s | lr %s | weight decay %s | seed %s\n' \
     "${HOOD_MESH_EPOCHS}" "${HOOD_MESH_BATCH_SIZE}" "${HOOD_MESH_LR}" \
     "${HOOD_MESH_WEIGHT_DECAY}" "${HOOD_MESH_SEED}"
-printf 'W&B tracking: %s (offline records can be uploaded later with wandb sync)\n' "${WANDB_MODE}"
+printf 'W&B tracking: %s (startup retries online; WANDB_MODE=offline records to disk only)\n' "${WANDB_MODE}"
 mkdir -p "${PROJECT_DIR}/runs/slurm"
 # Half the training runs of the 11.5 h full-location baseline; 16 h leaves margin.
 exec bash "${PROJECT_DIR}/submit_mesh_impact_history_1704_fourier_k256.sh" \

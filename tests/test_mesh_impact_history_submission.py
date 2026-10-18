@@ -316,12 +316,12 @@ printf 'ARG=%s\\n' "$@"
         self.env.update(HOOD_MESH_TIME_SUBSAMPLE_STRIDE="16", HOOD_MESH_HIC_RANGE_THRESHOLD_PERCENT="30")
         output = self.launch("submit_mesh_impact_history_1704_fourier_k256_t250.sh")
         for expected in ("STRIDE=4", "HIC=0", "TIME=fourier", "BATCH=8",
-                         "TRACKING=offline",
+                         "TRACKING=online",
                          "NAME=mesh_history_clusterB_k256_fourier_hic0pct_t250",
                          "ARG=--job-name=mesh_hist_fourier_k256_t250", "ARG=--time=24:00:00"):
             self.assertIn(expected, output)
-        self.env["WANDB_MODE"] = "online"
-        self.assertIn("TRACKING=online", self.launch("submit_mesh_impact_history_1704_fourier_k256_t250.sh"))
+        self.env["WANDB_MODE"] = "offline"
+        self.assertIn("TRACKING=offline", self.launch("submit_mesh_impact_history_1704_fourier_k256_t250.sh"))
 
     def test_no_shortcut_launcher_closes_both_paths_and_otherwise_matches_the_20261004_run(self):
         self.env.pop("WANDB_MODE", None)
@@ -342,7 +342,7 @@ printf 'ARG=%s\\n' "$@"
         output = self.launch("submit_mesh_impact_history_1704_no_location_shortcuts.sh")
         for expected in ("RESIDUAL=false", "POOL_HEADFORM=false", "IMPACTOR=286", "STRIDE=16", "HIC=0",
                          "CUTOFF=[]", "K=256", "LAYERS=2", "TIME=fourier", "IMPACT=film", "TEST=4 5",
-                         "VAL=11", "EPOCHS=100", "BATCH=8", "TRACKING=offline",
+                         "VAL=11", "EPOCHS=100", "BATCH=8", "TRACKING=online",
                          "NAME=mesh_history_clusterB_k256_fourier_hic0pct_no_shortcuts",
                          "ARG=--job-name=mesh_hist_no_shortcuts", "ARG=--time=24:00:00"):
             self.assertIn(expected, output)
@@ -371,7 +371,7 @@ printf 'ARG=%s\\n' "$@"
         for expected in (f"HOLDOUT={split}", "RESIDUAL=false", "POOL_HEADFORM=false", "IMPACTOR=286",
                          "STRIDE=16", "HIC=0", "K=256", "TIME=fourier", "TEST=4 5", "VAL=11", "EPOCHS=100",
                          "NAME=mesh_history_clusterB_k256_fourier_no_shortcuts_location_holdout",
-                         "TRACKING=offline", "ARG=--job-name=mesh_hist_location_holdout", "ARG=--time=16:00:00"):
+                         "TRACKING=online", "ARG=--job-name=mesh_hist_location_holdout", "ARG=--time=16:00:00"):
             self.assertIn(expected, output)
         arguments = [line[4:] for line in output.splitlines() if line.startswith("ARG=")]
         self.assertGreater(arguments.index("--time=16:00:00"), arguments.index("--time=08:00:00"))

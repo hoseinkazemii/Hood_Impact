@@ -214,10 +214,13 @@ class WandbTrackingTests(unittest.TestCase):
             with mock.patch.object(training.wandb, "init", return_value=run) as initialize:
                 actual = training.initialize_wandb(args, initial_config, root, logger)
             self.assertIs(actual, run)
-            initialize.assert_called_once_with(
+            initialize.assert_called_once()
+            kwargs = initialize.call_args.kwargs
+            self.assertEqual({key: value for key, value in kwargs.items() if key != "settings"}, dict(
                 project="test-project", entity="test-team", name=root.name,
                 config=initial_config, dir=str(root), mode="online",
-            )
+            ))
+            self.assertEqual(kwargs["settings"].init_timeout, training.WANDB_INIT_TIMEOUT_SECONDS)
             run.define_metric.assert_any_call("epoch")
             for metric in ("train/loss", "val/loss", "val/mae_g", "lr"):
                 run.define_metric.assert_any_call(metric, step_metric="epoch")
@@ -240,16 +243,40 @@ class WandbTrackingTests(unittest.TestCase):
                 self.assertEqual(metadata["mode"], mode)
                 self.assertIsNone(metadata["url"])
 
-    def test_failed_online_initialization_surfaces_error_without_local_fallback(self):
+    def test_failed_online_initialization_retries_then_surfaces_error_without_local_fallback(self):
         error = RuntimeError("authentication failed")
         with tempfile.TemporaryDirectory() as directory:
             logger = mock.Mock()
-            with mock.patch.object(training.wandb, "init", side_effect=error) as initialize:
+            with mock.patch.object(training.wandb, "init", side_effect=error) as initialize, \
+                    mock.patch.object(training.time, "sleep") as sleep:
                 with self.assertRaisesRegex(RuntimeError, "W&B initialization failed") as raised:
                     training.initialize_wandb(self.make_args(), {}, Path(directory), logger)
             self.assertIs(raised.exception.__cause__, error)
-            initialize.assert_called_once()
+            self.assertEqual(initialize.call_count, training.WANDB_INIT_ATTEMPTS)
+            self.assertTrue(all(call.kwargs["mode"] == "online" for call in initialize.call_args_list))
+            self.assertEqual(sleep.call_count, training.WANDB_INIT_ATTEMPTS - 1)
             logger.error.assert_called_once()
+
+    def test_slow_online_start_recovers_on_retry(self):
+        # Job 3317059: the first contact with api.wandb.ai timed out.
+        run = self.make_run()
+        with tempfile.TemporaryDirectory() as directory:
+            logger = mock.Mock()
+            with mock.patch.object(training.wandb, "init", side_effect=[TimeoutError("timed out"), run]), \
+                    mock.patch.object(training.time, "sleep"):
+                self.assertIs(training.initialize_wandb(self.make_args(), {}, Path(directory), logger), run)
+            logger.warning.assert_called_once()
+            logger.error.assert_not_called()
+            self.assertEqual(json.loads((Path(directory) / "wandb_run.json").read_text())["mode"], "online")
+
+    def test_local_modes_do_not_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(training.wandb, "init", side_effect=RuntimeError("disk")) as initialize, \
+                    mock.patch.object(training.time, "sleep") as sleep:
+                with self.assertRaises(RuntimeError):
+                    training.initialize_wandb(self.make_args("offline"), {}, Path(directory), mock.Mock())
+            initialize.assert_called_once()
+            sleep.assert_not_called()
 
     def test_mode_mismatch_fails_and_closes_unexpected_run(self):
         with tempfile.TemporaryDirectory() as directory:
