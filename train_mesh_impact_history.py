@@ -127,8 +127,8 @@ def parse_args(argv=None):
     parser.add_argument("--hic-range-threshold-percent", type=float,
                         help="Keep locations with 100*(max-min)/mean HIC15 >= this value across all 12 designs.")
     parser.add_argument("--location-holdout", metavar="SPLIT_JSON",
-                        help="Disjoint impact locations: test designs keep only the file's test locations, "
-                             "all other designs only its training/validation locations (see location_holdout.py).")
+                        help="Location split file (see location_holdout.py): checkerboard gives test designs "
+                             "only unseen locations; per_design_random keeps a random subset per design.")
     parser.add_argument("--max-train-time", type=float, help="Optional cutoff before the configured time stride is applied.")
     parser.add_argument("--time-subsample-stride", type=int,
                         help="Keep every Nth source time/target sample (16 by default; 4 gives 250 of 1000 points).")
@@ -591,12 +591,10 @@ def main(argv=None):
             logger.info("HIC range >= %s%% across all 12 designs: %s/142 locations; %s retained runs",
                         report["threshold_percent"], len(report["selected_locations"]), len(data["run_numbers"]))
         if args.location_holdout is not None:
-            from location_holdout import apply_split
+            from location_holdout import apply_split, describe
             report = args.location_holdout_report
             data = apply_split(data, report, args.test_designs, config.samples_per_design)
-            logger.info("Location holdout (%s): %s training/validation locations, %s test-only locations; %s retained runs",
-                        report["scheme"], len(report["train_validation_locations"]),
-                        len(report["test_locations"]), len(data["run_numbers"]))
+            logger.info("Location split (%s); %s retained runs", describe(report), len(data["run_numbers"]))
         splits = resolve_splits(data, config, args.test_designs, args.val_designs)
         if source_dir is not None and splits != args.resume_splits:
             raise ValueError("Loaded train/validation/test runs differ from the saved resume split")

@@ -382,6 +382,30 @@ printf 'ARG=%s\\n' "$@"
         self.assertNotIn("--location-holdout", commands[0])
         self.assertIn("<--location-holdout> </split dir/split.json>", commands[1])
 
+    def test_random70_launcher_adds_the_per_design_split_to_the_no_shortcut_settings(self):
+        self.env.pop("WANDB_MODE", None)
+        self.stub("sbatch", """printf 'HOLDOUT=%s\\nFILM=%s\\nOCTAVES=[%s]\\nRESIDUAL=%s\\nPOOL_HEADFORM=%s\\n' \\
+    "$HOOD_MESH_LOCATION_HOLDOUT" "$HOOD_MESH_GEOMETRY_FILM" "$HOOD_MESH_GEOMETRY_FOURIER_OCTAVES" \\
+    "$HOOD_MESH_POOLING_QUERY_RESIDUAL" "$HOOD_MESH_POOL_IMPACTOR_NODES"
+printf 'IMPACTOR=%s\\nSTRIDE=%s\\nHIC=%s\\nK=%s\\nTEST=%s\\nVAL=%s\\nNAME=%s\\nTRACKING=%s\\n' \\
+    "$HOOD_MESH_IMPACTOR_NODES" "$HOOD_MESH_TIME_SUBSAMPLE_STRIDE" "$HOOD_MESH_HIC_RANGE_THRESHOLD_PERCENT" \\
+    "$HOOD_MESH_NEIGHBORHOOD_K" "$HOOD_MESH_TEST_DESIGNS" "$HOOD_MESH_VAL_DESIGNS" "$HOOD_MESH_RUN_NAME" "$WANDB_MODE"
+printf 'ARG=%s\\n' "$@"
+""")
+        self.env.update(HOOD_MESH_LOCATION_HOLDOUT="/stale/split.json", HOOD_MESH_GEOMETRY_FILM="all",
+                        HOOD_MESH_GEOMETRY_FOURIER_OCTAVES="5", HOOD_MESH_POOLING_QUERY_RESIDUAL="true",
+                        HOOD_MESH_TIME_SUBSAMPLE_STRIDE="4", HOOD_MESH_TEST_DESIGNS="10 11")
+        output = self.launch("submit_mesh_impact_history_1704_random70.sh")
+        split = self.shell_path(self.repo / "location_splits" / "euroncap1704_random70_seed42.json")
+        for expected in (f"HOLDOUT={split}", "FILM=none", "OCTAVES=[]", "RESIDUAL=false", "POOL_HEADFORM=false",
+                         "IMPACTOR=286", "STRIDE=16", "HIC=0", "K=256", "TEST=4 5", "VAL=11",
+                         "NAME=mesh_history_clusterB_k256_fourier_no_shortcuts_random70", "TRACKING=online",
+                         "ARG=--job-name=mesh_hist_random70", "ARG=--time=16:00:00"):
+            self.assertIn(expected, output)
+        self.assertIn("mesh_history_1704_random70_%j.out", output)
+        arguments = [line[4:] for line in output.splitlines() if line.startswith("ARG=")]
+        self.assertGreater(arguments.index("--time=16:00:00"), arguments.index("--time=08:00:00"))
+
     def test_geometry_film_launcher_adds_only_the_injection_to_the_no_shortcut_settings(self):
         self.env.pop("WANDB_MODE", None)
         self.stub("sbatch", """printf 'FILM=%s\\nOCTAVES=%s\\nRESIDUAL=%s\\nPOOL_HEADFORM=%s\\nIMPACTOR=%s\\n' \\

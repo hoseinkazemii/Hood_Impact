@@ -93,6 +93,18 @@ each) and cross-design HIC range (median 20%). Regenerate the file with
 it. Submit with `bash submit_mesh_impact_history_1704_location_holdout.sh`,
 which otherwise keeps the no-location-shortcut settings.
 
+### Per-design random locations
+
+`location_splits/euroncap1704_random70_seed42.json` keeps the design split
+(train 0-3, 6-10; validation 11; test 4, 5) but gives every design its own
+random 70% of the locations (99 of 142), drawn independently per design with
+seed 42. The same location may appear in train, validation and test: 891 / 99 /
+198 runs, and every test location is trained on some design. Designs 4 and 5
+share 72 locations, which the matched-location design sensitivity uses.
+Regenerate it with `python location_holdout.py --scheme per_design_random`
+(`--fraction`, `--seed`) and submit with
+`bash submit_mesh_impact_history_1704_random70.sh`.
+
 ## Train
 
 Run from the repository root using an environment with PyTorch, NumPy, pandas,
