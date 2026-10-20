@@ -74,8 +74,8 @@ def build_source_preprocessor(run_dir, data_dir, output_dir):
     return DataPreprocessor(config), config
 
 
-def infer_designs(run_dir, data_dir, designs, device, output_dir, progress_every=25):
-    """Predict every impact location of each design and pair it with the truth."""
+def infer_designs(run_dir, data_dir, designs, device, output_dir, progress_every=25, run_numbers=None):
+    """Predict design histories, optionally restricted to saved split run IDs."""
     run_dir = Path(run_dir).resolve()
     predictor = HistoryPredictor.from_run(run_dir, device=device)
     source, config = build_source_preprocessor(run_dir, data_dir, output_dir)
@@ -85,10 +85,15 @@ def infer_designs(run_dir, data_dir, designs, device, output_dir, progress_every
 
     histories, records = [], []
     started = time.perf_counter()
-    total = len(designs) * samples_per_design
+    selected_runs = None if run_numbers is None else {int(run) for run in run_numbers}
+    total = (len(designs) * samples_per_design if selected_runs is None else
+             sum(design * samples_per_design + location in selected_runs
+                 for design in designs for location in range(1, samples_per_design + 1)))
     for design in designs:
         for location in range(1, samples_per_design + 1):
             run_number = design * samples_per_design + location
+            if selected_runs is not None and run_number not in selected_runs:
+                continue
             mesh = source.load_mesh_geometry(run_number)
             impact = impact_coords.iloc[run_number - 1][["X1", "X2"]].to_numpy(np.float32)
             times, truth = source.load_acceleration_history(run_number)

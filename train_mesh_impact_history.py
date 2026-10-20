@@ -430,10 +430,10 @@ def initialize_wandb(args, initial_config, output_dir, logger):
 
 
 def export_predictions(path, dataset, predictions, targets):
-    """Flatten test histories in the same sequential order as the test loader."""
+    """Flatten histories in the dataset's sequential (unshuffled loader) order."""
     counts = [len(times) for times in dataset.time_arrays]
     if sum(counts) != len(predictions) or len(targets) != len(predictions):
-        raise ValueError("Test predictions do not match the sampled histories")
+        raise ValueError("Predictions do not match the sampled histories")
     pd.DataFrame({
         "run_number": np.repeat(dataset.run_numbers, counts),
         "time": np.concatenate(dataset.time_arrays),
@@ -714,6 +714,25 @@ def main(argv=None):
         logger.info("Matched-location design sensitivity: skill=%s, amplitude ratio=%s, alignment=%s; HIC15 skill=%s",
                     sensitivity["design_difference_skill"], sensitivity["difference_amplitude_ratio"],
                     sensitivity["difference_alignment_cosine"], sensitivity["hic15"]["design_difference_skill"])
+        from torch.utils.data import DataLoader
+        from evaluate_design_difference_r2 import (
+            design_difference_report, difference_log_values, write_design_difference_report,
+        )
+        # The training loader shuffles; export train histories in dataset order.
+        train_eval_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=False,
+                                       collate_fn=train_loader.collate_fn)
+        _, train_predictions, train_targets = evaluator.evaluate(train_eval_loader)
+        export_predictions(output_dir / "train_acceleration_histories.csv", train_dataset, train_predictions, train_targets)
+        difference = design_difference_report(config.data_format, config.samples_per_design, {
+            "train": (train_dataset, train_predictions, train_targets),
+            "test": (test_dataset, predictions, targets),
+        })
+        write_design_difference_report(output_dir, difference)
+        difference_values = difference_log_values(difference)
+        run.summary.update(difference_values)
+        run.log(difference_values)
+        logger.info("Near-clone design-difference R2 (acceleration): train=%s, test=%s",
+                    difference["train"]["r2"], difference["test"]["r2"])
         wandb.log({f"test/{key}": value for key, value in metrics.items() if np.isfinite(value)})
         logger.info("Best-checkpoint test metrics (acceleration in g): %s", metrics)
         logger.info("Finished. Run artifacts: %s", output_dir)

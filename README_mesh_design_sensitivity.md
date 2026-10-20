@@ -10,6 +10,27 @@ After the best validation checkpoint is evaluated, each new
 - `test_design_sensitivity_by_location.csv`: the same diagnostics at each matched location.
 - `test_design_sensitivity.png`: true/predicted spread and skill by location.
 
+- `train_acceleration_histories.csv`: best-checkpoint predictions for the training runs.
+- `design_difference_r2.json`: **near-clone design-difference R2, train and test separately.**
+
+`design_difference_r2.json` answers "does the model give near-identical designs
+different curves, and the right ones?". For two near-clone designs (same entry of
+`mesh_design_clusters.GEOMETRY_CLUSTERS`) at the same impact location, `d(t)` is the
+simulated acceleration difference and `p(t)` the predicted one; within a split,
+
+```text
+r2 = 1 - sum((p - d)^2) / sum((d - mean d)^2)     pooled over times, locations, pairs
+```
+
+0 means the same predicted curve for both designs, 1 is perfect, and below 0 means
+wrong differences. Train scores the near-clone pairs inside the training designs
+(12 pairs for the usual 0-3 / 6-9 split), test scores 4 vs 5. Only locations present
+for both designs count. Each split also records its pairs, matched-curve count and
+true/predicted difference RMS (g). W&B gets `train/design_difference_r2` and
+`test/design_difference_r2`. Formats other than `euroncap1704` have no cluster map,
+so their `r2` is `null`. Backfill a run that has both history CSVs with
+`python evaluate_design_difference_r2.py runs/mesh_impact_history/<run>`.
+
 The values are also logged to W&B under `test/design_sensitivity/`, with HIC15
 under `test/design_sensitivity/hic15/`. Existing `metrics.json` retains its
 ordinary acceleration metrics. The separate change-attention pipeline exports

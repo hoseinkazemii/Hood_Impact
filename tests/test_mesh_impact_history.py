@@ -407,8 +407,13 @@ class TrainingRoundTripTests(unittest.TestCase):
                 "prediction_times.npy", "training_history.json", "training_history.csv",
                 "training_history.png", "wandb_run.json",
                 "metrics.json", "test_acceleration_histories.csv",
+                "train_acceleration_histories.csv", "design_difference_r2.json",
             ):
                 self.assertTrue((run_dir / artifact).is_file(), artifact)
+            # The legacy format has no near-clone cluster map, so nothing is scored.
+            difference = json.loads((run_dir / "design_difference_r2.json").read_text(encoding="utf-8"))
+            self.assertIsNone(difference["train"]["r2"])
+            self.assertIsNone(difference["test"]["r2"])
 
             saved = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
             self.assertEqual(saved["architecture"]["name"], "MeshImpactHistoryNet")
@@ -467,6 +472,14 @@ class TrainingRoundTripTests(unittest.TestCase):
                 np.testing.assert_allclose(rows["time"], expected_times, rtol=1e-6, atol=1e-9)
                 np.testing.assert_allclose(rows["acceleration_true_g"], accelerations[run - 1][::stride], rtol=1e-6)
                 np.testing.assert_allclose(prediction_g, rows["acceleration_pred_g"], rtol=2e-5, atol=2e-5)
+            # Train histories come from an unshuffled pass, so rows follow run order.
+            exported_train = pd.read_csv(run_dir / "train_acceleration_histories.csv")
+            self.assertEqual(exported_train["run_number"].tolist(), np.repeat([1, 2], len(expected_times)).tolist())
+            for run in (1, 2):
+                rows = exported_train[exported_train["run_number"] == run]
+                np.testing.assert_allclose(rows["acceleration_true_g"], accelerations[run - 1][::stride], rtol=1e-6)
+                np.testing.assert_allclose(predictor.predict(meshes[run - 1], impacts[run - 1]),
+                                           rows["acceleration_pred_g"], rtol=2e-5, atol=2e-5)
 
             # Supplying the saved grid must not subsample it a second time.
             explicit_prediction = predictor.predict(meshes[4], impacts[4], sampled_time_points=predictor.time_points)

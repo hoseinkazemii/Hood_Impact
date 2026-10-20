@@ -154,3 +154,55 @@ def design_sensitivity_metrics(dataset, predictions, targets, samples_per_design
         "hic15": _summary(*hic_totals, unit=""),
         "per_location": per_location,
     }
+
+
+def near_clone_difference_r2(dataset, predictions, targets, samples_per_design, clusters):
+    """R2 of the acceleration difference curve between near-clone designs.
+
+    For every unordered pair of designs a < b in the same ``clusters`` entry and
+    every location both designs supply: d(t) = y_b(t) - y_a(t) from the targets,
+    p(t) the same from the predictions, and
+    ``r2 = 1 - sum((p - d)^2) / sum((d - mean d)^2)`` pooled over times,
+    locations and pairs. A model that gives every design the same curve at a
+    location (p = 0) scores about 0. ``r2`` is ``None`` without a matched pair.
+    Inputs follow ``design_sensitivity_metrics``.
+    """
+    runs = [int(run) for run in dataset.run_numbers]
+    prediction = np.asarray(predictions, dtype=np.float64).reshape(-1)
+    target = np.asarray(targets, dtype=np.float64).reshape(-1)
+    offsets = np.concatenate(([0], np.cumsum([len(time) for time in dataset.time_arrays])))
+    if len(runs) != len(dataset.time_arrays) or len(set(runs)) != len(runs):
+        raise ValueError("Run numbers must be unique and match the time grids")
+    if len(prediction) != offsets[-1] or len(target) != offsets[-1]:
+        raise ValueError("Flattened prediction/target length does not match the dataset time grids")
+    positions = getattr(dataset, "indentor_positions", None)
+    index = {((run - 1) // samples_per_design, (run - 1) % samples_per_design + 1): i for i, run in enumerate(runs)}
+    cluster_of = {int(design): name for name, members in clusters.items() for design in members}
+    designs = sorted({design for design, _ in index})
+    true_parts, predicted_parts, used_pairs = [], [], []
+    for a, b in combinations(designs, 2):
+        if a not in cluster_of or cluster_of[a] != cluster_of.get(b):
+            continue
+        locations = sorted(location for design, location in index if design == a and (b, location) in index)
+        for location in locations:
+            i, j = index[(a, location)], index[(b, location)]
+            if not np.array_equal(dataset.time_arrays[i], dataset.time_arrays[j]):
+                raise ValueError(f"Time grids differ for designs {a}/{b} at location {location}")
+            if positions is not None and not np.allclose(positions[i], positions[j], rtol=0, atol=1e-3):
+                raise ValueError(f"Impact XY mismatch for designs {a}/{b} at location {location}")
+            true_parts.append(target[offsets[j]:offsets[j + 1]] - target[offsets[i]:offsets[i + 1]])
+            predicted_parts.append(prediction[offsets[j]:offsets[j + 1]] - prediction[offsets[i]:offsets[i + 1]])
+        if locations:
+            used_pairs.append([a, b])
+    result = {"r2": None, "design_pairs": used_pairs, "num_matched_curves": len(true_parts),
+              "true_difference_rms_g": None, "predicted_difference_rms_g": None}
+    if not true_parts:
+        return result
+    true_delta, predicted_delta = np.concatenate(true_parts), np.concatenate(predicted_parts)
+    denominator = np.square(true_delta - true_delta.mean()).sum()
+    result.update(
+        r2=float(1 - np.square(predicted_delta - true_delta).sum() / denominator) if denominator > 0 else None,
+        true_difference_rms_g=float(np.sqrt(np.mean(true_delta ** 2))),
+        predicted_difference_rms_g=float(np.sqrt(np.mean(predicted_delta ** 2))),
+    )
+    return result

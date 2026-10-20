@@ -79,6 +79,9 @@ Data/HoodImpact_1704_EuroNCAP/
 Data/**/neighbor_graphs/
 Data/HoodImpact_NoiseFloor/inp_files/
 Data/HoodImpact_NoiseFloor/output_history_acc/
+Data/HoodImpact_SolverFactorial/inp_files/
+Data/HoodImpact_SolverFactorial/output_history_acc/
+Data/HoodImpact_1704_EuroNCAP/design_difference_cache/
 Data/mesh_geometry/
 
 # Generated acceleration-history media/data dumps
