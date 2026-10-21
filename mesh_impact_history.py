@@ -274,6 +274,13 @@ class MeshImpactHistoryNet(nn.Module):
     sites act on num_latents x width. Measured for a training step on 38,977-node
     meshes (width 128, k 256): 0.71 GiB per mesh uninjected, 0.83 with
     "latent", 0.90 with "all"; step time rises 2-4%.
+
+    ``node_extra_features`` appends that many per-node channels after XYZ, so
+    ``mesh`` has shape (N, 3 + node_extra_features). They enter the node
+    embedding only; neighborhoods, radial priors and the geometry memory keep
+    using the first three columns as coordinates. The common/residual model
+    (common_residual.py) uses them for the explicit deviation of a design from
+    its reference hood. With 0 (the default) the network is unchanged.
     """
 
     def __init__(
@@ -299,6 +306,7 @@ class MeshImpactHistoryNet(nn.Module):
         pool_impactor_nodes: bool = False,
         geometry_film: str = "none",
         geometry_fourier_octaves: int = 5,
+        node_extra_features: int = 0,
     ):
         super().__init__()
         integer_options = {
@@ -339,6 +347,9 @@ class MeshImpactHistoryNet(nn.Module):
             raise ValueError("neighborhood_scale_mm must be finite and positive")
         if isinstance(impactor_nodes, bool) or not isinstance(impactor_nodes, int) or impactor_nodes < 0:
             raise ValueError("impactor_nodes must be a nonnegative integer")
+        if (isinstance(node_extra_features, bool) or not isinstance(node_extra_features, int)
+                or node_extra_features < 0):
+            raise ValueError("node_extra_features must be a nonnegative integer")
         for name, value in (("pooling_query_residual", pooling_query_residual),
                             ("pool_impactor_nodes", pool_impactor_nodes)):
             if not isinstance(value, bool):
@@ -362,6 +373,7 @@ class MeshImpactHistoryNet(nn.Module):
         self.pooling_query_residual = pooling_query_residual
         self.pool_impactor_nodes = pool_impactor_nodes
         self.geometry_film = geometry_film
+        self.node_extra_features = node_extra_features
 
         # The shared preprocessor fits mesh and impact scalers independently.
         # Store their affine maps in the checkpoint so relative coordinates
@@ -372,7 +384,7 @@ class MeshImpactHistoryNet(nn.Module):
         self.register_buffer("impact_scale", torch.ones(2))
 
         self.node_embedding = nn.Sequential(
-            nn.Linear(3 if impact_conditioning == "film" else 6, width),
+            nn.Linear((3 if impact_conditioning == "film" else 6) + node_extra_features, width),
             nn.GELU(), nn.Linear(width, width),
             nn.LayerNorm(width),
         )
@@ -503,12 +515,13 @@ class MeshImpactHistoryNet(nn.Module):
         return mesh[:, :2] - impact_mesh_xy
 
     def node_features(self, mesh: Tensor, impact: Tensor) -> Tensor:
-        """Use XYZ only for FiLM; retain six features for historical runs."""
+        """Use XYZ (+ extra channels) for FiLM; retain six features for historical runs."""
         if self.impact_conditioning == "film":
             return mesh
-        relative_xy = self.impact_relative_xy(mesh, impact)
+        coordinates = mesh[:, :3]
+        relative_xy = self.impact_relative_xy(coordinates, impact)
         radius_squared = relative_xy.square().sum(dim=-1, keepdim=True)
-        return torch.cat((mesh, relative_xy, radius_squared), dim=-1)
+        return torch.cat((coordinates, relative_xy, radius_squared, mesh[:, 3:]), dim=-1)
 
     def _encode_neighborhoods(self, mesh: Tensor, nodes: Tensor, node_geometry: Tensor | None = None) -> Tensor:
         """Run local attention over the structural nodes, in input order.
@@ -526,7 +539,7 @@ class MeshImpactHistoryNet(nn.Module):
         """
         # Undo anisotropic standardization; the omitted mean is a common
         # translation and cannot change distances or relative positions.
-        coordinates = mesh[self.impactor_nodes:] * self.mesh_scale
+        coordinates = mesh[self.impactor_nodes:, :3] * self.mesh_scale
         if len(coordinates) < 2:
             raise ValueError(
                 f"Neighborhood attention needs at least two structural nodes; "
@@ -535,7 +548,7 @@ class MeshImpactHistoryNet(nn.Module):
         neighbors = self.neighbor_cache.neighbors(coordinates, self.neighborhood_k)
         updated = nodes[self.impactor_nodes:]
         if self.geometry_film == "all" and node_geometry is None:
-            node_geometry = self.geometry_encoder(mesh)
+            node_geometry = self.geometry_encoder(mesh[:, :3])
         for index, block in enumerate(self.neighborhood_blocks):
             updated = block(updated, coordinates, neighbors)
             if self.geometry_film == "all":
@@ -608,7 +621,7 @@ class MeshImpactHistoryNet(nn.Module):
 
     def _encode_mesh_and_geometry(self, mesh: Tensor, impact: Tensor, condition: Tensor):
         """Return (memory tokens, per-token geometry memory or None) for one mesh."""
-        node_geometry = self.geometry_encoder(mesh) if self.geometry_film != "none" else None
+        node_geometry = self.geometry_encoder(mesh[:, :3]) if self.geometry_film != "none" else None
         tokens, query, key, value, spatial_bias = self._mesh_pooling_inputs(mesh, impact, condition, node_geometry)
         attention_mask = spatial_bias.to(query.dtype)[None, None, :, :]
         update = F.scaled_dot_product_attention(
@@ -637,8 +650,9 @@ class MeshImpactHistoryNet(nn.Module):
     ) -> None:
         if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
             raise ValueError("batch_size must be a positive integer")
-        if mesh.ndim != 2 or mesh.shape[1] != 3 or mesh.shape[0] == 0:
-            raise ValueError("mesh must have shape (N, 3) with at least one node")
+        columns = 3 + self.node_extra_features
+        if mesh.ndim != 2 or mesh.shape[1] != columns or mesh.shape[0] == 0:
+            raise ValueError(f"mesh must have shape (N, {columns}) with at least one node")
         if indentor.shape != (batch_size, 2):
             raise ValueError("indentor must have shape (batch_size, 2)")
         if time.ndim != 1 or time.numel() == 0:
@@ -673,7 +687,8 @@ class MeshImpactHistoryNet(nn.Module):
         """Return one normalized acceleration per input time, in the same order.
 
         Args:
-            mesh: Normalized XYZ nodes, shape (sum_nodes, 3).
+            mesh: Normalized XYZ nodes, shape (sum_nodes, 3), followed by
+                ``node_extra_features`` extra channels when that is nonzero.
             mesh_batch: Mesh sample membership, shape (sum_nodes,).
             indentor: Normalized impact XY for each sample, shape (B, 2).
             time: Normalized, already-subsampled times, shape (sum_times,).
