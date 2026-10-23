@@ -39,9 +39,11 @@ class LatentMixingBlock(nn.Module):
         )
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, tokens: Tensor) -> Tensor:
+    def forward(self, tokens: Tensor, padding_mask: Tensor | None = None) -> Tensor:
+        """``padding_mask`` (B, L), True for padded tokens, keeps them out of the keys."""
         normalized = self.attention_norm(tokens)
-        update = self.attention(normalized, normalized, normalized, need_weights=False)[0]
+        update = self.attention(normalized, normalized, normalized,
+                                key_padding_mask=padding_mask, need_weights=False)[0]
         tokens = tokens + self.dropout(update)
         return tokens + self.dropout(self.feedforward(self.feedforward_norm(tokens)))
 
@@ -644,6 +646,17 @@ class MeshImpactHistoryNet(nn.Module):
         )
         return memory, geometry.squeeze(0).transpose(0, 1).reshape(self.num_latents, self.width)
 
+    def _decoder_context(self, mesh: Tensor, mesh_batch: Tensor, indentor: Tensor, batch_size: int):
+        """A second memory the decoder reads after each block; none in this network.
+
+        DesignChangeHistoryNet (mesh_design_change.py) returns its change-node
+        tokens here and reads them in ``_read_decoder_context``.
+        """
+        return None
+
+    def _read_decoder_context(self, index: int, queries: Tensor, context) -> Tensor:
+        raise NotImplementedError("_decoder_context returned a context without a reader")
+
     def _validate_inputs(
         self, mesh: Tensor, mesh_batch: Tensor, indentor: Tensor,
         time: Tensor, time_batch: Tensor, batch_size: int,
@@ -730,8 +743,11 @@ class MeshImpactHistoryNet(nn.Module):
         queries = self.time_embedding(time_features)
         if self.impact_conditioning == "legacy_additive":
             queries = queries + condition[:, None, :]
-        for block in self.decoder_blocks:
+        decoder_context = self._decoder_context(mesh, mesh_batch, indentor, batch_size)
+        for index, block in enumerate(self.decoder_blocks):
             queries = block(queries, memory, padding_mask)
+            if decoder_context is not None:
+                queries = self._read_decoder_context(index, queries, decoder_context)
         padded_acceleration = self.acceleration_head(queries).squeeze(-1)
 
         # Restore even interleaved input time batches without cross-sample

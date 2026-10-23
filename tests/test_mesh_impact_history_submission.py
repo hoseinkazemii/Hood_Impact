@@ -456,6 +456,51 @@ printf 'ARG=%s\\n' "$@"
             self.assertIn("<--geometry-fourier-octaves> <5>", command)
         self.assertIn("Geometry memory FiLM: all", output)
 
+    def test_design_change_launcher_adds_only_the_change_path_to_the_no_shortcut_settings(self):
+        self.env.pop("WANDB_MODE", None)
+        self.stub("sbatch", """printf 'CHANGE=%s\\nCHANGE_LAYERS=%s\\nCHANGE_OCTAVES=%s\\nFILM=%s\\n' \\
+    "$HOOD_MESH_DESIGN_CHANGE_NODES" "$HOOD_MESH_DESIGN_CHANGE_LAYERS" "$HOOD_MESH_DESIGN_CHANGE_FOURIER_OCTAVES" \\
+    "$HOOD_MESH_GEOMETRY_FILM"
+printf 'RESIDUAL=%s\\nPOOL_HEADFORM=%s\\nIMPACTOR=%s\\nSTRIDE=%s\\nHIC=%s\\nCUTOFF=[%s]\\nHOLDOUT=[%s]\\n' \\
+    "$HOOD_MESH_POOLING_QUERY_RESIDUAL" "$HOOD_MESH_POOL_IMPACTOR_NODES" "$HOOD_MESH_IMPACTOR_NODES" \\
+    "$HOOD_MESH_TIME_SUBSAMPLE_STRIDE" "$HOOD_MESH_HIC_RANGE_THRESHOLD_PERCENT" "$HOOD_MESH_MAX_TRAIN_TIME" \\
+    "$HOOD_MESH_LOCATION_HOLDOUT"
+printf 'K=%s\\nLAYERS=%s\\nTIME=%s\\nIMPACT=%s\\nTEST=%s\\nVAL=%s\\nEPOCHS=%s\\nBATCH=%s\\nSEED=%s\\n' \\
+    "$HOOD_MESH_NEIGHBORHOOD_K" "$HOOD_MESH_NEIGHBORHOOD_LAYERS" "$HOOD_MESH_TIME_ENCODING" \\
+    "$HOOD_MESH_IMPACT_CONDITIONING" "$HOOD_MESH_TEST_DESIGNS" "$HOOD_MESH_VAL_DESIGNS" "$HOOD_MESH_EPOCHS" \\
+    "$HOOD_MESH_BATCH_SIZE" "$HOOD_MESH_SEED"
+printf 'NAME=%s\\nTRACKING=%s\\n' "$HOOD_MESH_RUN_NAME" "$WANDB_MODE"
+printf 'ARG=%s\\n' "$@"
+""")
+        # Stale exports from other experiments must not leak into the comparison.
+        self.env.update(HOOD_MESH_GEOMETRY_FILM="all", HOOD_MESH_POOLING_QUERY_RESIDUAL="true",
+                        HOOD_MESH_POOL_IMPACTOR_NODES="true", HOOD_MESH_TIME_SUBSAMPLE_STRIDE="4",
+                        HOOD_MESH_HIC_RANGE_THRESHOLD_PERCENT="30", HOOD_MESH_MAX_TRAIN_TIME="0.02",
+                        HOOD_MESH_LOCATION_HOLDOUT="/stale/split.json", HOOD_MESH_NEIGHBORHOOD_K="16",
+                        HOOD_MESH_TEST_DESIGNS="10 11")
+        output = self.launch("submit_mesh_impact_history_1704_design_change_nodes.sh")
+        for expected in ("CHANGE=true", "CHANGE_LAYERS=2", "CHANGE_OCTAVES=5", "FILM=none", "RESIDUAL=false",
+                         "POOL_HEADFORM=false", "IMPACTOR=286", "STRIDE=16", "HIC=0", "CUTOFF=[]", "HOLDOUT=[]",
+                         "K=256", "LAYERS=2", "TIME=fourier", "IMPACT=film", "TEST=4 5", "VAL=11", "EPOCHS=100",
+                         "BATCH=8", "SEED=42",
+                         "NAME=mesh_history_clusterB_k256_fourier_no_shortcuts_design_change_nodes",
+                         "TRACKING=online", "ARG=--job-name=mesh_hist_design_change", "ARG=--time=24:00:00"):
+            self.assertIn(expected, output)
+        self.assertIn("mesh_history_1704_design_change_nodes_%j.out", output)
+        arguments = [line[4:] for line in output.splitlines() if line.startswith("ARG=")]
+        self.assertGreater(arguments.index("--time=24:00:00"), arguments.index("--time=08:00:00"))
+        # The batch job hands the change path to both preflight and training.
+        self.env.update(HOOD_MESH_DESIGN_CHANGE_NODES="true", HOOD_MESH_DESIGN_CHANGE_LAYERS="2",
+                        HOOD_MESH_DESIGN_CHANGE_FOURIER_OCTAVES="5")
+        output = self.launch("run_mesh_impact_history_1704.sbatch")
+        commands = [line for line in output.splitlines() if line.startswith("PYTHON")]
+        self.assertEqual(len(commands), 2)
+        for command in commands:
+            self.assertIn("<--design-change-nodes> <true>", command)
+            self.assertIn("<--design-change-layers> <2>", command)
+            self.assertIn("<--design-change-fourier-octaves> <5>", command)
+        self.assertIn("Design-change nodes: true", output)
+
     def test_batch_runs_directly_with_broken_srun_and_preserves_gpu_decoder_and_split(self):
         self.env["CUDA_VISIBLE_DEVICES"] = "GPU-allocated-by-slurm"
         for decoder in ("", "temporal", "mesh_only"):

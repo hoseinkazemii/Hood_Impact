@@ -66,6 +66,10 @@ MODEL_DEFAULTS = {
     "geometry_fourier_octaves": 5,
 }
 BOOLEAN_MODEL_KEYS = tuple(key for key, value in MODEL_DEFAULTS.items() if isinstance(value, bool))
+# Decoder path over the near-clone change nodes (mesh_design_change.py), used
+# with --design-change-nodes true; these keys reach only that model.
+DESIGN_CHANGE_DEFAULTS = {"design_change_layers": 2, "design_change_fourier_octaves": 5}
+ARCHITECTURES = ("MeshImpactHistoryNet", "DesignChangeHistoryNet")
 # Fresh experiments hold out the whole B cluster. Resumes restore saved splits.
 DEFAULT_TEST_DESIGNS = (4, 5)
 DEFAULT_VAL_DESIGNS = (11,)
@@ -152,6 +156,13 @@ def parse_args(argv=None):
         help="Geometry memory FiLM: latent re-injects after each latent mixing block; "
              "all also after each neighborhood block; none is the uninjected network.",
     )
+    parser.add_argument(
+        "--design-change-nodes", type=parse_boolean, default=False, metavar="{true,false}",
+        help="Give each node that differs between near-clone designs its own token, read by the "
+             "decoder after every block (DesignChangeHistoryNet); false is the plain network.",
+    )
+    for key, default in DESIGN_CHANGE_DEFAULTS.items():
+        parser.add_argument(f"--{key.replace('_', '-')}", type=type(default), default=default)
     parser.add_argument("--output-dir", help="New run directory; defaults to runs/mesh_impact_history/<timestamp>.")
     parser.add_argument("--neighbor-cache-dir", help="Shared persistent kNN directory; defaults to neighbor_graphs beside inp_files.")
     parser.add_argument("--resume-from", help="Prior run directory (latest, else best checkpoint) or checkpoint file; writes a new run.")
@@ -191,12 +202,14 @@ def restore_resume_arguments(args, parser, argv):
         if not path.is_file():
             parser.error(f"Missing resume artifact: {path}")
     saved = json.loads((source_dir / "config.json").read_text(encoding="utf-8"))
-    if saved.get("format_version") != 1 or saved.get("architecture", {}).get("name") != "MeshImpactHistoryNet":
-        parser.error("Resume requires a supported MeshImpactHistoryNet run")
+    architecture = saved.get("architecture", {}).get("name")
+    if saved.get("format_version") != 1 or architecture not in ARCHITECTURES:
+        parser.error(f"Resume requires a supported run of {' or '.join(ARCHITECTURES)}")
     if saved["training"].get("loss", "normalized_acceleration_mse") != "normalized_acceleration_mse":
         parser.error("This checkpoint used a different training objective; start a fresh acceleration-MSE run")
     splits = json.loads((source_dir / "splits.json").read_text(encoding="utf-8"))
-    settings = {**MODEL_DEFAULTS, **saved_model_kwargs(saved["architecture"]["kwargs"]),
+    settings = {**MODEL_DEFAULTS, **DESIGN_CHANGE_DEFAULTS, **saved_model_kwargs(saved["architecture"]["kwargs"]),
+                "design_change_nodes": architecture == "DesignChangeHistoryNet",
                 **{key: saved["data"][key] for key in ("data_format", "num_samples", "samples_per_design")},
                 **{key: saved["training"][key] for key in ("batch_size", "weight_decay", "seed")},
                 "epochs": saved["training"]["num_epochs"],
@@ -259,6 +272,8 @@ def build_config(args):
             raise ValueError("HIC location filtering requires the complete 12 x 142 euroncap1704 dataset")
     if args.location_holdout is not None and (config.data_format != "euroncap1704" or config.samples_per_design != 142):
         raise ValueError("The location holdout is defined on the 142-location euroncap1704 grid")
+    if args.design_change_nodes and (config.data_format != "euroncap1704" or config.samples_per_design != 142):
+        raise ValueError("Design-change nodes are found from the 142-location euroncap1704 decks")
     return config
 
 
@@ -323,9 +338,10 @@ def resolved_config(config, args, model_kwargs, prediction_grid):
     )
     data_config = {key: getattr(config, key) for key in data_keys}
     data_config.update({key: str(Path(getattr(config, key)).resolve()) for key in path_keys})
+    architecture = "DesignChangeHistoryNet" if getattr(args, "design_change_nodes", False) else "MeshImpactHistoryNet"
     return {
         "format_version": 1,
-        "architecture": {"name": "MeshImpactHistoryNet", "kwargs": model_kwargs},
+        "architecture": {"name": architecture, "kwargs": model_kwargs},
         "data": data_config,
         "location_filter": getattr(args, "location_filter_report", None),
         "location_holdout": getattr(args, "location_holdout_report", None),
@@ -460,7 +476,7 @@ class HistoryPredictor:
         run_dir = Path(output_dir)
         saved = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
         architecture_name = saved.get("architecture", {}).get("name")
-        if saved.get("format_version") != 1 or architecture_name not in ("MeshImpactHistoryNet", "MeshChangeAttentionNet"):
+        if saved.get("format_version") != 1 or architecture_name not in (*ARCHITECTURES, "MeshChangeAttentionNet"):
             raise ValueError("This directory is not a supported mesh history run")
         config = SimpleNamespace(**saved["preprocessing"], device=torch.device(device))
         preprocessor = DataPreprocessor(config)
@@ -469,9 +485,16 @@ class HistoryPredictor:
         if architecture_name == "MeshChangeAttentionNet":
             from mesh_change_attention import MeshChangeAttentionNet
             model_class = MeshChangeAttentionNet
+        elif architecture_name == "DesignChangeHistoryNet":
+            from mesh_design_change import DesignChangeHistoryNet
+            model_class = DesignChangeHistoryNet
         model = model_class(**saved_model_kwargs(saved["architecture"]["kwargs"]))
         checkpoint = torch.load(run_dir / CHECKPOINT_NAME, map_location="cpu", weights_only=True)
         model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+        if architecture_name == "DesignChangeHistoryNet":
+            # Only hoods saved with the run are known; DesignChangeTable.register adds others.
+            from mesh_design_change import TABLE_FILE, DesignChangeTable
+            model.design_changes = DesignChangeTable.load(run_dir / TABLE_FILE)
         if model.neighborhood_blocks:
             from mesh_neighborhood import default_neighbor_cache_directory
             stored = (saved.get("neighbor_graph_cache") or {}).get("directory")
@@ -555,8 +578,13 @@ def main(argv=None):
     run = None
     try:
         model_kwargs = {key: getattr(args, key) for key in MODEL_DEFAULTS}
-        model = MeshImpactHistoryNet(**model_kwargs)
-        logger.info("MeshImpactHistoryNet: %s", model_kwargs)
+        if args.design_change_nodes:
+            from mesh_design_change import DesignChangeHistoryNet
+            model_kwargs.update({key: getattr(args, key) for key in DESIGN_CHANGE_DEFAULTS})
+            model = DesignChangeHistoryNet(**model_kwargs)
+        else:
+            model = MeshImpactHistoryNet(**model_kwargs)
+        logger.info("%s: %s", type(model).__name__, model_kwargs)
         if source_dir is not None:
             logger.info("Resume: %s | completed epochs: %s | next epoch: %s/%s",
                         args.resume_from, completed, completed + 1, config.num_epochs)
@@ -570,6 +598,17 @@ def main(argv=None):
         run = initialize_wandb(
             args, resolved_config(config, args, model_kwargs, prediction_grid=None), output_dir, logger,
         )
+        if args.design_change_nodes:
+            # Geometry only, from every deck (held-out designs included, as their
+            # change nodes come from their near-clones); no history is read.
+            from design_change_nodes import find_design_changes
+            design_changes, design_change_report = find_design_changes(
+                Path(config.inp_dir).parent, range(config.num_samples // config.samples_per_design),
+                config.samples_per_design,
+            )
+            for cluster in design_change_report["clusters"]:
+                logger.info("Design-change nodes: cluster %s | base %s | %s nodes",
+                            cluster["designs"], cluster["base"], cluster["change_nodes"])
         preprocessor = DataPreprocessor(config)
         data = preprocessor.load_all_data()
         validate_data(data)
@@ -619,7 +658,19 @@ def main(argv=None):
             preprocessor.indentor_scaler.mean_, preprocessor.indentor_scaler.scale_,
         )
         model.set_time_scaler(preprocessor.time_scaler.mean_[0], preprocessor.time_scaler.scale_[0])
-        first_times = np.asarray(train_dataset.time_arrays[0], dtype=np.float32)
+        if args.design_change_nodes:
+            from mesh_design_change import TABLE_FILE, DesignChangeTable, register_design_changes
+            design_change_report["registration"] = register_design_changes(
+                model, design_changes, data["mesh_geometries"],
+                [run_to_design_id(run, config.samples_per_design) for run in data["run_numbers"]],
+                preprocessor.transform_mesh,
+            )
+            if source_dir is not None and not model.design_changes.same_as(DesignChangeTable.load(source_dir / TABLE_FILE)):
+                raise ValueError("The design-change table differs from the resume run's; the decks or scalers changed")
+            model.design_changes.save(output_dir / TABLE_FILE)
+            write_json(output_dir / "design_change_nodes.json", design_change_report)
+            logger.info("Design-change table: %s", design_change_report["registration"])
+        first_times =np.asarray(train_dataset.time_arrays[0], dtype=np.float32)
         if source_dir is not None and not np.array_equal(
                 first_times, np.load(source_dir / "prediction_times.npy", allow_pickle=False)):
             raise ValueError("Loaded prediction time grid differs from the resume run")
@@ -654,6 +705,10 @@ def main(argv=None):
         if not matching_grid:
             logger.warning("Loaded runs have different sampled time grids. Default inference uses training run %s; pass sampled_time_points for another already-subsampled grid.", train_dataset.run_numbers[0])
         saved_config = resolved_config(config, args, model_kwargs, prediction_grid)
+        if args.design_change_nodes:
+            saved_config["design_change"] = {key: design_change_report[key]
+                                             for key in ("rule", "static_channels", "clusters", "registration")}
+            saved_config["design_change"]["file"] = "design_change_nodes.json"
         if source_dir is not None:
             saved_config["training"]["resumed_after_epoch"] = completed
         write_json(output_dir / "config.json", saved_config)

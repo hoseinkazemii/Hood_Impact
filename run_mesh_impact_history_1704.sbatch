@@ -62,6 +62,7 @@ else
     printf 'Test designs: %s | Validation designs: %s\n' "${TEST_DESIGNS[*]}" "${VAL_DESIGNS[*]}"
     printf 'Decoder arm: %s\n' "${DECODER}"
     printf 'Geometry memory FiLM: %s\n' "${HOOD_MESH_GEOMETRY_FILM:-none}"
+    printf 'Design-change nodes: %s\n' "${HOOD_MESH_DESIGN_CHANGE_NODES:-false}"
 fi
 printf 'W&B: %s | project: %s | entity: %s\n' "${WANDB_MODE}" "${WANDB_PROJECT}" "${WANDB_ENTITY:-default team}"
 module list 2>&1 || true
@@ -80,6 +81,8 @@ for option in NEIGHBORHOOD_LAYERS:neighborhood-layers NEIGHBORHOOD_K:neighborhoo
     TIME_ENCODING:time-encoding FOURIER_NUM_FREQUENCIES:fourier-num-frequencies \
     FOURIER_MIN_FREQUENCY_HZ:fourier-min-frequency-hz FOURIER_MAX_FREQUENCY_HZ:fourier-max-frequency-hz \
     GEOMETRY_FILM:geometry-film GEOMETRY_FOURIER_OCTAVES:geometry-fourier-octaves \
+    DESIGN_CHANGE_NODES:design-change-nodes DESIGN_CHANGE_LAYERS:design-change-layers \
+    DESIGN_CHANGE_FOURIER_OCTAVES:design-change-fourier-octaves \
     BATCH_SIZE:batch-size TIME_SUBSAMPLE_STRIDE:time-subsample-stride MAX_TRAIN_TIME:max-train-time; do
     variable="HOOD_MESH_${option%%:*}"
     if [[ -n "${!variable}" ]]; then

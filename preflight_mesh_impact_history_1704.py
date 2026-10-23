@@ -26,9 +26,11 @@ from train_mesh_impact_history import (
     DECODER_BLOCKS,
     DEFAULT_TEST_DESIGNS,
     DEFAULT_VAL_DESIGNS,
+    DESIGN_CHANGE_DEFAULTS,
     MODEL_DEFAULTS,
     MeshImpactHistoryNet,
     add_model_arguments,
+    parse_boolean,
     parse_args as parse_training_args,
     resolve_splits,
     validate_data,
@@ -238,8 +240,14 @@ def validate_runtime(require_cuda):
         raise ValueError("CUDA was requested but is unavailable in this Python environment")
 
 
-def validate_cuda_model(data, decoder=MODEL_DEFAULTS["decoder"], neighbor_cache_dir=None, **neighborhood_options):
-    """Exercise the selected decoder and learned spatial-bias gradients."""
+def validate_cuda_model(data, decoder=MODEL_DEFAULTS["decoder"], neighbor_cache_dir=None,
+                        design_changes=None, design_change_options=None, **neighborhood_options):
+    """Exercise the selected decoder and learned spatial-bias gradients.
+
+    With ``design_changes`` (find_design_changes output) the probe is a
+    DesignChangeHistoryNet whose first run is read with an edited design's
+    change nodes, so the change readouts must receive a gradient.
+    """
     # Standardize this one example only for numerical stability in the probe.
     # These temporary statistics never reach training or a saved checkpoint.
     mesh = np.asarray(data["mesh_geometries"][0], dtype=np.float32)
@@ -253,10 +261,18 @@ def validate_cuda_model(data, decoder=MODEL_DEFAULTS["decoder"], neighbor_cache_
     time = np.asarray(data["time_arrays"][0], dtype=np.float32)
     time_mean, time_scale = float(time.mean()), max(float(time.std()), 1e-6)
     time = torch.as_tensor((time - time_mean) / time_scale, device="cuda")
-    model = MeshImpactHistoryNet(
-        width=16, num_heads=2, num_latents=4, latent_layers=1,
-        temporal_layers=1, dropout=0.0, decoder=decoder, **neighborhood_options,
-    ).to("cuda")
+    model_kwargs = dict(width=16, num_heads=2, num_latents=4, latent_layers=1,
+                        temporal_layers=1, dropout=0.0, decoder=decoder, **neighborhood_options)
+    if design_changes is None:
+        model = MeshImpactHistoryNet(**model_kwargs).to("cuda")
+    else:
+        from mesh_design_change import DesignChangeHistoryNet, DesignChangeTable
+        model = DesignChangeHistoryNet(**model_kwargs, **design_change_options).to("cuda")
+        # Wiring probe only: training registers each design's own meshes instead.
+        edited = next(design for design, change in sorted(design_changes.items())
+                      if np.abs(change["static"][:, 3:6]).max(initial=0) > 0)
+        model.design_changes = DesignChangeTable.from_changes(design_changes)
+        model.design_changes.register(mesh[model.impactor_nodes:], edited)
     model.set_coordinate_scalers(mean, scale, mean[:2], scale[:2])
     model.set_time_scaler(time_mean, time_scale)
     if model.neighborhood_blocks and neighbor_cache_dir is not None:
@@ -288,11 +304,16 @@ def validate_cuda_model(data, decoder=MODEL_DEFAULTS["decoder"], neighbor_cache_
         heads = [*model.latent_geometry_film, *getattr(model, "node_geometry_film", ())]
         if any(head.affine.weight.grad is None or not head.affine.weight.grad.abs().sum() > 0 for head in heads):
             raise ValueError("CUDA model probe produced no gradient for a geometry FiLM head")
+    if design_changes is not None and any(
+            readout.output.weight.grad is None or not readout.output.weight.grad.abs().sum() > 0
+            for readout in model.change_readouts):
+        raise ValueError("CUDA model probe produced no gradient for a design-change readout")
     torch.cuda.synchronize()
     print(f"GPU: {torch.cuda.get_device_name(0)} | decoder={decoder} | "
           f"time_encoding={model.time_encoding} ({model.time_feature_count} features) | "
           f"neighborhood_layers={len(model.neighborhood_blocks)} | "
-          f"geometry_film={model.geometry_film} forward/backward: passed")
+          f"geometry_film={model.geometry_film} | design_change_nodes={design_changes is not None} "
+          f"forward/backward: passed")
     if model.neighborhood_blocks:
         print(f"Neighbor graph cache: built={model.neighbor_cache.builds} | loaded from disk={model.neighbor_cache.disk_hits}")
 
@@ -307,6 +328,9 @@ def parse_args(argv=None):
     parser.add_argument("--val-designs", type=int, nargs="+", default=list(DEFAULT_VAL_DESIGNS))
     parser.add_argument("--decoder", choices=sorted(DECODER_BLOCKS), default=MODEL_DEFAULTS["decoder"])
     add_model_arguments(parser, EXPERIMENT_MODEL_KEYS)
+    parser.add_argument("--design-change-nodes", type=parse_boolean, default=False, metavar="{true,false}")
+    for key, default in DESIGN_CHANGE_DEFAULTS.items():
+        parser.add_argument(f"--{key.replace('_', '-')}", type=type(default), default=default)
     parser.add_argument("--batch-size", type=int, default=Config.batch_size)
     parser.add_argument("--time-subsample-stride", type=int, default=Config.time_subsample_stride)
     parser.add_argument("--max-train-time", type=float, default=Config.max_train_time)
@@ -320,7 +344,8 @@ def parse_args(argv=None):
         if saved.data_format != "euroncap1704" or saved.num_samples != NUM_RUNS or saved.samples_per_design != SAMPLES_PER_DESIGN:
             parser.error("The 1704 resume launcher requires a full euroncap1704 run")
         for key in (*EXPERIMENT_MODEL_KEYS, "decoder", "test_designs", "val_designs",
-                    "batch_size", "time_subsample_stride", "max_train_time"):
+                    "batch_size", "time_subsample_stride", "max_train_time",
+                    "design_change_nodes", *DESIGN_CHANGE_DEFAULTS):
             setattr(args, key, getattr(saved, key))
         if args.data_root is None:
             args.data_root = str(Path(saved.inp_dir).parent)
@@ -352,9 +377,19 @@ def main(argv=None):
             print("WARNING: --impactor-nodes 0 keeps the moving headform in the local graph, "
                   "so the neighbor graph is rebuilt for every run instead of once per design")
         data, source_count, cutoff_count = validate_first_run(root, impact_xy, args)
+        design_changes = None
+        if args.design_change_nodes:
+            # Parses every deck once (cached for training) and checks the base rule.
+            from design_change_nodes import find_design_changes
+            design_changes, report = find_design_changes(root, range(NUM_DESIGNS), SAMPLES_PER_DESIGN)
+            print("Design-change nodes: " + " | ".join(
+                f"cluster {cluster['designs']} base {cluster['base']}: {cluster['change_nodes']} nodes"
+                for cluster in report["clusters"]))
         if args.require_cuda:
             validate_cuda_model(data, decoder=args.decoder,
-                                neighbor_cache_dir=args.neighbor_cache_dir or root / "neighbor_graphs", **{
+                                neighbor_cache_dir=args.neighbor_cache_dir or root / "neighbor_graphs",
+                                design_changes=design_changes,
+                                design_change_options={key: getattr(args, key) for key in DESIGN_CHANGE_DEFAULTS}, **{
                 key: getattr(args, key) for key in EXPERIMENT_MODEL_KEYS
             })
         print(f"Dataset: {root} | {NUM_RUNS} mesh/history pairs and impact XY rows")
