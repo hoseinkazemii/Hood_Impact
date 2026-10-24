@@ -58,8 +58,10 @@ printf 'Training: %s epochs | batch %s | lr %s | weight decay %s | seed %s | pla
 printf 'W&B tracking: %s (startup retries online; WANDB_MODE=offline records to disk only)\n' "${WANDB_MODE}"
 mkdir -p "${PROJECT_DIR}/runs/slurm"
 # The baseline needed 11.5 h on one GH200; the change path adds a few percent.
+# 14 h leaves margin while still backfilling (job 3440305 queued ~1.5 days at 24 h);
+# a timeout resumes from the latest checkpoint via the *_resume.sh wrapper.
 exec bash "${PROJECT_DIR}/submit_mesh_impact_history_1704_fourier_k256.sh" \
-    --job-name=mesh_hist_design_change --time=24:00:00 \
+    --job-name=mesh_hist_design_change --time=14:00:00 \
     --output="${PROJECT_DIR}/runs/slurm/mesh_history_1704_design_change_nodes_%j.out" \
     --error="${PROJECT_DIR}/runs/slurm/mesh_history_1704_design_change_nodes_%j.err" \
     "$@"

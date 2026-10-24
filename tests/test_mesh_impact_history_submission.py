@@ -484,11 +484,11 @@ printf 'ARG=%s\\n' "$@"
                          "K=256", "LAYERS=2", "TIME=fourier", "IMPACT=film", "TEST=4 5", "VAL=11", "EPOCHS=100",
                          "BATCH=8", "SEED=42",
                          "NAME=mesh_history_clusterB_k256_fourier_no_shortcuts_design_change_nodes",
-                         "TRACKING=online", "ARG=--job-name=mesh_hist_design_change", "ARG=--time=24:00:00"):
+                         "TRACKING=online", "ARG=--job-name=mesh_hist_design_change", "ARG=--time=14:00:00"):
             self.assertIn(expected, output)
         self.assertIn("mesh_history_1704_design_change_nodes_%j.out", output)
         arguments = [line[4:] for line in output.splitlines() if line.startswith("ARG=")]
-        self.assertGreater(arguments.index("--time=24:00:00"), arguments.index("--time=08:00:00"))
+        self.assertGreater(arguments.index("--time=14:00:00"), arguments.index("--time=08:00:00"))
         # The batch job hands the change path to both preflight and training.
         self.env.update(HOOD_MESH_DESIGN_CHANGE_NODES="true", HOOD_MESH_DESIGN_CHANGE_LAYERS="2",
                         HOOD_MESH_DESIGN_CHANGE_FOURIER_OCTAVES="5")
@@ -500,6 +500,39 @@ printf 'ARG=%s\\n' "$@"
             self.assertIn("<--design-change-layers> <2>", command)
             self.assertIn("<--design-change-fourier-octaves> <5>", command)
         self.assertIn("Design-change nodes: true", output)
+
+    def test_design_change_sweep_variants_pin_only_their_own_settings(self):
+        self.stub("sbatch", """printf 'CHANGE=%s\\nLAYERS=%s\\nOCTAVES=%s\\nDROPOUT=%s\\nWD=%s\\n' \\
+    "$HOOD_MESH_DESIGN_CHANGE_NODES" "$HOOD_MESH_DESIGN_CHANGE_LAYERS" "$HOOD_MESH_DESIGN_CHANGE_FOURIER_OCTAVES" \\
+    "$HOOD_MESH_DROPOUT" "$HOOD_MESH_WEIGHT_DECAY"
+printf 'EPOCHS=%s\\nBATCH=%s\\nLR=%s\\nSEED=%s\\nK=%s\\nTEST=%s\\nVAL=%s\\nNAME=%s\\n' \\
+    "$HOOD_MESH_EPOCHS" "$HOOD_MESH_BATCH_SIZE" "$HOOD_MESH_LR" "$HOOD_MESH_SEED" "$HOOD_MESH_NEIGHBORHOOD_K" \\
+    "$HOOD_MESH_TEST_DESIGNS" "$HOOD_MESH_VAL_DESIGNS" "$HOOD_MESH_RUN_NAME"
+printf 'ARG=%s\\n' "$@"
+""")
+        # Stale exports from other experiments must not leak into the sweep.
+        self.env.update(HOOD_MESH_DROPOUT="0.4", HOOD_MESH_WEIGHT_DECAY="0.3", HOOD_MESH_LR="0.01",
+                        HOOD_MESH_SEED="7", HOOD_MESH_EPOCHS="5", HOOD_MESH_RUN_NAME="stale",
+                        HOOD_MESH_DESIGN_CHANGE_LAYERS="9", HOOD_MESH_DESIGN_CHANGE_FOURIER_OCTAVES="9")
+        variants = {"small": ("0", "2", "0.1", "0.00001", "mesh_hist_dc_small"),
+                    "regularized": ("2", "5", "0.2", "0.05", "mesh_hist_dc_reg"),
+                    "small_regularized": ("0", "2", "0.2", "0.05", "mesh_hist_dc_small_reg")}
+        for variant, (layers, octaves, dropout, decay, job) in variants.items():
+            with self.subTest(variant=variant):
+                output = self.launch(f"submit_mesh_impact_history_1704_design_change_{variant}.sh")
+                for expected in ("CHANGE=true", f"LAYERS={layers}", f"OCTAVES={octaves}", f"DROPOUT={dropout}",
+                                 f"WD={decay}", "EPOCHS=100", "BATCH=8", "LR=0.0003", "SEED=42", "K=256",
+                                 "TEST=4 5", "VAL=11",
+                                 f"NAME=mesh_history_clusterB_k256_fourier_no_shortcuts_design_change_{variant}",
+                                 f"mesh_history_1704_design_change_{variant}_%j.out"):
+                    self.assertIn(expected, output)
+                arguments = [line[4:] for line in output.splitlines() if line.startswith("ARG=")]
+                job_names = [argument for argument in arguments if argument.startswith("--job-name=")]
+                self.assertEqual(job_names[-1], f"--job-name={job}")
+        output = self.launch("submit_mesh_impact_history_1704_design_change_sweep.sh")
+        self.assertEqual(output.count("CHANGE=true"), 3)
+        for variant in variants:
+            self.assertIn(f"NAME=mesh_history_clusterB_k256_fourier_no_shortcuts_design_change_{variant}", output)
 
     def test_batch_runs_directly_with_broken_srun_and_preserves_gpu_decoder_and_split(self):
         self.env["CUDA_VISIBLE_DEVICES"] = "GPU-allocated-by-slurm"
