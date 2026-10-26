@@ -174,7 +174,7 @@ def prepare_model_neighbor_graphs(model, preprocessor, mesh_geometries, director
     cache = model.neighbor_cache
     seen = set()
     for mesh in mesh_geometries:
-        raw = cache.points(mesh[model.impactor_nodes:])
+        raw = cache.points(np.asarray(mesh)[model.impactor_nodes:, :3])
         digest = cache.geometry_digest(raw)
         if digest in seen:
             continue

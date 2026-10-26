@@ -13,7 +13,11 @@ design_change_nodes.py skip pooling. Each one becomes its own token, built from:
 
 The impact-relative position is the part meant to transfer to held-out
 designs. It describes "a patch raised 10 mm, 40 mm from the head", not where
-on this particular hood the patch sits.
+on this particular hood the patch sits. With the backbone's
+``impact_conditioning="head_relative"`` the origin is the headform centroid
+taken from the mesh itself, the offset gains its z component (so 11 + 4 *
+octaves inputs), and a mirrored training sample flips the y of both the offset
+and the displacement.
 
 ``design_change_layers`` self-attention blocks run over each design's change
 tokens plus one learned null token. After every decoder block the time queries
@@ -84,7 +88,8 @@ class DesignChangeTable:
 
     @staticmethod
     def digest(structural):
-        return NeighborGraphCache.geometry_digest(NeighborGraphCache.points(structural))
+        """Key of a hood: its normalized XYZ; extra node channels are ignored."""
+        return NeighborGraphCache.geometry_digest(NeighborGraphCache.points(structural[:, :3]))
 
     def register(self, structural, design):
         matches = np.flatnonzero(self.designs == design)
@@ -179,16 +184,15 @@ class DesignChangeHistoryNet(MeshImpactHistoryNet):
                 or design_change_fourier_octaves < 1):
             raise ValueError("design_change_fourier_octaves must be a positive integer")
         super().__init__(**kwargs)
-        if self.node_extra_features:
-            raise ValueError("DesignChangeHistoryNet reads XYZ meshes; node_extra_features must be 0")
         self.design_change_layers = design_change_layers
         # Added after every backbone module, so one seed gives the backbone the
         # same initial weights as MeshImpactHistoryNet.
         frequencies = 2 * math.pi * 2.0 ** torch.arange(design_change_fourier_octaves) / CHANGE_LONGEST_WAVELENGTH_MM
         self.register_buffer("change_frequencies", frequencies.float(), persistent=False)
         width = self.width
+        offset_features = 3 if self.impact_conditioning == "head_relative" else 2
         self.change_embedding = nn.Sequential(
-            nn.Linear(10 + 4 * design_change_fourier_octaves, width), nn.GELU(),
+            nn.Linear(offset_features + 8 + 4 * design_change_fourier_octaves, width), nn.GELU(),
             nn.Linear(width, width), nn.LayerNorm(width),
         )
         self.change_null_token = nn.Parameter(torch.empty(1, 1, width))
@@ -203,14 +207,25 @@ class DesignChangeHistoryNet(MeshImpactHistoryNet):
         # Plain attribute, never a buffer: it is derived from the decks.
         self.design_changes = None
 
-    def change_features(self, static: Tensor, impact_mm: Tensor) -> Tensor:
-        """(B, M, 10 + 4 * octaves) token inputs from static rows (B, M, S) and impact XY (B, 2) in mm."""
+    def change_features(self, static: Tensor, origin_mm: Tensor, mirror: Tensor | None = None) -> Tensor:
+        """(B, M, D + 8 + 4 * octaves) token inputs from static rows (B, M, S).
+
+        ``origin_mm`` (B, D) is the impact XY (D = 2) or, for head_relative,
+        the headform centroid (D = 3), in mm. ``mirror`` (B,) bool negates
+        the y of the offset and of the displacement.
+        """
         base, displacement = static[..., :3], static[..., 3:6]
-        relative = base[..., :2] - impact_mm[:, None, :]
-        phases = (relative.unsqueeze(-1) * self.change_frequencies).flatten(2)
+        relative = base[..., :origin_mm.shape[-1]] - origin_mm[:, None, :]
+        if mirror is not None:
+            sign = torch.ones(mirror.shape + (1, 3), dtype=static.dtype, device=static.device)
+            sign[mirror, :, 1] = -1.0
+            relative = relative * sign[..., :relative.shape[-1]]
+            displacement = displacement * sign
+        planar = relative[..., :2]
+        phases = (planar.unsqueeze(-1) * self.change_frequencies).flatten(2)
         return torch.cat((
             relative / CHANGE_POSITION_SCALE_MM,
-            relative.norm(dim=-1, keepdim=True) / CHANGE_POSITION_SCALE_MM,
+            planar.norm(dim=-1, keepdim=True) / CHANGE_POSITION_SCALE_MM,
             phases.sin(), phases.cos(),
             displacement / CHANGE_DISPLACEMENT_SCALE_MM,
             displacement.norm(dim=-1, keepdim=True) / CHANGE_DISPLACEMENT_SCALE_MM,
@@ -218,7 +233,8 @@ class DesignChangeHistoryNet(MeshImpactHistoryNet):
             static[..., 8:9],
         ), dim=-1)
 
-    def _decoder_context(self, mesh: Tensor, mesh_batch: Tensor, indentor: Tensor, batch_size: int):
+    def _decoder_context(self, mesh: Tensor, mesh_batch: Tensor, indentor: Tensor, batch_size: int,
+                         mirror: list[bool] | None = None):
         if self.design_changes is None:
             raise RuntimeError("DesignChangeHistoryNet has no design_changes table; the trainer builds it "
                                f"from the decks, and saved runs keep it in {TABLE_FILE}")
@@ -226,8 +242,15 @@ class DesignChangeHistoryNet(MeshImpactHistoryNet):
                               for b in range(batch_size)], device=mesh.device)
         static, valid = self.design_changes.tensors(mesh.device)
         static, valid = static[index].to(mesh.dtype), valid[index]
-        impact_mm = indentor * self.impact_scale + self.impact_mean
-        tokens = self.change_embedding(self.change_features(static, impact_mm))
+        if self.impact_conditioning == "head_relative":
+            origin_mm = torch.stack([
+                (mesh[mesh_batch == b][:self.impactor_nodes, :3] * self.mesh_scale + self.mesh_mean).mean(dim=0)
+                for b in range(batch_size)
+            ])
+        else:
+            origin_mm = indentor * self.impact_scale + self.impact_mean
+        flipped = torch.tensor(mirror, device=mesh.device) if mirror is not None and any(mirror) else None
+        tokens = self.change_embedding(self.change_features(static, origin_mm, flipped))
         tokens = torch.cat((self.change_null_token.expand(batch_size, -1, -1), tokens), dim=1)
         valid = torch.cat((valid.new_ones(batch_size, 1), valid), dim=1)
         for block in self.change_blocks:
@@ -253,7 +276,7 @@ def register_design_changes(model, changes, meshes, designs, transform_mesh):
     for mesh, design in zip(meshes, designs):
         change = changes[design]
         expected = change["static"][:, :3] + change["static"][:, 3:6]
-        error = float(np.abs(np.asarray(mesh)[change["rows"]] - expected).max()) if len(expected) else 0.0
+        error = float(np.abs(np.asarray(mesh)[change["rows"], :3] - expected).max()) if len(expected) else 0.0
         if error > 1e-2:
             raise ValueError(f"Design {design}: mesh rows differ from the deck change nodes by {error:.3g} mm")
         worst = max(worst, error)

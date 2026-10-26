@@ -134,8 +134,12 @@ class MeshOnlyDecoderBlock(nn.Module):
 DECODER_BLOCKS = {"temporal": HistoryDecoderBlock, "mesh_only": MeshOnlyDecoderBlock}
 
 
-IMPACT_CONDITIONING = ("film", "legacy_additive")
+IMPACT_CONDITIONING = ("film", "legacy_additive", "none", "head_relative")
 TIME_ENCODINGS = ("fourier", "legacy_five")
+# head_relative: positions are offsets from the headform centroid in units of
+# this length, and a mirrored sample has its y offsets negated.
+HEAD_FRAME_SCALE_MM = 250.0
+MIRROR = (1.0, -1.0, 1.0)
 # Geometry memory injection sites (Xia & Aviles-Rivero, ICML 2026). "latent"
 # re-injects after every latent mixing block; "all" also after every
 # neighborhood block. The decoder is never injected; see MeshImpactHistoryNet.
@@ -249,6 +253,36 @@ class MeshImpactHistoryNet(nn.Module):
     values. ``legacy_additive`` still adds the impact embedding to the time
     queries; that mode exists to replay historical checkpoints.
 
+    ``impact_conditioning="none"`` takes the impact location out entirely: no
+    impact embedding, no FiLM and no radial prior, so every pooling token is
+    global and the learned queries are constants. ``indentor`` is still
+    validated but never read. It is meant for single-location training, where
+    the location is the same for every sample (README_one_impact_location.md).
+
+    ``impact_conditioning="head_relative"`` also reads no impact location, but
+    keeps working across locations by moving the origin to the head. The
+    leading ``impactor_nodes`` rows are the rigid headform, and their centroid
+    is the head centre (ImpactCoords X1-X3 of the 1704 set). Every node enters
+    as its offset from that centre (/ ``HEAD_FRAME_SCALE_MM``) plus its
+    horizontal distance, never as an absolute position. The same hood therefore
+    looks different from every impact point, but translating a whole sample
+    (hood and head together) leaves the prediction unchanged. There is no impact
+    embedding and no FiLM; the learned queries are constants. Half of the
+    tokens keep a radial prior, now centred on the head, so it needs no location
+    input either. Its precision is stored as log(p): the inverse-softplus
+    storage of the older modes is about p for sharp tokens, so Adam barely moved
+    them. ``indentor`` is validated but never read. Requires ``impactor_nodes >
+    0``, the headform kept out of pooling, and ``geometry_film="none"`` (the
+    geometry memory reads absolute XYZ). See README_head_centred.md.
+
+    ``mirror_augmentation`` (head_relative only) mirrors half of each training
+    batch at random: y offsets, the y offsets the neighborhood blocks read, and
+    the extra channels listed in ``mirror_odd_channels`` (e.g. the y component
+    of a surface normal) change sign. The 1704 impacts are purely vertical
+    (-11.1 m/s along z), so a mirrored run is a physically valid run with the
+    same history. Neighbor graphs and design-change lookups use the unmirrored
+    coordinates, since a reflection keeps every distance.
+
     Geometry memory injection (Xia & Aviles-Rivero, "Do Neural Operators Forget
     Geometry?", ICML 2026). ``geometry_film`` re-injects geometry after
     backbone layers, ``V <- V * (1 + gamma_l(m)) + beta_l(m)``, so later layers
@@ -309,6 +343,8 @@ class MeshImpactHistoryNet(nn.Module):
         geometry_film: str = "none",
         geometry_fourier_octaves: int = 5,
         node_extra_features: int = 0,
+        mirror_augmentation: bool = False,
+        mirror_odd_channels: Sequence[int] = (),
     ):
         super().__init__()
         integer_options = {
@@ -361,6 +397,21 @@ class MeshImpactHistoryNet(nn.Module):
         if geometry_film == "all" and not neighborhood_layers:
             raise ValueError("geometry_film='all' injects after neighborhood blocks; "
                              "set neighborhood_layers > 0 or use geometry_film='latent'")
+        if impact_conditioning == "head_relative":
+            if not impactor_nodes or pool_impactor_nodes:
+                raise ValueError("impact_conditioning='head_relative' centres every mesh on its headform rows: "
+                                 "set impactor_nodes > 0 and keep pool_impactor_nodes off")
+            if geometry_film != "none":
+                raise ValueError("geometry_film reads absolute XYZ; use geometry_film='none' with head_relative")
+        if not isinstance(mirror_augmentation, bool):
+            raise ValueError("mirror_augmentation must be True or False")
+        if mirror_augmentation and impact_conditioning != "head_relative":
+            raise ValueError("mirror_augmentation needs impact_conditioning='head_relative'")
+        mirror_odd_channels = tuple(mirror_odd_channels)
+        if (any(isinstance(channel, bool) or not isinstance(channel, int) for channel in mirror_odd_channels)
+                or len(set(mirror_odd_channels)) != len(mirror_odd_channels)
+                or not set(mirror_odd_channels) <= set(range(node_extra_features))):
+            raise ValueError("mirror_odd_channels must be distinct indices of the extra node channels")
 
         self.decoder = decoder
         self.impact_conditioning = impact_conditioning
@@ -368,7 +419,8 @@ class MeshImpactHistoryNet(nn.Module):
         self.width = width
         self.num_heads = num_heads
         self.num_latents = num_latents
-        self.num_global_latents = num_latents // 2
+        # Local tokens need an impact point to centre their radial prior on.
+        self.num_global_latents = num_latents if impact_conditioning == "none" else num_latents // 2
         self.attention_dropout = dropout
         self.neighborhood_k = neighborhood_k
         self.impactor_nodes = impactor_nodes
@@ -376,6 +428,12 @@ class MeshImpactHistoryNet(nn.Module):
         self.pool_impactor_nodes = pool_impactor_nodes
         self.geometry_film = geometry_film
         self.node_extra_features = node_extra_features
+        self.mirror_augmentation = mirror_augmentation
+        self.mirror_odd_channels = mirror_odd_channels
+        # Derived from the options; kept out of the state dict.
+        sign = torch.ones(node_extra_features)
+        sign[list(mirror_odd_channels)] = -1.0
+        self.register_buffer("mirror_channel_sign", sign, persistent=False)
 
         # The shared preprocessor fits mesh and impact scalers independently.
         # Store their affine maps in the checkpoint so relative coordinates
@@ -385,14 +443,16 @@ class MeshImpactHistoryNet(nn.Module):
         self.register_buffer("impact_mean", torch.zeros(2))
         self.register_buffer("impact_scale", torch.ones(2))
 
+        coordinate_features = {"legacy_additive": 6, "head_relative": 4}.get(impact_conditioning, 3)
         self.node_embedding = nn.Sequential(
-            nn.Linear((3 if impact_conditioning == "film" else 6) + node_extra_features, width),
+            nn.Linear(coordinate_features + node_extra_features, width),
             nn.GELU(), nn.Linear(width, width),
             nn.LayerNorm(width),
         )
-        self.impact_embedding = nn.Sequential(
-            nn.Linear(2, width), nn.GELU(), nn.Linear(width, width),
-        )
+        if impact_conditioning not in ("none", "head_relative"):
+            self.impact_embedding = nn.Sequential(
+                nn.Linear(2, width), nn.GELU(), nn.Linear(width, width),
+            )
         self.latent_queries = nn.Parameter(torch.empty(num_latents, width))
         nn.init.normal_(self.latent_queries, std=0.02)
         self.query_norm = nn.LayerNorm(width)
@@ -402,8 +462,12 @@ class MeshImpactHistoryNet(nn.Module):
         self.mesh_dropout = nn.Dropout(dropout)
 
         local_count = num_latents - self.num_global_latents
-        initial_precision = torch.logspace(math.log10(0.5), math.log10(32.0), local_count)
-        self.local_log_precision = nn.Parameter(torch.log(torch.expm1(initial_precision)))
+        if local_count:
+            initial_precision = torch.logspace(math.log10(0.5), math.log10(32.0), local_count)
+            # head_relative stores log(p); the older modes keep inverse-softplus(p) so their checkpoints replay.
+            self.local_log_precision = nn.Parameter(
+                torch.log(initial_precision) if impact_conditioning == "head_relative"
+                else torch.log(torch.expm1(initial_precision)))
         self.latent_blocks = nn.ModuleList([
             LatentMixingBlock(width, num_heads, dropout) for _ in range(latent_layers)
         ])
@@ -509,6 +573,26 @@ class MeshImpactHistoryNet(nn.Module):
         for name, value in converted.items():
             getattr(self, name).copy_(value)
 
+    def impact_condition(self, indentor: Tensor) -> Tensor | None:
+        """Embedded impact location, or None for a network that takes no location."""
+        return None if self.impact_conditioning in ("none", "head_relative") else self.impact_embedding(indentor)
+
+    def head_frame(self, mesh: Tensor, mirror: bool = False) -> Tensor:
+        """Node offsets (N, 3) from the headform centroid, in mm; y negated when mirrored.
+
+        Standardization is affine per axis, so scaling the normalized offsets
+        by ``mesh_scale`` gives them exactly in mm.
+        """
+        coordinates = mesh[:, :3] * self.mesh_scale
+        relative = coordinates - coordinates[:self.impactor_nodes].mean(dim=0)
+        return relative * relative.new_tensor(MIRROR) if mirror else relative
+
+    def mirror_flags(self, batch_size: int) -> list[bool]:
+        """Which samples of the batch are mirrored: a random half while training."""
+        if not (self.training and self.mirror_augmentation):
+            return [False] * batch_size
+        return (torch.rand(batch_size) < 0.5).tolist()
+
     def impact_relative_xy(self, mesh: Tensor, impact: Tensor) -> Tensor:
         """Relative XY in common mesh-scaler units, used by the pooling prior."""
         impact_mesh_xy = (
@@ -516,16 +600,21 @@ class MeshImpactHistoryNet(nn.Module):
         ) / self.mesh_scale[:2]
         return mesh[:, :2] - impact_mesh_xy
 
-    def node_features(self, mesh: Tensor, impact: Tensor) -> Tensor:
-        """Use XYZ (+ extra channels) for FiLM; retain six features for historical runs."""
-        if self.impact_conditioning == "film":
+    def node_features(self, mesh: Tensor, impact: Tensor, mirror: bool = False) -> Tensor:
+        """Use XYZ (+ extra channels); head offsets for head_relative; six features for historical runs."""
+        if self.impact_conditioning == "head_relative":
+            relative = self.head_frame(mesh, mirror) / HEAD_FRAME_SCALE_MM
+            extra = mesh[:, 3:] * self.mirror_channel_sign if mirror else mesh[:, 3:]
+            return torch.cat((relative, relative[:, :2].norm(dim=-1, keepdim=True), extra), dim=-1)
+        if self.impact_conditioning != "legacy_additive":
             return mesh
         coordinates = mesh[:, :3]
         relative_xy = self.impact_relative_xy(coordinates, impact)
         radius_squared = relative_xy.square().sum(dim=-1, keepdim=True)
         return torch.cat((coordinates, relative_xy, radius_squared, mesh[:, 3:]), dim=-1)
 
-    def _encode_neighborhoods(self, mesh: Tensor, nodes: Tensor, node_geometry: Tensor | None = None) -> Tensor:
+    def _encode_neighborhoods(self, mesh: Tensor, nodes: Tensor, node_geometry: Tensor | None = None,
+                              mirror: bool = False) -> Tensor:
         """Run local attention over the structural nodes, in input order.
 
         The leading ``impactor_nodes`` rows are the rigid headform. It travels
@@ -548,6 +637,9 @@ class MeshImpactHistoryNet(nn.Module):
                 f"got {len(coordinates)} after holding out {self.impactor_nodes} impactor nodes"
             )
         neighbors = self.neighbor_cache.neighbors(coordinates, self.neighborhood_k)
+        if mirror:
+            # A reflection keeps the graph; only the offsets the blocks read flip.
+            coordinates = coordinates * coordinates.new_tensor(MIRROR)
         updated = nodes[self.impactor_nodes:]
         if self.geometry_film == "all" and node_geometry is None:
             node_geometry = self.geometry_encoder(mesh[:, :3])
@@ -560,15 +652,18 @@ class MeshImpactHistoryNet(nn.Module):
         return torch.cat((nodes[:self.impactor_nodes], updated))
 
     def _mesh_pooling_inputs(self, mesh: Tensor, impact: Tensor, condition: Tensor,
-                             node_geometry: Tensor | None = None):
-        features = self.node_features(mesh, impact)
+                             node_geometry: Tensor | None = None, mirror: bool = False):
+        features = self.node_features(mesh, impact, mirror)
         nodes = self.node_embedding(features)
         if self.neighborhood_blocks:
-            nodes = self._encode_neighborhoods(mesh, nodes, node_geometry)
+            nodes = self._encode_neighborhoods(mesh, nodes, node_geometry, mirror)
         if self.impact_conditioning == "film":
             # Normalize before modulation so no immediate LayerNorm removes
             # the FiLM scale/shift. Both query and residual use these tokens.
             tokens = self.impact_film(self.query_norm(self.latent_queries), condition)
+            query = self.mesh_query(tokens)
+        elif self.impact_conditioning in ("none", "head_relative"):
+            tokens = self.query_norm(self.latent_queries)
             query = self.mesh_query(tokens)
         else:
             tokens = self.latent_queries + condition.unsqueeze(0)
@@ -581,12 +676,22 @@ class MeshImpactHistoryNet(nn.Module):
 
         # Global tokens have zero spatial bias. Local tokens have soft learned
         # radial priors, never a hard node cutoff or arbitrary node sampling.
-        precision = torch.cat((
-            self.local_log_precision.new_zeros(self.num_global_latents),
-            F.softplus(self.local_log_precision),
-        ))
-        radius_squared = self.impact_relative_xy(mesh, impact).square().sum(dim=-1)
-        spatial_bias = -precision[:, None] * radius_squared.unsqueeze(0)
+        if self.impact_conditioning == "none":
+            spatial_bias = mesh.new_zeros(self.num_latents, len(mesh))
+        elif self.impact_conditioning == "head_relative":
+            precision = torch.cat((
+                self.local_log_precision.new_zeros(self.num_global_latents),
+                self.local_log_precision.exp(),
+            ))
+            radius_squared = (self.head_frame(mesh)[:, :2] / HEAD_FRAME_SCALE_MM).square().sum(dim=-1)
+            spatial_bias = -precision[:, None] * radius_squared.unsqueeze(0)
+        else:
+            precision = torch.cat((
+                self.local_log_precision.new_zeros(self.num_global_latents),
+                F.softplus(self.local_log_precision),
+            ))
+            radius_squared = self.impact_relative_xy(mesh, impact).square().sum(dim=-1)
+            spatial_bias = -precision[:, None] * radius_squared.unsqueeze(0)
         if not self.pool_impactor_nodes and self.impactor_nodes:
             # A -inf bias gives the headform rows exactly zero attention, so
             # memory is built from hood nodes only while weights keep one
@@ -610,7 +715,7 @@ class MeshImpactHistoryNet(nn.Module):
             raise ValueError("token_chunk_size must be positive")
         # Generator execution must itself be inside no_grad.
         with torch.no_grad():
-            condition = self.impact_embedding(impact)
+            condition = self.impact_condition(impact)
             _, query, key, _, spatial_bias = self._mesh_pooling_inputs(mesh, impact, condition)
             for start in range(0, self.num_latents, token_chunk_size):
                 stop = min(start + token_chunk_size, self.num_latents)
@@ -618,13 +723,14 @@ class MeshImpactHistoryNet(nn.Module):
                 scores = scores / math.sqrt(self.width // self.num_heads)
                 yield start, torch.softmax(scores + spatial_bias[None, start:stop].float(), dim=-1)
 
-    def _encode_mesh(self, mesh: Tensor, impact: Tensor, condition: Tensor) -> Tensor:
-        return self._encode_mesh_and_geometry(mesh, impact, condition)[0]
+    def _encode_mesh(self, mesh: Tensor, impact: Tensor, condition: Tensor, mirror: bool = False) -> Tensor:
+        return self._encode_mesh_and_geometry(mesh, impact, condition, mirror)[0]
 
-    def _encode_mesh_and_geometry(self, mesh: Tensor, impact: Tensor, condition: Tensor):
+    def _encode_mesh_and_geometry(self, mesh: Tensor, impact: Tensor, condition: Tensor, mirror: bool = False):
         """Return (memory tokens, per-token geometry memory or None) for one mesh."""
         node_geometry = self.geometry_encoder(mesh[:, :3]) if self.geometry_film != "none" else None
-        tokens, query, key, value, spatial_bias = self._mesh_pooling_inputs(mesh, impact, condition, node_geometry)
+        tokens, query, key, value, spatial_bias = self._mesh_pooling_inputs(
+            mesh, impact, condition, node_geometry, mirror)
         attention_mask = spatial_bias.to(query.dtype)[None, None, :, :]
         update = F.scaled_dot_product_attention(
             query.unsqueeze(0), key.unsqueeze(0), value.unsqueeze(0),
@@ -646,7 +752,8 @@ class MeshImpactHistoryNet(nn.Module):
         )
         return memory, geometry.squeeze(0).transpose(0, 1).reshape(self.num_latents, self.width)
 
-    def _decoder_context(self, mesh: Tensor, mesh_batch: Tensor, indentor: Tensor, batch_size: int):
+    def _decoder_context(self, mesh: Tensor, mesh_batch: Tensor, indentor: Tensor, batch_size: int,
+                         mirror: list[bool] | None = None):
         """A second memory the decoder reads after each block; none in this network.
 
         DesignChangeHistoryNet (mesh_design_change.py) returns its change-node
@@ -713,18 +820,20 @@ class MeshImpactHistoryNet(nn.Module):
                 raise ValueError("indentor must have shape (batch_size, 2)")
             batch_size = indentor.shape[0]
         self._validate_inputs(mesh, mesh_batch, indentor, time, time_batch, batch_size)
-        condition = self.impact_embedding(indentor)
+        condition = self.impact_condition(indentor)
+        conditions = [None] * batch_size if condition is None else condition
+        mirror = self.mirror_flags(batch_size)
 
         # Encoding each mesh separately avoids padding tens of thousands of
         # nodes. Only the compact memory and short time sequences are batched.
         geometry = None
         if self.geometry_film == "none":
             memory = torch.stack([
-                self._encode_mesh(mesh[mesh_batch == b], indentor[b], condition[b])
+                self._encode_mesh(mesh[mesh_batch == b], indentor[b], conditions[b], mirror[b])
                 for b in range(batch_size)
             ])
         else:
-            encoded = [self._encode_mesh_and_geometry(mesh[mesh_batch == b], indentor[b], condition[b])
+            encoded = [self._encode_mesh_and_geometry(mesh[mesh_batch == b], indentor[b], conditions[b])
                        for b in range(batch_size)]
             memory = torch.stack([tokens for tokens, _ in encoded])
             geometry = self.geometry_memory_norm(torch.stack([shape for _, shape in encoded]))
@@ -743,7 +852,7 @@ class MeshImpactHistoryNet(nn.Module):
         queries = self.time_embedding(time_features)
         if self.impact_conditioning == "legacy_additive":
             queries = queries + condition[:, None, :]
-        decoder_context = self._decoder_context(mesh, mesh_batch, indentor, batch_size)
+        decoder_context = self._decoder_context(mesh, mesh_batch, indentor, batch_size, mirror)
         for index, block in enumerate(self.decoder_blocks):
             queries = block(queries, memory, padding_mask)
             if decoder_context is not None:

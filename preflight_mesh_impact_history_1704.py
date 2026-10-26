@@ -28,8 +28,10 @@ from train_mesh_impact_history import (
     DEFAULT_VAL_DESIGNS,
     DESIGN_CHANGE_DEFAULTS,
     MODEL_DEFAULTS,
+    NODE_FEATURES,
     MeshImpactHistoryNet,
     add_model_arguments,
+    node_feature_kwargs,
     parse_boolean,
     parse_args as parse_training_args,
     resolve_splits,
@@ -56,7 +58,7 @@ EXPERIMENT_MODEL_KEYS = tuple(
     if key.startswith("neighborhood_") or key in ("impactor_nodes", "impact_conditioning")
     or key == "time_encoding" or key.startswith("fourier_")
     or key in ("pooling_query_residual", "pool_impactor_nodes")
-    or key.startswith("geometry_")
+    or key.startswith("geometry_") or key == "mirror_augmentation"
 )
 
 
@@ -111,6 +113,10 @@ def validate_splits(test_designs, val_designs):
             raise ValueError(f"{name} design IDs must be integers in 0..{NUM_DESIGNS - 1}")
         if len(set(identifiers)) != len(identifiers):
             raise ValueError(f"{name} design IDs must not contain duplicates")
+    # Training without a validation design is for few-sample single-location
+    # runs (README_one_impact_location.md); full 1704-run jobs keep one.
+    if not val_designs:
+        raise ValueError("validation design IDs must be nonempty for full 1704-run jobs")
     return resolve_splits(
         {"run_numbers": list(range(1, NUM_RUNS + 1))},
         SimpleNamespace(samples_per_design=SAMPLES_PER_DESIGN),
@@ -202,6 +208,8 @@ def validate_first_run(root, impact_xy, preprocessing=None):
         data_format="euroncap1704",
         inp_dir=str(root / "inp_files"),
         acceleration_dir=str(root / "output_history_acc"),
+        samples_per_design=SAMPLES_PER_DESIGN,
+        node_features=getattr(preprocessing, "node_features", "xyz"),
         time_subsample_stride=stride,
         max_train_time=cutoff,
     )
@@ -241,7 +249,8 @@ def validate_runtime(require_cuda):
 
 
 def validate_cuda_model(data, decoder=MODEL_DEFAULTS["decoder"], neighbor_cache_dir=None,
-                        design_changes=None, design_change_options=None, **neighborhood_options):
+                        design_changes=None, design_change_options=None, node_features="xyz",
+                        **neighborhood_options):
     """Exercise the selected decoder and learned spatial-bias gradients.
 
     With ``design_changes`` (find_design_changes output) the probe is a
@@ -250,10 +259,10 @@ def validate_cuda_model(data, decoder=MODEL_DEFAULTS["decoder"], neighbor_cache_
     """
     # Standardize this one example only for numerical stability in the probe.
     # These temporary statistics never reach training or a saved checkpoint.
-    mesh = np.asarray(data["mesh_geometries"][0], dtype=np.float32)
-    mean = mesh.mean(axis=0)
-    scale = np.maximum(mesh.std(axis=0), 1e-6)
-    mesh = torch.as_tensor((mesh - mean) / scale, device="cuda")
+    raw = np.asarray(data["mesh_geometries"][0], dtype=np.float32)
+    mean = raw[:, :3].mean(axis=0)
+    scale = np.maximum(raw[:, :3].std(axis=0), 1e-6)
+    mesh = torch.as_tensor(np.hstack(((raw[:, :3] - mean) / scale, raw[:, 3:])), device="cuda")
     impact = torch.as_tensor(
         (np.asarray(data["indentor_positions"][0]) - mean[:2]) / scale[:2],
         device="cuda", dtype=torch.float32,
@@ -262,7 +271,8 @@ def validate_cuda_model(data, decoder=MODEL_DEFAULTS["decoder"], neighbor_cache_
     time_mean, time_scale = float(time.mean()), max(float(time.std()), 1e-6)
     time = torch.as_tensor((time - time_mean) / time_scale, device="cuda")
     model_kwargs = dict(width=16, num_heads=2, num_latents=4, latent_layers=1,
-                        temporal_layers=1, dropout=0.0, decoder=decoder, **neighborhood_options)
+                        temporal_layers=1, dropout=0.0, decoder=decoder, **neighborhood_options,
+                        **node_feature_kwargs(node_features))
     if design_changes is None:
         model = MeshImpactHistoryNet(**model_kwargs).to("cuda")
     else:
@@ -278,8 +288,8 @@ def validate_cuda_model(data, decoder=MODEL_DEFAULTS["decoder"], neighbor_cache_
     if model.neighborhood_blocks and neighbor_cache_dir is not None:
         model.neighbor_cache.directory = Path(neighbor_cache_dir)
         start = model.impactor_nodes
-        model.neighbor_cache.register_geometry(data["mesh_geometries"][0][start:],
-                                              mesh[start:] * model.mesh_scale, model.neighborhood_k)
+        model.neighbor_cache.register_geometry(raw[start:, :3],
+                                              mesh[start:, :3] * model.mesh_scale, model.neighborhood_k)
     prediction = model(
         mesh=mesh,
         mesh_batch=torch.zeros(len(mesh), device="cuda", dtype=torch.long),
@@ -292,7 +302,8 @@ def validate_cuda_model(data, decoder=MODEL_DEFAULTS["decoder"], neighbor_cache_
         raise ValueError("CUDA model probe produced an invalid acceleration history")
     prediction.square().mean().backward()
     gradients = [parameter.grad for parameter in model.parameters() if parameter.grad is not None]
-    if model.local_log_precision.grad is None or not gradients or not all(
+    precision = getattr(model, "local_log_precision", None)  # Absent when every token is global.
+    if (precision is not None and precision.grad is None) or not gradients or not all(
         torch.isfinite(gradient).all() for gradient in gradients
     ):
         raise ValueError("CUDA model probe produced missing spatial-bias or nonfinite gradients")
@@ -312,8 +323,9 @@ def validate_cuda_model(data, decoder=MODEL_DEFAULTS["decoder"], neighbor_cache_
     print(f"GPU: {torch.cuda.get_device_name(0)} | decoder={decoder} | "
           f"time_encoding={model.time_encoding} ({model.time_feature_count} features) | "
           f"neighborhood_layers={len(model.neighborhood_blocks)} | "
-          f"geometry_film={model.geometry_film} | design_change_nodes={design_changes is not None} "
-          f"forward/backward: passed")
+          f"geometry_film={model.geometry_film} | design_change_nodes={design_changes is not None} | "
+          f"impact_conditioning={model.impact_conditioning} | node_features={node_features} | "
+          f"mirror_augmentation={model.mirror_augmentation} forward/backward: passed")
     if model.neighborhood_blocks:
         print(f"Neighbor graph cache: built={model.neighbor_cache.builds} | loaded from disk={model.neighbor_cache.disk_hits}")
 
@@ -331,6 +343,7 @@ def parse_args(argv=None):
     parser.add_argument("--design-change-nodes", type=parse_boolean, default=False, metavar="{true,false}")
     for key, default in DESIGN_CHANGE_DEFAULTS.items():
         parser.add_argument(f"--{key.replace('_', '-')}", type=type(default), default=default)
+    parser.add_argument("--node-features", choices=NODE_FEATURES, default="xyz")
     parser.add_argument("--batch-size", type=int, default=Config.batch_size)
     parser.add_argument("--time-subsample-stride", type=int, default=Config.time_subsample_stride)
     parser.add_argument("--max-train-time", type=float, default=Config.max_train_time)
@@ -345,7 +358,7 @@ def parse_args(argv=None):
             parser.error("The 1704 resume launcher requires a full euroncap1704 run")
         for key in (*EXPERIMENT_MODEL_KEYS, "decoder", "test_designs", "val_designs",
                     "batch_size", "time_subsample_stride", "max_train_time",
-                    "design_change_nodes", *DESIGN_CHANGE_DEFAULTS):
+                    "design_change_nodes", *DESIGN_CHANGE_DEFAULTS, "node_features"):
             setattr(args, key, getattr(saved, key))
         if args.data_root is None:
             args.data_root = str(Path(saved.inp_dir).parent)
@@ -388,7 +401,7 @@ def main(argv=None):
         if args.require_cuda:
             validate_cuda_model(data, decoder=args.decoder,
                                 neighbor_cache_dir=args.neighbor_cache_dir or root / "neighbor_graphs",
-                                design_changes=design_changes,
+                                design_changes=design_changes, node_features=args.node_features,
                                 design_change_options={key: getattr(args, key) for key in DESIGN_CHANGE_DEFAULTS}, **{
                 key: getattr(args, key) for key in EXPERIMENT_MODEL_KEYS
             })

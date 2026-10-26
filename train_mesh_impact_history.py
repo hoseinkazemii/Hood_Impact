@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 import torch
+from torch.utils.data import DataLoader
 import wandb
 
 from mesh_impact_history import (
@@ -25,10 +26,16 @@ from mesh_impact_history import (
 )
 from mesh_impact_history_reporting import export_training_history_plot
 from utils.utils import (
+    INP_MESH_FORMATS,
+    MESH_PART_ELSETS,
+    MIRROR_ODD_STRUCTURE_CHANNELS,
+    NODE_FEATURES,
+    STRUCTURE_CHANNELS,
     Config,
     DataPreprocessor,
     Evaluator,
     Trainer,
+    collate_fn,
     create_data_loaders,
     run_to_design_id,
     set_seed,
@@ -64,6 +71,8 @@ MODEL_DEFAULTS = {
     # Geometry memory injection (FiLM); "none" adds no parameters.
     "geometry_film": "none",
     "geometry_fourier_octaves": 5,
+    # Mirror half of each training batch (impact_conditioning head_relative only).
+    "mirror_augmentation": False,
 }
 BOOLEAN_MODEL_KEYS = tuple(key for key, value in MODEL_DEFAULTS.items() if isinstance(value, bool))
 # Decoder path over the near-clone change nodes (mesh_design_change.py), used
@@ -122,7 +131,17 @@ def parse_args(argv=None):
     parser.add_argument("--samples-per-design", type=int)
     # Cluster B never participates in optimization or checkpoint selection.
     parser.add_argument("--test-designs", type=int, nargs="+", default=list(DEFAULT_TEST_DESIGNS), help="Zero-based design IDs.")
-    parser.add_argument("--val-designs", type=int, nargs="+", default=list(DEFAULT_VAL_DESIGNS), help="Zero-based design IDs.")
+    parser.add_argument("--val-designs", type=int, nargs="*", default=list(DEFAULT_VAL_DESIGNS),
+                        help="Zero-based design IDs. Give none to train on every non-test design; the training "
+                             "designs are then monitored instead and select the checkpoint.")
+    parser.add_argument("--locations", type=int, nargs="+",
+                        help="Load only these one-based impact locations of the 142-location euroncap1704 grid.")
+    parser.add_argument("--mesh-parts", choices=sorted(MESH_PART_ELSETS),
+                        help="Hood parts kept in each .inp mesh: all (default) or inner, the Hood_Inner frame "
+                             "under the skin. The leading headform rows are always kept.")
+    parser.add_argument("--node-features", choices=NODE_FEATURES,
+                        help="Per-node inputs: xyz (default) or structure, which appends the panel, the unit "
+                             "surface normal and the outer-inner gap of every node (euroncap1704).")
     parser.add_argument("--epochs", type=int, help="Total epoch target, including completed epochs.")
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--lr", type=float)
@@ -145,7 +164,9 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--impact-conditioning", choices=IMPACT_CONDITIONING, default=MODEL_DEFAULTS["impact_conditioning"],
-        help="film uses XYZ-only nodes and FiLM pooling; legacy_additive reproduces older runs.",
+        help="film uses XYZ-only nodes and FiLM pooling; head_relative reads no impact location and "
+             "expresses every node relative to the headform centroid; none is for one location; "
+             "legacy_additive reproduces older runs.",
     )
     parser.add_argument(
         "--time-encoding", choices=TIME_ENCODINGS, default=MODEL_DEFAULTS["time_encoding"],
@@ -218,6 +239,9 @@ def restore_resume_arguments(args, parser, argv):
                 "time_subsample_stride": saved["preprocessing"]["time_subsample_stride"],
                 "hic_range_threshold_percent": (saved.get("location_filter") or {}).get("threshold_percent"),
                 "location_holdout": (saved.get("location_holdout") or {}).get("file"),
+                "locations": saved["data"].get("locations"),
+                "mesh_parts": saved["preprocessing"].get("mesh_parts", "all"),
+                "node_features": saved["preprocessing"].get("node_features", "xyz"),
                 "test_designs": splits["test"]["design_ids"],
                 "val_designs": splits["validation"]["design_ids"]}
     explicit = {token.split("=", 1)[0] for token in argv if token.startswith("--")}
@@ -250,6 +274,8 @@ def build_config(args):
             overrides[mapping.get(key, key)] = value
     if args.device is not None:
         overrides["device"] = torch.device(args.device)
+    overrides["mesh_parts"] = args.mesh_parts or "all"
+    overrides["node_features"] = args.node_features or "xyz"
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     overrides["output_dir"] = str(Path(args.output_dir or Path("runs") / "mesh_impact_history" / stamp).resolve())
     config = Config(**overrides)
@@ -274,7 +300,34 @@ def build_config(args):
         raise ValueError("The location holdout is defined on the 142-location euroncap1704 grid")
     if args.design_change_nodes and (config.data_format != "euroncap1704" or config.samples_per_design != 142):
         raise ValueError("Design-change nodes are found from the 142-location euroncap1704 decks")
+    if config.mesh_parts != "all" and config.data_format not in INP_MESH_FORMATS:
+        raise ValueError("--mesh-parts needs .inp meshes (industrylike or euroncap1704)")
+    if config.node_features == "structure" and (config.data_format != "euroncap1704" or config.samples_per_design != 142):
+        raise ValueError("--node-features structure reads the per-design geometry of the 142-location euroncap1704 decks")
+    if args.design_change_nodes and config.mesh_parts != "all":
+        raise ValueError("Design-change rows index the complete deck mesh; keep --mesh-parts all")
+    if args.locations:
+        config.selected_runs = selected_location_runs(args, config)
     return config
+
+
+def selected_location_runs(args, config):
+    """Run numbers of every design at the requested grid locations."""
+    if config.data_format != "euroncap1704" or config.samples_per_design != 142 or config.num_samples != 1704:
+        raise ValueError("--locations selects from the complete 12 x 142 euroncap1704 dataset")
+    if args.hic_range_threshold_percent is not None or args.location_holdout is not None:
+        raise ValueError("--locations replaces the HIC location filter and the location holdout; use one")
+    if len(set(args.locations)) != len(args.locations) or not set(args.locations) <= set(range(1, 143)):
+        raise ValueError("--locations must be distinct IDs in 1..142")
+    return sorted(142 * design + location for design in range(12) for location in args.locations)
+
+
+def node_feature_kwargs(node_features):
+    """Model keywords implied by the per-node inputs the data loader appends."""
+    if node_features != "structure":
+        return {}
+    return {"node_extra_features": len(STRUCTURE_CHANNELS),
+            "mirror_odd_channels": [STRUCTURE_CHANNELS.index(name) for name in MIRROR_ODD_STRUCTURE_CHANNELS]}
 
 
 def validate_data(data):
@@ -287,13 +340,15 @@ def validate_data(data):
     for key in ("mesh_geometries", "indentor_positions", "time_arrays", "accelerations"):
         if len(data[key]) != len(run_numbers):
             raise ValueError(f"{key} does not match the number of loaded runs")
+    columns = np.asarray(data["mesh_geometries"][0]).shape[-1]
     for i, run in enumerate(run_numbers):
         mesh = np.asarray(data["mesh_geometries"][i])
         impact = np.asarray(data["indentor_positions"][i])
         times = np.asarray(data["time_arrays"][i])
         accel = np.asarray(data["accelerations"][i])
-        if mesh.ndim != 2 or mesh.shape[1] != 3 or not len(mesh):
-            raise ValueError(f"Run {run}: mesh must have shape (N, 3) with at least one node")
+        if mesh.ndim != 2 or mesh.shape[1] != columns or columns < 3 or not len(mesh):
+            raise ValueError(f"Run {run}: mesh must have shape (N, {max(columns, 3)}): XYZ, then the "
+                             "same extra node channels as every run, with at least one node")
         if impact.shape != (2,):
             raise ValueError(f"Run {run}: impact location must have shape (2,)")
         if times.ndim != 1 or len(times) < 1 or accel.shape != times.shape:
@@ -307,8 +362,8 @@ def validate_data(data):
 def resolve_splits(data, config, test_designs, val_designs):
     """Validate design separation using runs that actually loaded successfully."""
     test_ids, val_ids = set(test_designs), set(val_designs)
-    if not test_ids or not val_ids:
-        raise ValueError("Validation and test design lists must both be nonempty")
+    if not test_ids:
+        raise ValueError("The test design list must be nonempty")
     if test_ids & val_ids:
         raise ValueError(f"Validation and test design IDs overlap: {sorted(test_ids & val_ids)}")
     design_ids = {run_to_design_id(run, config.samples_per_design) for run in data["run_numbers"]}
@@ -325,6 +380,8 @@ def resolve_splits(data, config, test_designs, val_designs):
         name = "test" if design in test_ids else "validation" if design in val_ids else "train"
         split[name]["run_numbers"].append(int(run))
     for name, group in split.items():
+        if name == "validation" and not val_ids:
+            continue
         if not group["run_numbers"]:
             raise ValueError(f"The {name} split is empty; choose held-out designs leaving training data")
     return split
@@ -338,6 +395,7 @@ def resolved_config(config, args, model_kwargs, prediction_grid):
     )
     data_config = {key: getattr(config, key) for key in data_keys}
     data_config.update({key: str(Path(getattr(config, key)).resolve()) for key in path_keys})
+    data_config["locations"] = sorted(args.locations) if args.locations else None
     architecture = "DesignChangeHistoryNet" if getattr(args, "design_change_nodes", False) else "MeshImpactHistoryNet"
     return {
         "format_version": 1,
@@ -350,6 +408,9 @@ def resolved_config(config, args, model_kwargs, prediction_grid):
             "time_subsample_stride": config.time_subsample_stride,
             "max_train_time": config.max_train_time,
             "mesh_columns": ["X1", "X2", "X3"],
+            "mesh_parts": config.mesh_parts,
+            "node_features": config.node_features,
+            "node_channels": list(STRUCTURE_CHANNELS) if config.node_features == "structure" else [],
             "impact_columns": ["X1", "X2"],
             "acceleration_units": "g",
             "scalers_fit_on": "train",
@@ -364,6 +425,7 @@ def resolved_config(config, args, model_kwargs, prediction_grid):
             "batch_sampling": "shuffle",
             "scheduler": "CosineAnnealingLR",
             "gradient_clip_norm": 1.0,
+            "checkpoint_selection": "validation_loss" if args.val_designs else "training_designs_eval_loss",
         },
         "prediction_grid": prediction_grid,
         "wandb": {
@@ -463,6 +525,8 @@ class HistoryPredictor:
 
     ``predict(mesh_xyz, impact_xy)`` returns acceleration in g at
     ``predictor.time_points``. Optional time points must already be subsampled.
+    A model trained with extra node channels (``--node-features structure``)
+    takes them after XYZ, as DataPreprocessor.load_mesh_geometry returns them.
     """
 
     def __init__(self, model, preprocessor, time_points, device="cpu"):
@@ -508,8 +572,10 @@ class HistoryPredictor:
         mesh = np.asarray(mesh_xyz, dtype=np.float32)
         impact = np.asarray(impact_xy, dtype=np.float32)
         times = self.time_points if sampled_time_points is None else np.asarray(sampled_time_points, dtype=np.float32)
-        if mesh.ndim != 2 or mesh.shape[1] != 3 or not len(mesh):
-            raise ValueError("mesh_xyz must have shape (N, 3), with at least one node")
+        columns = 3 + self.model.node_extra_features
+        if mesh.ndim != 2 or mesh.shape[1] != columns or not len(mesh):
+            raise ValueError(f"mesh_xyz must have shape (N, {columns}): XYZ and the model's extra node "
+                             "channels, with at least one node")
         if impact.shape != (2,):
             raise ValueError("impact_xy must have shape (2,), in the same physical coordinate frame as the mesh")
         if times.ndim != 1 or not len(times) or np.any(np.diff(times) <= 0):
@@ -525,7 +591,7 @@ class HistoryPredictor:
         if self.model.neighborhood_blocks:
             start = self.model.impactor_nodes
             self.model.neighbor_cache.register_geometry(
-                mesh[start:], normalized_mesh[start:] * self.model.mesh_scale, self.model.neighborhood_k,
+                mesh[start:, :3], normalized_mesh[start:, :3] * self.model.mesh_scale, self.model.neighborhood_k,
             )
         normalized_impact = tensor(self.preprocessor.transform_indentor(impact)).unsqueeze(0)
         normalized_times = tensor(self.preprocessor.transform_time(times))
@@ -578,6 +644,7 @@ def main(argv=None):
     run = None
     try:
         model_kwargs = {key: getattr(args, key) for key in MODEL_DEFAULTS}
+        model_kwargs.update(node_feature_kwargs(config.node_features))
         if args.design_change_nodes:
             from mesh_design_change import DesignChangeHistoryNet
             model_kwargs.update({key: getattr(args, key) for key in DESIGN_CHANGE_DEFAULTS})
@@ -585,6 +652,10 @@ def main(argv=None):
         else:
             model = MeshImpactHistoryNet(**model_kwargs)
         logger.info("%s: %s", type(model).__name__, model_kwargs)
+        if model.impact_conditioning == "head_relative":
+            logger.info("Head-relative input: no impact location is read; every node is an offset from the "
+                        "centroid of the %s headform rows | mirror augmentation: %s | node features: %s",
+                        model.impactor_nodes, model.mirror_augmentation, config.node_features)
         if source_dir is not None:
             logger.info("Resume: %s | completed epochs: %s | next epoch: %s/%s",
                         args.resume_from, completed, completed + 1, config.num_epochs)
@@ -612,8 +683,13 @@ def main(argv=None):
         preprocessor = DataPreprocessor(config)
         data = preprocessor.load_all_data()
         validate_data(data)
-        if len(data["run_numbers"]) != config.num_samples:
-            logger.warning("Loaded %s of %s runs; see preprocessing warnings for missing files.", len(data["run_numbers"]), config.num_samples)
+        expected_runs = len(config.selected_runs) if config.selected_runs else config.num_samples
+        if len(data["run_numbers"]) != expected_runs:
+            logger.warning("Loaded %s of %s runs; see preprocessing warnings for missing files.", len(data["run_numbers"]), expected_runs)
+        if args.locations:
+            logger.info("Locations %s: %s runs | mesh parts: %s | %s nodes in the first mesh",
+                        sorted(args.locations), len(data["run_numbers"]), config.mesh_parts,
+                        len(data["mesh_geometries"][0]))
         if args.hic_range_threshold_percent is not None:
             from hic_location_filter import analyze, filter_data
             if set(data["run_numbers"]) != set(range(1, 1705)):
@@ -644,6 +720,15 @@ def main(argv=None):
         )
         train_loader, val_loader, test_loader, test_dataset = loaders
         train_dataset = train_loader.dataset
+        # Fixed-order, eval-mode pass over the training designs: the monitor and
+        # checkpoint selector when no validation design is held out, and the
+        # source of the exported training-set predictions.
+        train_eval_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=False,
+                                       collate_fn=collate_fn)
+        if not splits["validation"]["design_ids"]:
+            val_loader = train_eval_loader
+            logger.info("No validation design: val/* metrics are the training designs in eval mode, "
+                        "and they select the checkpoint. The test designs are never seen.")
         if source_dir is not None:
             preprocessor.load_scalers(str(source_dir / "scalers.joblib"))
         else:
@@ -759,6 +844,18 @@ def main(argv=None):
         metrics, predictions, targets = evaluator.evaluate(test_loader)
         write_json(output_dir / "metrics.json", metrics)
         export_predictions(output_dir / "test_acceleration_histories.csv", test_dataset, predictions, targets)
+        # One fixed-order pass over the training designs feeds the training-fit
+        # files, the location report and the design-difference report.
+        train_metrics, train_predictions, train_targets = evaluator.evaluate(train_eval_loader)
+        write_json(output_dir / "train_metrics.json", train_metrics)
+        export_predictions(output_dir / "train_acceleration_histories.csv", train_dataset,
+                           train_predictions, train_targets)
+        run.summary.update({f"train_eval/{key}": value for key, value in train_metrics.items()
+                            if np.isfinite(value)})
+        if args.locations:
+            from report_one_impact_location import write_report
+            report = write_report(output_dir)
+            logger.info("Location report: %s", report)
         from mesh_change_metrics import design_sensitivity_metrics
         from evaluate_design_sensitivity import write_sensitivity_report, sensitivity_log_values
         sensitivity = design_sensitivity_metrics(test_dataset, predictions, targets, config.samples_per_design)
@@ -769,15 +866,9 @@ def main(argv=None):
         logger.info("Matched-location design sensitivity: skill=%s, amplitude ratio=%s, alignment=%s; HIC15 skill=%s",
                     sensitivity["design_difference_skill"], sensitivity["difference_amplitude_ratio"],
                     sensitivity["difference_alignment_cosine"], sensitivity["hic15"]["design_difference_skill"])
-        from torch.utils.data import DataLoader
         from evaluate_design_difference_r2 import (
             design_difference_report, difference_log_values, write_design_difference_report,
         )
-        # The training loader shuffles; export train histories in dataset order.
-        train_eval_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=False,
-                                       collate_fn=train_loader.collate_fn)
-        _, train_predictions, train_targets = evaluator.evaluate(train_eval_loader)
-        export_predictions(output_dir / "train_acceleration_histories.csv", train_dataset, train_predictions, train_targets)
         difference = design_difference_report(config.data_format, config.samples_per_design, {
             "train": (train_dataset, train_predictions, train_targets),
             "test": (test_dataset, predictions, targets),

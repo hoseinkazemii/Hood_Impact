@@ -181,7 +181,9 @@ class MeshChangeAttentionNet(MeshImpactHistoryNet):
         update = self.change_pool(query[:, None], normalized, normalized, need_weights=False)[0][:, 0]
         return query + self.mesh_dropout(update)
 
-    def _encode_mesh(self, mesh, impact, condition):
+    def _encode_mesh(self, mesh, impact, condition, mirror=False):
+        if mirror:
+            raise ValueError("MeshChangeAttentionNet does not support mirror augmentation")
         ordinary = super()._encode_mesh(mesh, impact, condition)
         changes = self._encode_changes(mesh, impact, condition)
         return torch.cat((ordinary, changes), dim=0)

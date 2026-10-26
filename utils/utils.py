@@ -29,6 +29,18 @@ from pathlib import Path
 # the legacy HoodImpactor_<run>_COORD.csv files) and whose acceleration files use
 # the HoodImpact_<run>_SAE1000_interp1000.csv naming.
 INP_MESH_FORMATS = {"industrylike", "euroncap1704"}
+# Hood parts a mesh may be restricted to, as Abaqus element sets; None keeps
+# every node. The leading headform rows are always kept.
+MESH_PART_ELSETS = {"all": None, "inner": ("Hood_Inner-1-2",)}
+# Per-node channels appended after XYZ. "structure" adds, per design and in this
+# order: the panel (outer, inner, hinge as 0/1), the unit surface normal, and
+# log(1 + gap / 10 mm), the gap being the distance from an outer node to the
+# nearest inner node and from any other node to the nearest outer node. The
+# leading headform rows get zeros. normal_y changes sign in a mirror image.
+NODE_FEATURES = ("xyz", "structure")
+STRUCTURE_CHANNELS = ("outer", "inner", "hinge", "normal_x", "normal_y", "normal_z", "log_gap")
+MIRROR_ODD_STRUCTURE_CHANNELS = ("normal_y",)
+STRUCTURE_GAP_SCALE_MM = 10.0
 
 
 class Config:
@@ -53,6 +65,9 @@ class Config:
 
     prediction_target = "acceleration"  # options: "acceleration", "hic"
     num_samples = 1000
+    selected_runs = None  # optional subset of runs 1..num_samples to load (None = all)
+    mesh_parts = "all"  # "inner": headform rows + Hood_Inner frame only (.inp formats)
+    node_features = "xyz"  # "structure": + STRUCTURE_CHANNELS per node (euroncap1704)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     seed = 42
     max_train_time = None   # seconds (None = use full history)
@@ -301,6 +316,7 @@ class DataPreprocessor:
         self.accel_scaler = StandardScaler()
         self.hic_scaler = StandardScaler()
         self._fitted = False
+        self._structure_tables = {}
 
     def load_mesh_geometry(self, run_number: int) -> np.ndarray:
         """Load mesh geometry for a given run number.
@@ -309,7 +325,8 @@ class DataPreprocessor:
             run_number: Experiment run number (1-indexed)
 
         Returns:
-            coords: (N, 3) array of node coordinates
+            coords: (N, 3) array of node coordinates, followed by the
+                STRUCTURE_CHANNELS when ``config.node_features`` is "structure"
         """
         if self.config.data_format in INP_MESH_FORMATS:
             return self._load_mesh_from_inp(run_number)
@@ -330,8 +347,17 @@ class DataPreprocessor:
         stops at the next keyword line beginning with ``*``).
         """
         filepath = os.path.join(self.config.inp_dir, f"HoodImpact_{run_number}.inp")
+        elsets = MESH_PART_ELSETS[getattr(self.config, "mesh_parts", "all")]
+        ids, coords = (self._read_inp_nodes(filepath) if elsets is None
+                       else self._load_mesh_parts_from_inp(filepath, elsets))
+        if getattr(self.config, "node_features", "xyz") == "structure":
+            return np.hstack((coords, self._structure_channels(run_number, ids)))
+        return coords
 
-        coords = []
+    @staticmethod
+    def _read_inp_nodes(filepath: str):
+        """(IDs, (N, 3) XYZ) of the first ``*NODE`` block, in file order."""
+        ids, coords = [], []
         recording = False
         with open(filepath, "r") as f:
             for line in f:
@@ -347,9 +373,59 @@ class DataPreprocessor:
                     break
                 parts = s.split(",")
                 if len(parts) >= 4:
+                    ids.append(int(parts[0]))
                     coords.append([float(parts[1]), float(parts[2]), float(parts[3])])
 
-        return np.array(coords, dtype=np.float32)
+        return np.array(ids, dtype=np.int64), np.array(coords, dtype=np.float32)
+
+    @staticmethod
+    def _load_mesh_parts_from_inp(filepath: str, elsets):
+        """(IDs, XYZ) of the headform nodes and the nodes of ``elsets``, in deck order.
+
+        The 1704 decks list the rigid headform first, so a model that holds
+        out the leading ``impactor_nodes`` rows still finds exactly the
+        headform there.
+        """
+        from abaqus_scripts.inp_geom import Deck
+
+        deck = Deck(filepath)
+        keep = deck.impactor_node_ids()
+        for name in elsets:
+            keep |= deck.elset_nodes(name)
+        kept = [(node, xyz) for node, xyz in deck.nodes.items() if node in keep]
+        return (np.array([node for node, _ in kept], dtype=np.int64),
+                np.array([xyz for _, xyz in kept], dtype=np.float32))
+
+    def _structure_channels(self, run_number: int, ids: np.ndarray) -> np.ndarray:
+        """(N, len(STRUCTURE_CHANNELS)) of each mesh row, matched by node ID.
+
+        The channels belong to the run's design and are read once per design
+        from design_difference_data.load_design_geometry (cached on disk beside
+        inp_files). Its node set excludes the headform, whose leading rows get
+        zeros; any other unmatched node is an error.
+        """
+        design = (run_number - 1) // self.config.samples_per_design
+        if design not in self._structure_tables:
+            from design_difference_data import PANELS, load_design_geometry
+
+            geometry = load_design_geometry(design, Path(self.config.inp_dir).parent)
+            panel = geometry["panel"]
+            channels = np.column_stack([
+                *(panel == PANELS.index(name) for name in STRUCTURE_CHANNELS[:3]),
+                geometry["normal"],
+                np.log1p(geometry["gap"] / STRUCTURE_GAP_SCALE_MM),
+            ]).astype(np.float32)
+            self._structure_tables[design] = (np.asarray(geometry["ids"], dtype=np.int64), channels)
+        table_ids, table = self._structure_tables[design]
+        rows = np.minimum(np.searchsorted(table_ids, ids), len(table_ids) - 1)
+        found = table_ids[rows] == ids
+        missing = np.flatnonzero(~found)
+        if len(missing) and missing[-1] != len(missing) - 1:
+            raise ValueError(f"Run {run_number}: {len(missing)} mesh nodes have no structure channels "
+                             "and are not all leading headform rows")
+        channels = np.zeros((len(ids), table.shape[1]), dtype=np.float32)
+        channels[found] = table[rows[found]]
+        return channels
 
     def load_impact_coords(self) -> pd.DataFrame:
         """Load impactor positions for the industrylike dataset.
@@ -469,7 +545,8 @@ class DataPreprocessor:
         hic_values = []
         valid_run_numbers = []
 
-        for run_number in range(1, self.config.num_samples + 1):
+        runs = getattr(self.config, "selected_runs", None) or range(1, self.config.num_samples + 1)
+        for run_number in runs:
             try:
                 coords = self.load_mesh_geometry(run_number)
 
@@ -524,7 +601,8 @@ class DataPreprocessor:
         accelerations=None,
         hic_values=None,
     ):
-        all_mesh = np.concatenate(mesh_geometries, axis=0)  # (sum N_i, 3)
+        # XYZ only: extra node channels are already unit-scale and pass through.
+        all_mesh = np.concatenate([np.asarray(mesh)[:, :3] for mesh in mesh_geometries], axis=0)  # (sum N_i, 3)
         self.mesh_scaler.fit(all_mesh)
         self.indentor_scaler.fit(indentor_positions)  # (N_train, 2)
 
@@ -560,7 +638,11 @@ class DataPreprocessor:
         self._fitted = True
 
     def transform_mesh(self, mesh: np.ndarray) -> np.ndarray:
-        return self.mesh_scaler.transform(mesh)
+        """Standardize XYZ; extra per-node channels pass through unchanged."""
+        mesh = np.asarray(mesh)
+        if mesh.shape[1] == 3:
+            return self.mesh_scaler.transform(mesh)
+        return np.hstack((self.mesh_scaler.transform(mesh[:, :3]), mesh[:, 3:])).astype(np.float32, copy=False)
 
     def transform_indentor(self, indentor: np.ndarray) -> np.ndarray:
         return self.indentor_scaler.transform(indentor.reshape(1, -1)).squeeze(0)
