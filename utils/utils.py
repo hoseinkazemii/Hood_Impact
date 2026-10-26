@@ -29,6 +29,52 @@ from pathlib import Path
 # the legacy HoodImpactor_<run>_COORD.csv files) and whose acceleration files use
 # the HoodImpact_<run>_SAE1000_interp1000.csv naming.
 INP_MESH_FORMATS = {"industrylike", "euroncap1704"}
+# Which deck nodes become mesh rows. "all" is the whole first *NODE block
+# (headform first, then every hood node). "inner_panel" keeps only the nodes of
+# the hood inner panel's elements: no headform, outer skin, hinges or fasteners.
+MESH_NODE_SETS = ("all", "inner_panel")
+INNER_PANEL_ELSET = "Hood_Inner-1-2"
+
+
+def read_inp_nodes(path):
+    """IDs and coordinates of the first ``*NODE`` block of an Abaqus deck, in file order.
+
+    Later ``*NODE OUTPUT`` blocks are ignored because parsing stops at the next
+    keyword line.
+    """
+    ids, coords = [], []
+    recording = False
+    with open(path, "r") as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            if not recording:
+                recording = s.upper() == "*NODE"
+                continue
+            if s.startswith("*"):
+                break
+            parts = s.split(",")
+            if len(parts) >= 4:
+                ids.append(int(parts[0]))
+                coords.append([float(parts[1]), float(parts[2]), float(parts[3])])
+    return np.array(ids, dtype=np.int64), np.array(coords, dtype=np.float32)
+
+
+def inner_panel_node_ids(path):
+    """IDs of the nodes used by the hood inner panel's elements."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "abaqus_scripts"))
+    from inp_geom import Deck
+
+    return np.array(sorted(Deck(str(path)).elset_nodes(INNER_PANEL_ELSET)), dtype=np.int64)
+
+
+def mesh_node_ids(path, mesh_nodes="all"):
+    """IDs of the mesh rows DataPreprocessor loads from a deck, in row order."""
+    if mesh_nodes not in MESH_NODE_SETS:
+        raise ValueError(f"mesh_nodes must be one of {MESH_NODE_SETS}; got {mesh_nodes!r}")
+    ids, _ = read_inp_nodes(path)
+    return ids if mesh_nodes == "all" else ids[np.isin(ids, inner_panel_node_ids(path))]
 
 
 class Config:
@@ -301,6 +347,8 @@ class DataPreprocessor:
         self.accel_scaler = StandardScaler()
         self.hic_scaler = StandardScaler()
         self._fitted = False
+        # Inner-panel node IDs per design: every impact deck of a design shares them.
+        self._inner_panel_ids = {}
 
     def load_mesh_geometry(self, run_number: int) -> np.ndarray:
         """Load mesh geometry for a given run number.
@@ -325,31 +373,21 @@ class DataPreprocessor:
     def _load_mesh_from_inp(self, run_number: int) -> np.ndarray:
         """Parse the *NODE block of an Abaqus .inp file into an (N, 3) point cloud.
 
-        The first occurrence of a line equal to ``*NODE`` marks the main mesh
-        node block (later ``*NODE OUTPUT`` blocks are ignored because parsing
-        stops at the next keyword line beginning with ``*``).
+        ``config.mesh_nodes`` (default "all") selects the rows; "inner_panel"
+        keeps the inner panel's nodes in their file order, as mesh_node_ids does.
         """
         filepath = os.path.join(self.config.inp_dir, f"HoodImpact_{run_number}.inp")
-
-        coords = []
-        recording = False
-        with open(filepath, "r") as f:
-            for line in f:
-                s = line.strip()
-                if not s:
-                    continue
-                if not recording:
-                    if s.upper() == "*NODE":
-                        recording = True
-                    continue
-                # recording == True
-                if s.startswith("*"):
-                    break
-                parts = s.split(",")
-                if len(parts) >= 4:
-                    coords.append([float(parts[1]), float(parts[2]), float(parts[3])])
-
-        return np.array(coords, dtype=np.float32)
+        ids, coords = read_inp_nodes(filepath)
+        mesh_nodes = getattr(self.config, "mesh_nodes", "all")
+        if mesh_nodes == "all":
+            return coords
+        if mesh_nodes != "inner_panel":
+            raise ValueError(f"mesh_nodes must be one of {MESH_NODE_SETS}; got {mesh_nodes!r}")
+        per_design = getattr(self.config, "samples_per_design", None)
+        key = (run_number - 1) // per_design if per_design else run_number
+        if key not in self._inner_panel_ids:
+            self._inner_panel_ids[key] = inner_panel_node_ids(filepath)
+        return coords[np.isin(ids, self._inner_panel_ids[key])]
 
     def load_impact_coords(self) -> pd.DataFrame:
         """Load impactor positions for the industrylike dataset.

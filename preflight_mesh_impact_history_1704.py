@@ -27,9 +27,11 @@ from train_mesh_impact_history import (
     DEFAULT_TEST_DESIGNS,
     DEFAULT_VAL_DESIGNS,
     DESIGN_CHANGE_DEFAULTS,
+    MESH_NODE_SETS,
     MODEL_DEFAULTS,
     MeshImpactHistoryNet,
     add_model_arguments,
+    apply_mesh_nodes,
     parse_boolean,
     parse_args as parse_training_args,
     resolve_splits,
@@ -187,6 +189,19 @@ def validate_impactor_boundary(root, impactor_nodes):
           f"the remaining {len(first) - impactor_nodes} structural nodes are identical")
 
 
+def validate_inner_panel(root):
+    """Confirm inner-panel meshes hold no moving headform row: runs 1 and 2 (design 0) must match."""
+    config = SimpleNamespace(data_format="euroncap1704", inp_dir=str(root / "inp_files"),
+                             mesh_nodes="inner_panel", samples_per_design=SAMPLES_PER_DESIGN)
+    full = DataPreprocessor(SimpleNamespace(**{**vars(config), "mesh_nodes": "all"})).load_mesh_geometry(1)
+    processor = DataPreprocessor(config)
+    first, second = processor.load_mesh_geometry(1), processor.load_mesh_geometry(2)
+    if first.shape != second.shape or not np.array_equal(first, second):
+        raise ValueError("Inner-panel meshes of runs 1 and 2 (both design 0) differ; a moving node was kept")
+    print(f"Mesh nodes: inner panel only | {len(first)} of {len(full)} deck nodes "
+          f"(headform, outer skin, hinges and fasteners dropped); identical across impacts")
+
+
 def validate_first_run(root, impact_xy, preprocessing=None):
     """Check mesh parsing and the configured cutoff/stride against source data."""
     preprocessing = Config if preprocessing is None else preprocessing
@@ -204,6 +219,8 @@ def validate_first_run(root, impact_xy, preprocessing=None):
         acceleration_dir=str(root / "output_history_acc"),
         time_subsample_stride=stride,
         max_train_time=cutoff,
+        mesh_nodes=getattr(preprocessing, "mesh_nodes", "all"),
+        samples_per_design=SAMPLES_PER_DESIGN,
     )
     processor = DataPreprocessor(config)
     mesh = processor.load_mesh_geometry(1)
@@ -328,6 +345,7 @@ def parse_args(argv=None):
     parser.add_argument("--val-designs", type=int, nargs="+", default=list(DEFAULT_VAL_DESIGNS))
     parser.add_argument("--decoder", choices=sorted(DECODER_BLOCKS), default=MODEL_DEFAULTS["decoder"])
     add_model_arguments(parser, EXPERIMENT_MODEL_KEYS)
+    parser.add_argument("--mesh-nodes", choices=MESH_NODE_SETS)
     parser.add_argument("--design-change-nodes", type=parse_boolean, default=False, metavar="{true,false}")
     for key, default in DESIGN_CHANGE_DEFAULTS.items():
         parser.add_argument(f"--{key.replace('_', '-')}", type=type(default), default=default)
@@ -344,12 +362,13 @@ def parse_args(argv=None):
         if saved.data_format != "euroncap1704" or saved.num_samples != NUM_RUNS or saved.samples_per_design != SAMPLES_PER_DESIGN:
             parser.error("The 1704 resume launcher requires a full euroncap1704 run")
         for key in (*EXPERIMENT_MODEL_KEYS, "decoder", "test_designs", "val_designs",
-                    "batch_size", "time_subsample_stride", "max_train_time",
+                    "batch_size", "time_subsample_stride", "max_train_time", "mesh_nodes",
                     "design_change_nodes", *DESIGN_CHANGE_DEFAULTS):
             setattr(args, key, getattr(saved, key))
         if args.data_root is None:
             args.data_root = str(Path(saved.inp_dir).parent)
     args.data_root = args.data_root or DEFAULT_DATA_ROOT
+    apply_mesh_nodes(args)
     return args
 
 
@@ -357,7 +376,7 @@ def main(argv=None):
     args = parse_args(argv)
     try:
         validate_runtime(args.require_cuda)
-        validate_location_shortcuts(args.impactor_nodes, args.pool_impactor_nodes)
+        validate_location_shortcuts(args.impactor_nodes, args.pool_impactor_nodes, args.mesh_nodes)
         splits = validate_splits(args.test_designs, args.val_designs)
         if args.allow_clone_leak:
             print("Cluster check: SKIPPED (--allow-clone-leak); scores may measure retrieval")
@@ -371,7 +390,9 @@ def main(argv=None):
             print(f"Cluster check: passed | whole clusters held out: "
                   f"{held_clusters or 'none (no held-out design shares a cluster)'}")
         root, impact_xy = validate_dataset(args.data_root)
-        if args.impactor_nodes:
+        if args.mesh_nodes == "inner_panel":
+            validate_inner_panel(root)
+        elif args.impactor_nodes:
             validate_impactor_boundary(root, args.impactor_nodes)
         elif args.neighborhood_layers:
             print("WARNING: --impactor-nodes 0 keeps the moving headform in the local graph, "
@@ -381,9 +402,10 @@ def main(argv=None):
         if args.design_change_nodes:
             # Parses every deck once (cached for training) and checks the base rule.
             from design_change_nodes import find_design_changes
-            design_changes, report = find_design_changes(root, range(NUM_DESIGNS), SAMPLES_PER_DESIGN)
+            design_changes, report = find_design_changes(root, range(NUM_DESIGNS), SAMPLES_PER_DESIGN,
+                                                         mesh_nodes=args.mesh_nodes)
             print("Design-change nodes: " + " | ".join(
-                f"cluster {cluster['designs']} base {cluster['base']}: {cluster['change_nodes']} nodes"
+                f"cluster {cluster['designs']} base {cluster['base']}: {cluster['change_nodes_in_mesh']} nodes"
                 for cluster in report["clusters"]))
         if args.require_cuda:
             validate_cuda_model(data, decoder=args.decoder,

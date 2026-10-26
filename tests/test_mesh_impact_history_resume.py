@@ -44,7 +44,7 @@ def training_args(path):
             "--epochs", "4", "--batch-size", "4", "--time-subsample-stride", "4",
             "--width", "8", "--num-heads", "2", "--num-latents", "2",
             "--latent-layers", "1", "--temporal-layers", "1", "--neighborhood-layers", "2", "--neighborhood-k", "3",
-            "--impactor-nodes", "2", "--dropout", "0.1",
+            "--mesh-nodes", "all", "--impactor-nodes", "2", "--dropout", "0.1",
             "--device", "cpu", "--wandb-mode", "disabled", "--output-dir", str(path)]
 
 

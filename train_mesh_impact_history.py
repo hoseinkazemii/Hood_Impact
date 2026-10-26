@@ -25,6 +25,8 @@ from mesh_impact_history import (
 )
 from mesh_impact_history_reporting import export_training_history_plot
 from utils.utils import (
+    INP_MESH_FORMATS,
+    MESH_NODE_SETS,
     Config,
     DataPreprocessor,
     Evaluator,
@@ -67,8 +69,13 @@ MODEL_DEFAULTS = {
 }
 BOOLEAN_MODEL_KEYS = tuple(key for key, value in MODEL_DEFAULTS.items() if isinstance(value, bool))
 # Decoder path over the near-clone change nodes (mesh_design_change.py), used
-# with --design-change-nodes true; these keys reach only that model.
-DESIGN_CHANGE_DEFAULTS = {"design_change_layers": 2, "design_change_fourier_octaves": 5}
+# with --design-change-nodes true; these keys reach only that model. The small
+# path won the 2026-10-25 sweep (run 3447060; README_design_change_nodes.md).
+# Its tokens are each change node's XYZ (octaves apply to impact_relative only).
+DESIGN_CHANGE_DEFAULTS = {"design_change_layers": 0, "design_change_fourier_octaves": 2,
+                          "design_change_features": "xyz"}
+# Fresh runs see only the hood inner panel; runs saved without the key used "all".
+DEFAULT_MESH_NODES = "inner_panel"
 ARCHITECTURES = ("MeshImpactHistoryNet", "DesignChangeHistoryNet")
 # Fresh experiments hold out the whole B cluster. Resumes restore saved splits.
 DEFAULT_TEST_DESIGNS = (4, 5)
@@ -103,8 +110,18 @@ def add_model_arguments(parser, keys):
             parser.add_argument(option, type=type(default), default=default)
 
 
-def validate_location_shortcuts(impactor_nodes, pool_impactor_nodes):
+def apply_mesh_nodes(args):
+    """Default the node set by mesh format; inner-panel meshes have no headform rows to hold out."""
+    if args.mesh_nodes is None:
+        args.mesh_nodes = "all" if getattr(args, "data_format", None) == "legacy" else DEFAULT_MESH_NODES
+    if args.mesh_nodes == "inner_panel":
+        args.impactor_nodes = 0
+
+
+def validate_location_shortcuts(impactor_nodes, pool_impactor_nodes, mesh_nodes="all"):
     """Refuse a fresh run that cannot keep the headform out of pooling."""
+    if mesh_nodes == "inner_panel":
+        return
     if not pool_impactor_nodes and not impactor_nodes:
         raise ValueError(
             "--impactor-nodes 0 leaves the moving headform rows in pooling, where they act as a "
@@ -120,6 +137,12 @@ def parse_args(argv=None):
         parser.add_argument(f"--{name}")
     parser.add_argument("--num-samples", type=int)
     parser.add_argument("--samples-per-design", type=int)
+    parser.add_argument(
+        "--mesh-nodes", choices=MESH_NODE_SETS,
+        help="inner_panel (default for .inp decks) loads only the hood inner panel's nodes: no headform, "
+             "outer skin, hinges or fasteners, so --impactor-nodes becomes 0. all (default for CSV "
+             "meshes) loads every node.",
+    )
     # Cluster B never participates in optimization or checkpoint selection.
     parser.add_argument("--test-designs", type=int, nargs="+", default=list(DEFAULT_TEST_DESIGNS), help="Zero-based design IDs.")
     parser.add_argument("--val-designs", type=int, nargs="+", default=list(DEFAULT_VAL_DESIGNS), help="Zero-based design IDs.")
@@ -180,6 +203,7 @@ def parse_args(argv=None):
         parser.error("WANDB_MODE must be disabled, offline, or online; override it with --wandb-mode")
     if args.resume_from:
         restore_resume_arguments(args, parser, sys.argv[1:] if argv is None else argv)
+    apply_mesh_nodes(args)
     return args
 
 
@@ -208,9 +232,14 @@ def restore_resume_arguments(args, parser, argv):
     if saved["training"].get("loss", "normalized_acceleration_mse") != "normalized_acceleration_mse":
         parser.error("This checkpoint used a different training objective; start a fresh acceleration-MSE run")
     splits = json.loads((source_dir / "splits.json").read_text(encoding="utf-8"))
-    settings = {**MODEL_DEFAULTS, **DESIGN_CHANGE_DEFAULTS, **saved_model_kwargs(saved["architecture"]["kwargs"]),
+    model_kwargs = saved_model_kwargs(saved["architecture"]["kwargs"])
+    if architecture == "DesignChangeHistoryNet":
+        from mesh_design_change import saved_design_change_kwargs
+        model_kwargs = saved_design_change_kwargs(model_kwargs)
+    settings = {**MODEL_DEFAULTS, **DESIGN_CHANGE_DEFAULTS, **model_kwargs,
                 "design_change_nodes": architecture == "DesignChangeHistoryNet",
                 **{key: saved["data"][key] for key in ("data_format", "num_samples", "samples_per_design")},
+                "mesh_nodes": saved["data"].get("mesh_nodes", "all"),
                 **{key: saved["training"][key] for key in ("batch_size", "weight_decay", "seed")},
                 "epochs": saved["training"]["num_epochs"],
                 "lr": saved["training"]["learning_rate"],
@@ -243,7 +272,7 @@ def build_config(args):
     for key in (
         "data_format", "inp_dir", "impact_coords_path", "mesh_geometry_dir", "doe_path",
         "acceleration_dir", "num_samples", "samples_per_design", "epochs", "batch_size",
-        "lr", "weight_decay", "seed", "max_train_time", "time_subsample_stride",
+        "lr", "weight_decay", "seed", "max_train_time", "time_subsample_stride", "mesh_nodes",
     ):
         value = getattr(args, key)
         if value is not None:
@@ -253,6 +282,9 @@ def build_config(args):
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     overrides["output_dir"] = str(Path(args.output_dir or Path("runs") / "mesh_impact_history" / stamp).resolve())
     config = Config(**overrides)
+    if config.mesh_nodes != "all" and config.data_format not in INP_MESH_FORMATS:
+        raise ValueError("--mesh-nodes inner_panel reads the panels from .inp decks; use --mesh-nodes all "
+                         "for CSV meshes")
     for key in ("num_samples", "samples_per_design", "num_epochs", "batch_size", "time_subsample_stride"):
         value = getattr(config, key)
         if not isinstance(value, int) or isinstance(value, bool) or value < 1:
@@ -338,6 +370,7 @@ def resolved_config(config, args, model_kwargs, prediction_grid):
     )
     data_config = {key: getattr(config, key) for key in data_keys}
     data_config.update({key: str(Path(getattr(config, key)).resolve()) for key in path_keys})
+    data_config["mesh_nodes"] = config.mesh_nodes
     architecture = "DesignChangeHistoryNet" if getattr(args, "design_change_nodes", False) else "MeshImpactHistoryNet"
     return {
         "format_version": 1,
@@ -465,11 +498,13 @@ class HistoryPredictor:
     ``predictor.time_points``. Optional time points must already be subsampled.
     """
 
-    def __init__(self, model, preprocessor, time_points, device="cpu"):
+    def __init__(self, model, preprocessor, time_points, device="cpu", mesh_nodes="all"):
         self.device = torch.device(device)
         self.model = model.to(self.device).eval()
         self.preprocessor = preprocessor
         self.time_points = np.asarray(time_points, dtype=np.float32).copy()
+        # The node set predict() expects meshes in (utils.utils.MESH_NODE_SETS).
+        self.mesh_nodes = mesh_nodes
 
     @classmethod
     def from_run(cls, output_dir, device="cpu", neighbor_cache_dir=None):
@@ -478,17 +513,20 @@ class HistoryPredictor:
         architecture_name = saved.get("architecture", {}).get("name")
         if saved.get("format_version") != 1 or architecture_name not in (*ARCHITECTURES, "MeshChangeAttentionNet"):
             raise ValueError("This directory is not a supported mesh history run")
-        config = SimpleNamespace(**saved["preprocessing"], device=torch.device(device))
+        # Callers pass meshes loaded with the run's mesh_nodes (DataPreprocessor does this).
+        mesh_nodes = saved["data"].get("mesh_nodes", "all")
+        config = SimpleNamespace(**saved["preprocessing"], mesh_nodes=mesh_nodes, device=torch.device(device))
         preprocessor = DataPreprocessor(config)
         preprocessor.load_scalers(str(run_dir / "scalers.joblib"))
         model_class = MeshImpactHistoryNet
         if architecture_name == "MeshChangeAttentionNet":
             from mesh_change_attention import MeshChangeAttentionNet
             model_class = MeshChangeAttentionNet
-        elif architecture_name == "DesignChangeHistoryNet":
-            from mesh_design_change import DesignChangeHistoryNet
-            model_class = DesignChangeHistoryNet
-        model = model_class(**saved_model_kwargs(saved["architecture"]["kwargs"]))
+        model_kwargs = saved_model_kwargs(saved["architecture"]["kwargs"])
+        if architecture_name == "DesignChangeHistoryNet":
+            from mesh_design_change import DesignChangeHistoryNet, saved_design_change_kwargs
+            model_class, model_kwargs = DesignChangeHistoryNet, saved_design_change_kwargs(model_kwargs)
+        model = model_class(**model_kwargs)
         checkpoint = torch.load(run_dir / CHECKPOINT_NAME, map_location="cpu", weights_only=True)
         model.load_state_dict(checkpoint["model_state_dict"], strict=True)
         if architecture_name == "DesignChangeHistoryNet":
@@ -501,7 +539,7 @@ class HistoryPredictor:
             directory = neighbor_cache_dir or (stored if stored and Path(stored).is_dir() else None)
             model.neighbor_cache.directory = Path(directory).expanduser() if directory else default_neighbor_cache_directory(saved["data"]["data_format"])
         times = np.load(run_dir / "prediction_times.npy", allow_pickle=False)
-        return cls(model, preprocessor, times, device=device)
+        return cls(model, preprocessor, times, device=device, mesh_nodes=mesh_nodes)
 
     @torch.no_grad()
     def predict(self, mesh_xyz, impact_xy, sampled_time_points=None):
@@ -542,7 +580,7 @@ class HistoryPredictor:
 
 def main(argv=None):
     args = parse_args(argv)
-    validate_location_shortcuts(args.impactor_nodes, args.pool_impactor_nodes)
+    validate_location_shortcuts(args.impactor_nodes, args.pool_impactor_nodes, args.mesh_nodes)
     config = build_config(args)
     output_dir = Path(config.output_dir)
     # A new run cannot accidentally evaluate a leftover checkpoint from old work.
@@ -604,14 +642,17 @@ def main(argv=None):
             from design_change_nodes import find_design_changes
             design_changes, design_change_report = find_design_changes(
                 Path(config.inp_dir).parent, range(config.num_samples // config.samples_per_design),
-                config.samples_per_design,
+                config.samples_per_design, mesh_nodes=config.mesh_nodes,
             )
             for cluster in design_change_report["clusters"]:
-                logger.info("Design-change nodes: cluster %s | base %s | %s nodes",
-                            cluster["designs"], cluster["base"], cluster["change_nodes"])
+                logger.info("Design-change nodes: cluster %s | base %s | %s nodes, %s in the mesh",
+                            cluster["designs"], cluster["base"], cluster["change_nodes"],
+                            cluster["change_nodes_in_mesh"])
         preprocessor = DataPreprocessor(config)
         data = preprocessor.load_all_data()
         validate_data(data)
+        logger.info("Mesh nodes: %s | %s rows in run %s | network impactor_nodes=%s", config.mesh_nodes,
+                    len(data["mesh_geometries"][0]), data["run_numbers"][0], model.impactor_nodes)
         if len(data["run_numbers"]) != config.num_samples:
             logger.warning("Loaded %s of %s runs; see preprocessing warnings for missing files.", len(data["run_numbers"]), config.num_samples)
         if args.hic_range_threshold_percent is not None:

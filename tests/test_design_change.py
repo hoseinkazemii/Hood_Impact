@@ -123,6 +123,25 @@ class DesignChangeHistoryNetTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "no design_changes table"):
             self.predict(model)
 
+    def test_tokens_are_each_change_nodes_normalized_xyz(self):
+        model = self.model()
+        model.set_coordinate_scalers([10, -20, 5], [100, 50, 25], [0, 0], [100, 100])
+        self.assertEqual(model.change_embedding[0].in_features, 3)
+        static = torch.as_tensor(self.table.static[1:2])
+        features = model.change_features(static, torch.zeros(1, 2))
+        expected = (static[..., :3] + static[..., 3:6] - torch.tensor([10.0, -20, 5])) / torch.tensor([100.0, 50, 25])
+        torch.testing.assert_close(features, expected)
+
+    def test_saved_runs_keep_their_impact_relative_tokens(self):
+        from mesh_design_change import saved_design_change_kwargs
+        old = saved_design_change_kwargs({**self.KWARGS, "design_change_fourier_octaves": 5})
+        self.assertEqual(old["design_change_features"], "impact_relative")
+        self.assertEqual(DesignChangeHistoryNet(**old).change_embedding[0].in_features, 30)
+        new = saved_design_change_kwargs({**self.KWARGS, "design_change_features": "xyz"})
+        self.assertEqual(new["design_change_features"], "xyz")
+        with self.assertRaisesRegex(ValueError, "design_change_features"):
+            DesignChangeHistoryNet(**self.KWARGS, design_change_features="xy")
+
     def test_table_round_trip(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "table.npz"

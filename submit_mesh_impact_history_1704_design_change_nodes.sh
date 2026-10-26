@@ -15,6 +15,12 @@
 #                                base (designs 0, 4, 6 and 10).
 # The readout starts at zero, so with seed 42 the network starts exactly as the
 # baseline did, and the base designs always get the backbone's prediction.
+# The change path defaults to the sweep winner (run 3447060): no change
+# self-attention layers. Since 2026-10-26 each change token is just the node's
+# XYZ (--design-change-features xyz), and the network sees only the hood inner
+# panel (--mesh-nodes inner_panel: no headform, outer skin, hinges or
+# fasteners). The 2026-10 runs used the whole deck and 18- or 30-input tokens;
+# the ..._small/_regularized wrappers pin those settings to repeat them.
 # Compare design_difference_r2.json, test_design_sensitivity.json and
 # hic_metrics.json with the baseline run. See README_design_change_nodes.md.
 #
@@ -28,8 +34,10 @@ set -euo pipefail
 
 PROJECT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 export HOOD_MESH_DESIGN_CHANGE_NODES="true"
-export HOOD_MESH_DESIGN_CHANGE_LAYERS="${HOOD_MESH_DESIGN_CHANGE_LAYERS:-2}"
-export HOOD_MESH_DESIGN_CHANGE_FOURIER_OCTAVES="${HOOD_MESH_DESIGN_CHANGE_FOURIER_OCTAVES:-5}"
+export HOOD_MESH_DESIGN_CHANGE_LAYERS="${HOOD_MESH_DESIGN_CHANGE_LAYERS:-0}"
+export HOOD_MESH_DESIGN_CHANGE_FOURIER_OCTAVES="${HOOD_MESH_DESIGN_CHANGE_FOURIER_OCTAVES:-2}"
+export HOOD_MESH_DESIGN_CHANGE_FEATURES="${HOOD_MESH_DESIGN_CHANGE_FEATURES:-xyz}"
+export HOOD_MESH_MESH_NODES="${HOOD_MESH_MESH_NODES:-inner_panel}"
 export HOOD_MESH_GEOMETRY_FILM="none"
 export HOOD_MESH_POOLING_QUERY_RESIDUAL="false"
 export HOOD_MESH_POOL_IMPACTOR_NODES="false"
@@ -48,8 +56,9 @@ export HOOD_MESH_RUN_NAME="${HOOD_MESH_RUN_NAME:-mesh_history_clusterB_k256_four
 # a slow W&B start (job 3317059 timed out) before failing ahead of data loading.
 export WANDB_MODE="${WANDB_MODE:-online}"
 
-printf 'Design-change nodes: ON | %s change self-attention layers | %s sin/cos octaves of impact-relative XY\n' \
-    "${HOOD_MESH_DESIGN_CHANGE_LAYERS}" "${HOOD_MESH_DESIGN_CHANGE_FOURIER_OCTAVES}"
+printf 'Design-change nodes: ON | %s change self-attention layers | token features %s\n' \
+    "${HOOD_MESH_DESIGN_CHANGE_LAYERS}" "${HOOD_MESH_DESIGN_CHANGE_FEATURES}"
+printf 'Mesh nodes: %s\n' "${HOOD_MESH_MESH_NODES}"
 printf 'Location shortcuts: query residual OFF | headform rows excluded from pooling | geometry FiLM none\n'
 printf 'Baseline for comparison: 20261016_151923_3394500_1704 (same settings, no change nodes)\n'
 printf 'Training: %s epochs | batch %s | lr %s | weight decay %s | seed %s | plain acceleration MSE\n' \

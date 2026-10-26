@@ -4,19 +4,17 @@ Pooling compresses the ~38k hood nodes into 256 tokens, and near-clone designs
 differ at only 110-333 of them, so the pooled memory hardly changes between
 them (0.5% relative after pooling against 0.8% at the node embedding; probe of
 run 20261016_151923_3394500_1704). Here the change nodes found by
-design_change_nodes.py skip pooling. Each one becomes its own token, built from:
+design_change_nodes.py skip pooling. Each one becomes its own token, built from
+its XYZ in this design, normalized as the backbone's mesh input
+(``design_change_features="xyz"``, the default).
 
-* its position relative to the impact point: XY offset and distance
-  (/ 250 mm), and sin/cos of the offset at wavelengths 800 / 2^k mm;
-* its displacement from the cluster base (/ 10 mm) and the displacement length;
-* the base inner-outer panel gap and its change (/ 10 mm), and an outer-panel flag.
+Runs before 2026-10-26 used ``"impact_relative"`` tokens instead: the XY offset
+from the impact point and its distance (/ 250 mm), sin/cos of the offset at
+wavelengths 800 / 2^k mm, the displacement from the cluster base (/ 10 mm) and
+its length, the base inner-outer panel gap and its change, and an outer-panel flag.
 
-The impact-relative position is the part meant to transfer to held-out
-designs. It describes "a patch raised 10 mm, 40 mm from the head", not where
-on this particular hood the patch sits.
-
-``design_change_layers`` self-attention blocks run over each design's change
-tokens plus one learned null token. After every decoder block the time queries
+``design_change_layers`` self-attention blocks (default none) run over each
+design's change tokens plus one learned null token. After every decoder block the time queries
 read these tokens with a second cross-attention (:class:`ChangeReadout`). Its
 values are scaled by each node's displacement, and its output projection starts
 at zero. So:
@@ -51,6 +49,14 @@ CHANGE_POSITION_SCALE_MM = 250.0
 CHANGE_DISPLACEMENT_SCALE_MM = 10.0
 CHANGE_LONGEST_WAVELENGTH_MM = 800.0
 TABLE_FILE = "design_change_nodes.npz"
+# Change-token inputs: the node's XYZ (default), or the impact-relative position,
+# displacement, panel gap and panel flag that runs before 2026-10-26 used.
+CHANGE_FEATURES = ("xyz", "impact_relative")
+
+
+def saved_design_change_kwargs(kwargs: dict) -> dict:
+    """Model kwargs of a saved DesignChangeHistoryNet; older configs used impact-relative tokens."""
+    return {"design_change_features": "impact_relative", **kwargs}
 
 
 class DesignChangeTable:
@@ -172,9 +178,12 @@ class ChangeReadout(nn.Module):
 class DesignChangeHistoryNet(MeshImpactHistoryNet):
     """MeshImpactHistoryNet whose decoder also reads the design-change nodes directly."""
 
-    def __init__(self, design_change_layers: int = 2, design_change_fourier_octaves: int = 5, **kwargs):
+    def __init__(self, design_change_layers: int = 0, design_change_fourier_octaves: int = 2,
+                 design_change_features: str = "xyz", **kwargs):
         if isinstance(design_change_layers, bool) or not isinstance(design_change_layers, int) or design_change_layers < 0:
             raise ValueError("design_change_layers must be a nonnegative integer")
+        if design_change_features not in CHANGE_FEATURES:
+            raise ValueError(f"design_change_features must be one of {CHANGE_FEATURES}; got {design_change_features!r}")
         if (isinstance(design_change_fourier_octaves, bool) or not isinstance(design_change_fourier_octaves, int)
                 or design_change_fourier_octaves < 1):
             raise ValueError("design_change_fourier_octaves must be a positive integer")
@@ -182,13 +191,15 @@ class DesignChangeHistoryNet(MeshImpactHistoryNet):
         if self.node_extra_features:
             raise ValueError("DesignChangeHistoryNet reads XYZ meshes; node_extra_features must be 0")
         self.design_change_layers = design_change_layers
+        self.design_change_features = design_change_features
         # Added after every backbone module, so one seed gives the backbone the
         # same initial weights as MeshImpactHistoryNet.
         frequencies = 2 * math.pi * 2.0 ** torch.arange(design_change_fourier_octaves) / CHANGE_LONGEST_WAVELENGTH_MM
         self.register_buffer("change_frequencies", frequencies.float(), persistent=False)
         width = self.width
+        inputs = 3 if design_change_features == "xyz" else 10 + 4 * design_change_fourier_octaves
         self.change_embedding = nn.Sequential(
-            nn.Linear(10 + 4 * design_change_fourier_octaves, width), nn.GELU(),
+            nn.Linear(inputs, width), nn.GELU(),
             nn.Linear(width, width), nn.LayerNorm(width),
         )
         self.change_null_token = nn.Parameter(torch.empty(1, 1, width))
@@ -204,8 +215,14 @@ class DesignChangeHistoryNet(MeshImpactHistoryNet):
         self.design_changes = None
 
     def change_features(self, static: Tensor, impact_mm: Tensor) -> Tensor:
-        """(B, M, 10 + 4 * octaves) token inputs from static rows (B, M, S) and impact XY (B, 2) in mm."""
+        """Token inputs from static rows (B, M, S) and impact XY (B, 2) in mm.
+
+        "xyz": (B, M, 3), the node's coordinates in this design, normalized as the
+        backbone's mesh input. "impact_relative": (B, M, 10 + 4 * octaves).
+        """
         base, displacement = static[..., :3], static[..., 3:6]
+        if self.design_change_features == "xyz":
+            return (base + displacement - self.mesh_mean) / self.mesh_scale
         relative = base[..., :2] - impact_mm[:, None, :]
         phases = (relative.unsqueeze(-1) * self.change_frequencies).flatten(2)
         return torch.cat((

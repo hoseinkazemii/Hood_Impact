@@ -63,6 +63,7 @@ else
     printf 'Decoder arm: %s\n' "${DECODER}"
     printf 'Geometry memory FiLM: %s\n' "${HOOD_MESH_GEOMETRY_FILM:-none}"
     printf 'Design-change nodes: %s\n' "${HOOD_MESH_DESIGN_CHANGE_NODES:-false}"
+    printf 'Mesh nodes: %s\n' "${HOOD_MESH_MESH_NODES:-inner_panel (training default)}"
 fi
 printf 'W&B: %s | project: %s | entity: %s\n' "${WANDB_MODE}" "${WANDB_PROJECT}" "${WANDB_ENTITY:-default team}"
 module list 2>&1 || true
@@ -83,6 +84,7 @@ for option in NEIGHBORHOOD_LAYERS:neighborhood-layers NEIGHBORHOOD_K:neighborhoo
     GEOMETRY_FILM:geometry-film GEOMETRY_FOURIER_OCTAVES:geometry-fourier-octaves \
     DESIGN_CHANGE_NODES:design-change-nodes DESIGN_CHANGE_LAYERS:design-change-layers \
     DESIGN_CHANGE_FOURIER_OCTAVES:design-change-fourier-octaves \
+    DESIGN_CHANGE_FEATURES:design-change-features MESH_NODES:mesh-nodes \
     BATCH_SIZE:batch-size TIME_SUBSAMPLE_STRIDE:time-subsample-stride MAX_TRAIN_TIME:max-train-time; do
     variable="HOOD_MESH_${option%%:*}"
     if [[ -n "${!variable}" ]]; then

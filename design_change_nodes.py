@@ -135,20 +135,28 @@ def near_clone_changes(geometries, max_nodes=NEAR_CLONE_MAX_NODES, threshold_mm=
     return changes, report
 
 
-def find_design_changes(data_dir, designs, samples_per_design):
+def find_design_changes(data_dir, designs, samples_per_design, mesh_nodes="all"):
     """near_clone_changes on the decks, plus each change node's training-mesh row.
 
-    Rows index the mesh of every run of the design (first ``*NODE`` block of its
-    deck, headform included); the trainer checks them against the loaded meshes.
+    Rows index the mesh of every run of the design, as DataPreprocessor loads it
+    with ``mesh_nodes``; the trainer checks them against the loaded meshes. Change
+    nodes outside that mesh (with "inner_panel": 4 outer-skin nodes of cluster C)
+    are dropped.
     """
+    from utils.utils import mesh_node_ids
+
     data_dir = Path(data_dir)
     geometries = {design: load_design_geometry(design, data_dir) for design in designs}
     changes, report = near_clone_changes(geometries)
     for design, change in changes.items():
         deck = data_dir / "inp_files" / f"HoodImpact_{design * samples_per_design + 1}.inp"
-        row_of = {node: row for row, node in enumerate(inp_node_ids(deck))}
-        missing = [node for node in change["node_ids"] if node not in row_of]
-        if missing:
-            raise ValueError(f"Design {design}: change nodes {missing[:5]} are not in {deck.name}")
+        row_of = {node: row for row, node in enumerate(mesh_node_ids(deck, mesh_nodes))}
+        kept = np.array([node in row_of for node in change["node_ids"]], dtype=bool)
+        if mesh_nodes == "all" and not kept.all():
+            raise ValueError(f"Design {design}: change nodes {change['node_ids'][~kept][:5]} are not in {deck.name}")
+        change["node_ids"], change["static"] = change["node_ids"][kept], change["static"][kept]
         change["rows"] = np.array([row_of[node] for node in change["node_ids"]], dtype=np.int64)
+    report["mesh_nodes"] = mesh_nodes
+    for cluster in report["clusters"]:
+        cluster["change_nodes_in_mesh"] = len(changes[cluster["designs"][0]]["node_ids"])
     return changes, report

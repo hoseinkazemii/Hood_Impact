@@ -470,6 +470,7 @@ printf 'K=%s\\nLAYERS=%s\\nTIME=%s\\nIMPACT=%s\\nTEST=%s\\nVAL=%s\\nEPOCHS=%s\\n
     "$HOOD_MESH_IMPACT_CONDITIONING" "$HOOD_MESH_TEST_DESIGNS" "$HOOD_MESH_VAL_DESIGNS" "$HOOD_MESH_EPOCHS" \\
     "$HOOD_MESH_BATCH_SIZE" "$HOOD_MESH_SEED"
 printf 'NAME=%s\\nTRACKING=%s\\n' "$HOOD_MESH_RUN_NAME" "$WANDB_MODE"
+printf 'MESH=%s\\nFEATURES=%s\\n' "$HOOD_MESH_MESH_NODES" "$HOOD_MESH_DESIGN_CHANGE_FEATURES"
 printf 'ARG=%s\\n' "$@"
 """)
         # Stale exports from other experiments must not leak into the comparison.
@@ -479,10 +480,10 @@ printf 'ARG=%s\\n' "$@"
                         HOOD_MESH_LOCATION_HOLDOUT="/stale/split.json", HOOD_MESH_NEIGHBORHOOD_K="16",
                         HOOD_MESH_TEST_DESIGNS="10 11")
         output = self.launch("submit_mesh_impact_history_1704_design_change_nodes.sh")
-        for expected in ("CHANGE=true", "CHANGE_LAYERS=2", "CHANGE_OCTAVES=5", "FILM=none", "RESIDUAL=false",
+        for expected in ("CHANGE=true", "CHANGE_LAYERS=0", "CHANGE_OCTAVES=2", "FILM=none", "RESIDUAL=false",
                          "POOL_HEADFORM=false", "IMPACTOR=286", "STRIDE=16", "HIC=0", "CUTOFF=[]", "HOLDOUT=[]",
                          "K=256", "LAYERS=2", "TIME=fourier", "IMPACT=film", "TEST=4 5", "VAL=11", "EPOCHS=100",
-                         "BATCH=8", "SEED=42",
+                         "BATCH=8", "SEED=42", "MESH=inner_panel", "FEATURES=xyz",
                          "NAME=mesh_history_clusterB_k256_fourier_no_shortcuts_design_change_nodes",
                          "TRACKING=online", "ARG=--job-name=mesh_hist_design_change", "ARG=--time=14:00:00"):
             self.assertIn(expected, output)
@@ -491,7 +492,8 @@ printf 'ARG=%s\\n' "$@"
         self.assertGreater(arguments.index("--time=14:00:00"), arguments.index("--time=08:00:00"))
         # The batch job hands the change path to both preflight and training.
         self.env.update(HOOD_MESH_DESIGN_CHANGE_NODES="true", HOOD_MESH_DESIGN_CHANGE_LAYERS="2",
-                        HOOD_MESH_DESIGN_CHANGE_FOURIER_OCTAVES="5")
+                        HOOD_MESH_DESIGN_CHANGE_FOURIER_OCTAVES="5", HOOD_MESH_DESIGN_CHANGE_FEATURES="xyz",
+                        HOOD_MESH_MESH_NODES="inner_panel")
         output = self.launch("run_mesh_impact_history_1704.sbatch")
         commands = [line for line in output.splitlines() if line.startswith("PYTHON")]
         self.assertEqual(len(commands), 2)
@@ -499,7 +501,10 @@ printf 'ARG=%s\\n' "$@"
             self.assertIn("<--design-change-nodes> <true>", command)
             self.assertIn("<--design-change-layers> <2>", command)
             self.assertIn("<--design-change-fourier-octaves> <5>", command)
+            self.assertIn("<--design-change-features> <xyz>", command)
+            self.assertIn("<--mesh-nodes> <inner_panel>", command)
         self.assertIn("Design-change nodes: true", output)
+        self.assertIn("Mesh nodes: inner_panel", output)
 
     def test_design_change_sweep_variants_pin_only_their_own_settings(self):
         self.stub("sbatch", """printf 'CHANGE=%s\\nLAYERS=%s\\nOCTAVES=%s\\nDROPOUT=%s\\nWD=%s\\n' \\
@@ -508,12 +513,14 @@ printf 'ARG=%s\\n' "$@"
 printf 'EPOCHS=%s\\nBATCH=%s\\nLR=%s\\nSEED=%s\\nK=%s\\nTEST=%s\\nVAL=%s\\nNAME=%s\\n' \\
     "$HOOD_MESH_EPOCHS" "$HOOD_MESH_BATCH_SIZE" "$HOOD_MESH_LR" "$HOOD_MESH_SEED" "$HOOD_MESH_NEIGHBORHOOD_K" \\
     "$HOOD_MESH_TEST_DESIGNS" "$HOOD_MESH_VAL_DESIGNS" "$HOOD_MESH_RUN_NAME"
+printf 'MESH=%s\\nFEATURES=%s\\n' "$HOOD_MESH_MESH_NODES" "$HOOD_MESH_DESIGN_CHANGE_FEATURES"
 printf 'ARG=%s\\n' "$@"
 """)
         # Stale exports from other experiments must not leak into the sweep.
         self.env.update(HOOD_MESH_DROPOUT="0.4", HOOD_MESH_WEIGHT_DECAY="0.3", HOOD_MESH_LR="0.01",
                         HOOD_MESH_SEED="7", HOOD_MESH_EPOCHS="5", HOOD_MESH_RUN_NAME="stale",
-                        HOOD_MESH_DESIGN_CHANGE_LAYERS="9", HOOD_MESH_DESIGN_CHANGE_FOURIER_OCTAVES="9")
+                        HOOD_MESH_DESIGN_CHANGE_LAYERS="9", HOOD_MESH_DESIGN_CHANGE_FOURIER_OCTAVES="9",
+                        HOOD_MESH_MESH_NODES="inner_panel", HOOD_MESH_DESIGN_CHANGE_FEATURES="xyz")
         variants = {"small": ("0", "2", "0.1", "0.00001", "mesh_hist_dc_small"),
                     "regularized": ("2", "5", "0.2", "0.05", "mesh_hist_dc_reg"),
                     "small_regularized": ("0", "2", "0.2", "0.05", "mesh_hist_dc_small_reg")}
@@ -522,7 +529,7 @@ printf 'ARG=%s\\n' "$@"
                 output = self.launch(f"submit_mesh_impact_history_1704_design_change_{variant}.sh")
                 for expected in ("CHANGE=true", f"LAYERS={layers}", f"OCTAVES={octaves}", f"DROPOUT={dropout}",
                                  f"WD={decay}", "EPOCHS=100", "BATCH=8", "LR=0.0003", "SEED=42", "K=256",
-                                 "TEST=4 5", "VAL=11",
+                                 "TEST=4 5", "VAL=11", "MESH=all", "FEATURES=impact_relative",
                                  f"NAME=mesh_history_clusterB_k256_fourier_no_shortcuts_design_change_{variant}",
                                  f"mesh_history_1704_design_change_{variant}_%j.out"):
                     self.assertIn(expected, output)
@@ -642,7 +649,8 @@ class SubmissionDataTests(unittest.TestCase):
                 np.testing.assert_array_equal(data["accelerations"][0], acceleration[selected][::stride])
 
     def test_explicit_dense_preprocessing_overrides_shared_default(self):
-        args = preflight.parse_args(["--time-subsample-stride", "4"])
+        # The synthetic deck has no panel element sets, so read its whole node block.
+        args = preflight.parse_args(["--time-subsample-stride", "4", "--mesh-nodes", "all"])
         data, source_count, cutoff_count = preflight.validate_first_run(
             self.root, self.coords.to_numpy(dtype=np.float32), args)
         self.assertEqual((source_count, cutoff_count, len(data["time_arrays"][0])), (1000, 1000, 250))
@@ -708,7 +716,9 @@ class ImpactorBoundaryTests(unittest.TestCase):
                       Path("run_mesh_impact_history_1704.sbatch").read_text())
         for parse in (preflight.parse_args, training.parse_args):
             self.assertEqual(parse([]).impactor_nodes, 0)
-            self.assertEqual(parse(["--impactor-nodes", "286"]).impactor_nodes, 286)
+            self.assertEqual(parse(["--mesh-nodes", "all", "--impactor-nodes", "286"]).impactor_nodes, 286)
+            # Inner-panel meshes (the default) contain no headform rows.
+            self.assertEqual(parse(["--impactor-nodes", "286"]).impactor_nodes, 0)
 
     def test_location_shortcut_switches_parse_true_false_and_default_off(self):
         sbatch = Path("run_mesh_impact_history_1704.sbatch").read_text()
@@ -732,6 +742,6 @@ class ImpactorBoundaryTests(unittest.TestCase):
         training.validate_location_shortcuts(286, False)
         training.validate_location_shortcuts(0, True)
         with mock.patch("builtins.print"), mock.patch("sys.stderr"):
-            self.assertEqual(preflight.main(["--impactor-nodes", "0"]), 1)
+            self.assertEqual(preflight.main(["--mesh-nodes", "all", "--impactor-nodes", "0"]), 1)
         archived = Path("submit_mesh_impact_history_1704_no_temporal.sh").read_text()
         self.assertIn('export HOOD_MESH_POOL_IMPACTOR_NODES="true"', archived)

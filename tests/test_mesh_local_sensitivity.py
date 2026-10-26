@@ -122,7 +122,8 @@ def test_neighborhood_mse_train_save_and_reload_with_train_only_scalers():
         main(["--data-format", "euroncap1704", "--num-samples", "24", "--samples-per-design", "4",
               "--epochs", "2", "--batch-size", "4", "--width", "16", "--num-heads", "2", "--num-latents", "4",
               "--latent-layers", "1", "--temporal-layers", "1", "--neighborhood-layers", "2", "--neighborhood-k", "3",
-              "--impactor-nodes", "2", "--neighbor-cache-dir", str(Path(folder) / "neighbor_graphs"),
+              "--mesh-nodes", "all", "--impactor-nodes", "2",
+              "--neighbor-cache-dir", str(Path(folder) / "neighbor_graphs"),
               "--device", "cpu", "--wandb-mode", "disabled", "--output-dir", folder])
         root = Path(folder)
         saved = json.loads((root / "config.json").read_text())
