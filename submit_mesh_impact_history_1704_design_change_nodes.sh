@@ -10,17 +10,18 @@
 #                                110-333 nodes per design) becomes its own token,
 #                                so pooling cannot average it away. After every
 #                                decoder block the time queries read these tokens
-#                                with a second cross-attention whose values scale
-#                                with each node's displacement from its cluster
-#                                base (designs 0, 4, 6 and 10).
+#                                with a second, plain cross-attention.
 # The readout starts at zero, so with seed 42 the network starts exactly as the
-# baseline did, and the base designs always get the backbone's prediction.
-# The change path defaults to the sweep winner (run 3447060): no change
-# self-attention layers. Since 2026-10-26 each change token is just the node's
-# XYZ (--design-change-features xyz), and the network sees only the hood inner
-# panel (--mesh-nodes inner_panel: no headform, outer skin, hinges or
-# fasteners). The 2026-10 runs used the whole deck and 18- or 30-input tokens;
-# the ..._small/_regularized wrappers pin those settings to repeat them.
+# baseline did. The change path defaults to the sweep winner (run 3447060): no
+# change self-attention layers. Since 2026-10-26 each change token is just the
+# node's XYZ (--design-change-features xyz), and the network sees only the hood
+# inner panel (--mesh-nodes inner_panel: no headform, outer skin, hinges or
+# fasteners). Since 2026-10-30 the readout values are no longer scaled by each
+# node's displacement from its cluster base (--design-change-displacement-gate
+# false); runs 3440305-3458374 used that gate, so their base designs 0, 4, 6
+# and 10 always got the backbone's prediction. The 2026-10 runs used the whole
+# deck, 18- or 30-input tokens and the gate; the ..._small/_regularized
+# wrappers pin those settings to repeat them.
 # Compare design_difference_r2.json, test_design_sensitivity.json and
 # hic_metrics.json with the baseline run. See README_design_change_nodes.md.
 #
@@ -37,6 +38,7 @@ export HOOD_MESH_DESIGN_CHANGE_NODES="true"
 export HOOD_MESH_DESIGN_CHANGE_LAYERS="${HOOD_MESH_DESIGN_CHANGE_LAYERS:-0}"
 export HOOD_MESH_DESIGN_CHANGE_FOURIER_OCTAVES="${HOOD_MESH_DESIGN_CHANGE_FOURIER_OCTAVES:-2}"
 export HOOD_MESH_DESIGN_CHANGE_FEATURES="${HOOD_MESH_DESIGN_CHANGE_FEATURES:-xyz}"
+export HOOD_MESH_DESIGN_CHANGE_DISPLACEMENT_GATE="${HOOD_MESH_DESIGN_CHANGE_DISPLACEMENT_GATE:-false}"
 export HOOD_MESH_MESH_NODES="${HOOD_MESH_MESH_NODES:-inner_panel}"
 export HOOD_MESH_GEOMETRY_FILM="none"
 export HOOD_MESH_POOLING_QUERY_RESIDUAL="false"
@@ -56,8 +58,9 @@ export HOOD_MESH_RUN_NAME="${HOOD_MESH_RUN_NAME:-mesh_history_clusterB_k256_four
 # a slow W&B start (job 3317059 timed out) before failing ahead of data loading.
 export WANDB_MODE="${WANDB_MODE:-online}"
 
-printf 'Design-change nodes: ON | %s change self-attention layers | token features %s\n' \
-    "${HOOD_MESH_DESIGN_CHANGE_LAYERS}" "${HOOD_MESH_DESIGN_CHANGE_FEATURES}"
+printf 'Design-change nodes: ON | %s change self-attention layers | token features %s | displacement gate %s\n' \
+    "${HOOD_MESH_DESIGN_CHANGE_LAYERS}" "${HOOD_MESH_DESIGN_CHANGE_FEATURES}" \
+    "${HOOD_MESH_DESIGN_CHANGE_DISPLACEMENT_GATE}"
 printf 'Mesh nodes: %s\n' "${HOOD_MESH_MESH_NODES}"
 printf 'Location shortcuts: query residual OFF | headform rows excluded from pooling | geometry FiLM none\n'
 printf 'Baseline for comparison: 20261016_151923_3394500_1704 (same settings, no change nodes)\n'

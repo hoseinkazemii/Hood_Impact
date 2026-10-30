@@ -99,6 +99,10 @@ def test_training_saves_the_holdout_and_resume_restores_it(tmp_path, monkeypatch
         saved = json.loads((tmp_path / "run/config.json").read_text())
         assert saved["location_holdout"]["scheme"] == report["scheme"]
         assert (tmp_path / "run/location_holdout.json").is_file()
+        # The final epoch's checkpoint is scored beside the best-validation one.
+        for name in ("metrics.json", "test_acceleration_histories.csv", "train_acceleration_histories.csv",
+                     "design_difference_r2.json"):
+            assert (tmp_path / "run/last_checkpoint" / name).is_file()
         splits = json.loads((tmp_path / "run/splits.json").read_text())
         if report["scheme"] == "checkerboard":
             assert len(splits["test"]["run_numbers"]) == 142

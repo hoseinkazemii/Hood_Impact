@@ -26,9 +26,11 @@ set -euo pipefail
 PROJECT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 export HOOD_MESH_DESIGN_CHANGE_LAYERS="0"
 export HOOD_MESH_DESIGN_CHANGE_FOURIER_OCTAVES="2"
-# The 2026-10-25 sweep ran on the whole deck with impact-relative change tokens.
+# The 2026-10-25 sweep ran on the whole deck with impact-relative change tokens
+# and displacement-gated change readouts.
 export HOOD_MESH_MESH_NODES="all"
 export HOOD_MESH_DESIGN_CHANGE_FEATURES="impact_relative"
+export HOOD_MESH_DESIGN_CHANGE_DISPLACEMENT_GATE="true"
 export HOOD_MESH_DROPOUT="0.1"
 export HOOD_MESH_WEIGHT_DECAY="0.00001"
 # Pin the rest of the reference settings so stale exports cannot leak in.

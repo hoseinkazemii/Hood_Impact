@@ -30,6 +30,7 @@ from train_mesh_impact_history import (
     MESH_NODE_SETS,
     MODEL_DEFAULTS,
     MeshImpactHistoryNet,
+    add_design_change_arguments,
     add_model_arguments,
     apply_mesh_nodes,
     parse_boolean,
@@ -347,8 +348,7 @@ def parse_args(argv=None):
     add_model_arguments(parser, EXPERIMENT_MODEL_KEYS)
     parser.add_argument("--mesh-nodes", choices=MESH_NODE_SETS)
     parser.add_argument("--design-change-nodes", type=parse_boolean, default=False, metavar="{true,false}")
-    for key, default in DESIGN_CHANGE_DEFAULTS.items():
-        parser.add_argument(f"--{key.replace('_', '-')}", type=type(default), default=default)
+    add_design_change_arguments(parser)
     parser.add_argument("--batch-size", type=int, default=Config.batch_size)
     parser.add_argument("--time-subsample-stride", type=int, default=Config.time_subsample_stride)
     parser.add_argument("--max-train-time", type=float, default=Config.max_train_time)

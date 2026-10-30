@@ -52,11 +52,16 @@ The backbone is `MeshImpactHistoryNet`, unchanged. The new path:
    each design's change tokens plus one learned null token. The first run used 2; the sweep below found 0
    better, so each token now goes straight from its embedding to the readout.
 3. **A second read in the decoder.** After every decoder block, the time queries cross-attend to the
-   change tokens (`ChangeReadout`). Each node's value is scaled by its displacement / 10 mm, and the null
-   token's value by zero. The output projection has no bias and starts at zero. As a result:
-   - with the same seed, a new model starts as exactly the baseline network;
-   - the base designs 0, 4, 6 and 10 always get exactly the backbone prediction;
-   - the path learns only the effect of an edit.
+   change tokens (`ChangeReadout`). The output projection has no bias and starts at zero, so with the same
+   seed a new model starts as exactly the baseline network. Since 2026-10-30 this is plain attention
+   (`--design-change-displacement-gate false`, the default): the tokens are already only the nodes that
+   differ between near-clones, so the attention alone decides which matter, and every design, base
+   included, reads its change nodes.
+
+   The runs in the results below also scaled each node's value by its displacement from the cluster base
+   / 10 mm and the null token's by zero (`--design-change-displacement-gate true`; saved runs keep it).
+   There the base designs 0, 4, 6 and 10 always got exactly the backbone prediction, so the path learned
+   only the effect of an edit.
 
 The loss is the plain normalized acceleration MSE, as before. The model finds each hood by the digest of
 its normalized coordinates, like the neighbor-graph cache. The table is saved as
@@ -101,9 +106,31 @@ This is an A/B against `20261016_151923_3394500_1704`. The settings are the same
 - 100 epochs, batch 8, lr 3e-4, seed 42.
 
 The changes are `--design-change-nodes true` with the change path at its defaults (0 layers, XYZ
-tokens), and inner-panel meshes. To repeat the 2026-10 sweep runs exactly, use the
-`..._design_change_small/_regularized/_small_regularized.sh` wrappers, which pin `--mesh-nodes all` and
-impact-relative tokens.
+tokens, no displacement gate), and inner-panel meshes. To repeat the 2026-10 sweep runs exactly, use the
+`..._design_change_small/_regularized/_small_regularized.sh` wrappers, which pin `--mesh-nodes all`,
+impact-relative tokens and the displacement gate.
+
+### Long run (2026-10-30)
+
+```bash
+bash submit_mesh_impact_history_1704_design_change_long.sh
+```
+
+This is the best run so far, `20261027_055436_3458374_1704` (inner panel + XYZ tokens), with two
+changes: no displacement gate, and 800 epochs instead of 100 (about 41 h of the 48 h DeltaAI limit at
+3458374's 185 s per epoch; the cosine schedule spans all 800). The one-location test at location 137
+separated the near-clones only after about 1500 full-batch epochs.
+
+The best-validation (design 11) checkpoint is evaluated as usual. In 3458374 it came at epoch 60 of
+100, so training also scores the final epoch's checkpoint in `<run>/last_checkpoint/` (every run does
+this now): `metrics.json`, the train and test acceleration histories, and `design_difference_r2.json`.
+For HIC on either one, run `python evaluate_mesh_impact_hic.py <dir> --data-dir Data/HoodImpact_1704_EuroNCAP`.
+To beat, on test 4-5: the baseline's accel RMSE 15.54 g and HIC R2 0.898, and difference R2 > 0
+(better than predicting the same history for both designs).
+
+If the job times out, `hood_impact_last_model.pt` holds the last completed epoch. Continue it on the same
+schedule with
+`bash submit_mesh_impact_history_1704_local_sensitivity_resume.sh <run dir> --time=24:00:00`.
 
 Before the dataset loads, the preflight finds the change nodes from the decks and runs a CUDA
 forward/backward pass through the change path. The first run builds
@@ -154,8 +181,8 @@ What this shows:
   whole training difference, including the far-field part that is the solver time-step artifact. The
   readout has no locality, so it can act at any distance from the impact.
 
-For test pair 4-5, design 4 is the base, so its prediction is the backbone's. Any difference comes from
-design 5's edit.
+For test pair 4-5 in these gated runs, design 4 is the base, so its prediction is the backbone's. Any
+difference comes from design 5's edit.
 
 ## Limits
 

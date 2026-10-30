@@ -92,16 +92,29 @@ class DesignChangeHistoryNetTests(unittest.TestCase):
             torch.testing.assert_close(fresh[name], value, rtol=0, atol=0)
         torch.testing.assert_close(self.predict(changed), self.predict(backbone), rtol=0, atol=0)
 
-    def test_only_displaced_designs_leave_the_backbone(self):
-        backbone, changed = self.model(MeshImpactHistoryNet), self.model()
+    def readout_difference(self, **kwargs):
+        """Per-design max |change model - backbone| once the readouts are switched on."""
+        backbone, changed = self.model(MeshImpactHistoryNet), self.model(**kwargs)
         with torch.no_grad():
             for readout in changed.change_readouts:
                 readout.output.weight.normal_()
         changed.load_state_dict(backbone.state_dict(), strict=False)
-        difference = (self.predict(changed) - self.predict(backbone)).reshape(3, -1).abs().amax(dim=1)
+        return (self.predict(changed) - self.predict(backbone)).reshape(3, -1).abs().amax(dim=1)
+
+    def test_gated_readout_moves_only_displaced_designs(self):
+        difference = self.readout_difference(design_change_displacement_gate=True)
         self.assertEqual(difference[0].item(), 0.0)  # base: zero displacement
         self.assertEqual(difference[2].item(), 0.0)  # no change nodes
         self.assertGreater(difference[1].item(), 1e-3)
+
+    def test_plain_readout_reads_every_design(self):
+        # No gate: the base design's change nodes are read like any others, and a
+        # design without change nodes reads the learned null token.
+        self.assertFalse(self.model().design_change_displacement_gate)
+        difference = self.readout_difference()
+        self.assertTrue((difference > 1e-3).all(), difference)
+        with self.assertRaisesRegex(ValueError, "design_change_displacement_gate"):
+            self.model(design_change_displacement_gate="false")
 
     def test_change_path_learns_from_the_acceleration_loss(self):
         model = self.model().train()
@@ -139,6 +152,11 @@ class DesignChangeHistoryNetTests(unittest.TestCase):
         self.assertEqual(DesignChangeHistoryNet(**old).change_embedding[0].in_features, 30)
         new = saved_design_change_kwargs({**self.KWARGS, "design_change_features": "xyz"})
         self.assertEqual(new["design_change_features"], "xyz")
+        # Configs saved before 2026-10-30 have no gate key; they were trained with it.
+        self.assertTrue(old["design_change_displacement_gate"])
+        self.assertTrue(new["design_change_displacement_gate"])
+        plain = saved_design_change_kwargs({**self.KWARGS, "design_change_displacement_gate": False})
+        self.assertFalse(plain["design_change_displacement_gate"])
         with self.assertRaisesRegex(ValueError, "design_change_features"):
             DesignChangeHistoryNet(**self.KWARGS, design_change_features="xy")
 

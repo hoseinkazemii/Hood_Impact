@@ -470,7 +470,8 @@ printf 'K=%s\\nLAYERS=%s\\nTIME=%s\\nIMPACT=%s\\nTEST=%s\\nVAL=%s\\nEPOCHS=%s\\n
     "$HOOD_MESH_IMPACT_CONDITIONING" "$HOOD_MESH_TEST_DESIGNS" "$HOOD_MESH_VAL_DESIGNS" "$HOOD_MESH_EPOCHS" \\
     "$HOOD_MESH_BATCH_SIZE" "$HOOD_MESH_SEED"
 printf 'NAME=%s\\nTRACKING=%s\\n' "$HOOD_MESH_RUN_NAME" "$WANDB_MODE"
-printf 'MESH=%s\\nFEATURES=%s\\n' "$HOOD_MESH_MESH_NODES" "$HOOD_MESH_DESIGN_CHANGE_FEATURES"
+printf 'MESH=%s\\nFEATURES=%s\\nGATE=%s\\n' "$HOOD_MESH_MESH_NODES" "$HOOD_MESH_DESIGN_CHANGE_FEATURES" \\
+    "$HOOD_MESH_DESIGN_CHANGE_DISPLACEMENT_GATE"
 printf 'ARG=%s\\n' "$@"
 """)
         # Stale exports from other experiments must not leak into the comparison.
@@ -483,7 +484,7 @@ printf 'ARG=%s\\n' "$@"
         for expected in ("CHANGE=true", "CHANGE_LAYERS=0", "CHANGE_OCTAVES=2", "FILM=none", "RESIDUAL=false",
                          "POOL_HEADFORM=false", "IMPACTOR=286", "STRIDE=16", "HIC=0", "CUTOFF=[]", "HOLDOUT=[]",
                          "K=256", "LAYERS=2", "TIME=fourier", "IMPACT=film", "TEST=4 5", "VAL=11", "EPOCHS=100",
-                         "BATCH=8", "SEED=42", "MESH=inner_panel", "FEATURES=xyz",
+                         "BATCH=8", "SEED=42", "MESH=inner_panel", "FEATURES=xyz", "GATE=false",
                          "NAME=mesh_history_clusterB_k256_fourier_no_shortcuts_design_change_nodes",
                          "TRACKING=online", "ARG=--job-name=mesh_hist_design_change", "ARG=--time=14:00:00"):
             self.assertIn(expected, output)
@@ -493,7 +494,7 @@ printf 'ARG=%s\\n' "$@"
         # The batch job hands the change path to both preflight and training.
         self.env.update(HOOD_MESH_DESIGN_CHANGE_NODES="true", HOOD_MESH_DESIGN_CHANGE_LAYERS="2",
                         HOOD_MESH_DESIGN_CHANGE_FOURIER_OCTAVES="5", HOOD_MESH_DESIGN_CHANGE_FEATURES="xyz",
-                        HOOD_MESH_MESH_NODES="inner_panel")
+                        HOOD_MESH_DESIGN_CHANGE_DISPLACEMENT_GATE="false", HOOD_MESH_MESH_NODES="inner_panel")
         output = self.launch("run_mesh_impact_history_1704.sbatch")
         commands = [line for line in output.splitlines() if line.startswith("PYTHON")]
         self.assertEqual(len(commands), 2)
@@ -502,6 +503,7 @@ printf 'ARG=%s\\n' "$@"
             self.assertIn("<--design-change-layers> <2>", command)
             self.assertIn("<--design-change-fourier-octaves> <5>", command)
             self.assertIn("<--design-change-features> <xyz>", command)
+            self.assertIn("<--design-change-displacement-gate> <false>", command)
             self.assertIn("<--mesh-nodes> <inner_panel>", command)
         self.assertIn("Design-change nodes: true", output)
         self.assertIn("Mesh nodes: inner_panel", output)
@@ -513,14 +515,16 @@ printf 'ARG=%s\\n' "$@"
 printf 'EPOCHS=%s\\nBATCH=%s\\nLR=%s\\nSEED=%s\\nK=%s\\nTEST=%s\\nVAL=%s\\nNAME=%s\\n' \\
     "$HOOD_MESH_EPOCHS" "$HOOD_MESH_BATCH_SIZE" "$HOOD_MESH_LR" "$HOOD_MESH_SEED" "$HOOD_MESH_NEIGHBORHOOD_K" \\
     "$HOOD_MESH_TEST_DESIGNS" "$HOOD_MESH_VAL_DESIGNS" "$HOOD_MESH_RUN_NAME"
-printf 'MESH=%s\\nFEATURES=%s\\n' "$HOOD_MESH_MESH_NODES" "$HOOD_MESH_DESIGN_CHANGE_FEATURES"
+printf 'MESH=%s\\nFEATURES=%s\\nGATE=%s\\n' "$HOOD_MESH_MESH_NODES" "$HOOD_MESH_DESIGN_CHANGE_FEATURES" \\
+    "$HOOD_MESH_DESIGN_CHANGE_DISPLACEMENT_GATE"
 printf 'ARG=%s\\n' "$@"
 """)
         # Stale exports from other experiments must not leak into the sweep.
         self.env.update(HOOD_MESH_DROPOUT="0.4", HOOD_MESH_WEIGHT_DECAY="0.3", HOOD_MESH_LR="0.01",
                         HOOD_MESH_SEED="7", HOOD_MESH_EPOCHS="5", HOOD_MESH_RUN_NAME="stale",
                         HOOD_MESH_DESIGN_CHANGE_LAYERS="9", HOOD_MESH_DESIGN_CHANGE_FOURIER_OCTAVES="9",
-                        HOOD_MESH_MESH_NODES="inner_panel", HOOD_MESH_DESIGN_CHANGE_FEATURES="xyz")
+                        HOOD_MESH_MESH_NODES="inner_panel", HOOD_MESH_DESIGN_CHANGE_FEATURES="xyz",
+                        HOOD_MESH_DESIGN_CHANGE_DISPLACEMENT_GATE="false")
         variants = {"small": ("0", "2", "0.1", "0.00001", "mesh_hist_dc_small"),
                     "regularized": ("2", "5", "0.2", "0.05", "mesh_hist_dc_reg"),
                     "small_regularized": ("0", "2", "0.2", "0.05", "mesh_hist_dc_small_reg")}
@@ -529,7 +533,7 @@ printf 'ARG=%s\\n' "$@"
                 output = self.launch(f"submit_mesh_impact_history_1704_design_change_{variant}.sh")
                 for expected in ("CHANGE=true", f"LAYERS={layers}", f"OCTAVES={octaves}", f"DROPOUT={dropout}",
                                  f"WD={decay}", "EPOCHS=100", "BATCH=8", "LR=0.0003", "SEED=42", "K=256",
-                                 "TEST=4 5", "VAL=11", "MESH=all", "FEATURES=impact_relative",
+                                 "TEST=4 5", "VAL=11", "MESH=all", "FEATURES=impact_relative", "GATE=true",
                                  f"NAME=mesh_history_clusterB_k256_fourier_no_shortcuts_design_change_{variant}",
                                  f"mesh_history_1704_design_change_{variant}_%j.out"):
                     self.assertIn(expected, output)
@@ -540,6 +544,38 @@ printf 'ARG=%s\\n' "$@"
         self.assertEqual(output.count("CHANGE=true"), 3)
         for variant in variants:
             self.assertIn(f"NAME=mesh_history_clusterB_k256_fourier_no_shortcuts_design_change_{variant}", output)
+
+    def test_long_design_change_launcher_pins_the_ungated_800_epoch_run(self):
+        self.env.pop("WANDB_MODE", None)
+        self.stub("sbatch", """printf 'CHANGE=%s\\nLAYERS=%s\\nOCTAVES=%s\\nFEATURES=%s\\nGATE=%s\\nMESH=%s\\n' \\
+    "$HOOD_MESH_DESIGN_CHANGE_NODES" "$HOOD_MESH_DESIGN_CHANGE_LAYERS" "$HOOD_MESH_DESIGN_CHANGE_FOURIER_OCTAVES" \\
+    "$HOOD_MESH_DESIGN_CHANGE_FEATURES" "$HOOD_MESH_DESIGN_CHANGE_DISPLACEMENT_GATE" "$HOOD_MESH_MESH_NODES"
+printf 'EPOCHS=%s\\nBATCH=%s\\nLR=%s\\nSEED=%s\\nDROPOUT=%s\\nWD=%s\\nK=%s\\nTEST=%s\\nVAL=%s\\n' \\
+    "$HOOD_MESH_EPOCHS" "$HOOD_MESH_BATCH_SIZE" "$HOOD_MESH_LR" "$HOOD_MESH_SEED" "$HOOD_MESH_DROPOUT" \\
+    "$HOOD_MESH_WEIGHT_DECAY" "$HOOD_MESH_NEIGHBORHOOD_K" "$HOOD_MESH_TEST_DESIGNS" "$HOOD_MESH_VAL_DESIGNS"
+printf 'FILM=%s\\nRESIDUAL=%s\\nSTRIDE=%s\\nHIC=%s\\nNAME=%s\\nTRACKING=%s\\n' \\
+    "$HOOD_MESH_GEOMETRY_FILM" "$HOOD_MESH_POOLING_QUERY_RESIDUAL" "$HOOD_MESH_TIME_SUBSAMPLE_STRIDE" \\
+    "$HOOD_MESH_HIC_RANGE_THRESHOLD_PERCENT" "$HOOD_MESH_RUN_NAME" "$WANDB_MODE"
+printf 'ARG=%s\\n' "$@"
+""")
+        # Stale exports from other experiments must not leak into the long run.
+        self.env.update(HOOD_MESH_DROPOUT="0.4", HOOD_MESH_WEIGHT_DECAY="0.3", HOOD_MESH_LR="0.01",
+                        HOOD_MESH_SEED="7", HOOD_MESH_EPOCHS="5", HOOD_MESH_RUN_NAME="stale",
+                        HOOD_MESH_DESIGN_CHANGE_LAYERS="9", HOOD_MESH_DESIGN_CHANGE_FEATURES="impact_relative",
+                        HOOD_MESH_DESIGN_CHANGE_DISPLACEMENT_GATE="true", HOOD_MESH_MESH_NODES="all",
+                        HOOD_MESH_GEOMETRY_FILM="all", HOOD_MESH_TIME_SUBSAMPLE_STRIDE="4")
+        output = self.launch("submit_mesh_impact_history_1704_design_change_long.sh")
+        for expected in ("CHANGE=true", "LAYERS=0", "OCTAVES=2", "FEATURES=xyz", "GATE=false", "MESH=inner_panel",
+                         "EPOCHS=800", "BATCH=8", "LR=0.0003", "SEED=42", "DROPOUT=0.1", "WD=0.00001", "K=256",
+                         "TEST=4 5", "VAL=11", "FILM=none", "RESIDUAL=false", "STRIDE=16", "HIC=0",
+                         "NAME=mesh_history_clusterB_k256_fourier_no_shortcuts_design_change_no_gate_800ep",
+                         "TRACKING=online", "mesh_history_1704_design_change_long_%j.out"):
+            self.assertIn(expected, output)
+        arguments = [line[4:] for line in output.splitlines() if line.startswith("ARG=")]
+        times = [argument for argument in arguments if argument.startswith("--time=")]
+        self.assertEqual(times[-1], "--time=48:00:00")
+        job_names = [argument for argument in arguments if argument.startswith("--job-name=")]
+        self.assertEqual(job_names[-1], "--job-name=mesh_hist_dc_long")
 
     def test_batch_runs_directly_with_broken_srun_and_preserves_gpu_decoder_and_split(self):
         self.env["CUDA_VISIBLE_DEVICES"] = "GPU-allocated-by-slurm"

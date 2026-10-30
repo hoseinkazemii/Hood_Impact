@@ -71,9 +71,10 @@ BOOLEAN_MODEL_KEYS = tuple(key for key, value in MODEL_DEFAULTS.items() if isins
 # Decoder path over the near-clone change nodes (mesh_design_change.py), used
 # with --design-change-nodes true; these keys reach only that model. The small
 # path won the 2026-10-25 sweep (run 3447060; README_design_change_nodes.md).
-# Its tokens are each change node's XYZ (octaves apply to impact_relative only).
+# Its tokens are each change node's XYZ (octaves apply to impact_relative only),
+# read by plain attention; runs before 2026-10-30 scaled values by displacement.
 DESIGN_CHANGE_DEFAULTS = {"design_change_layers": 0, "design_change_fourier_octaves": 2,
-                          "design_change_features": "xyz"}
+                          "design_change_features": "xyz", "design_change_displacement_gate": False}
 # Fresh runs see only the hood inner panel; runs saved without the key used "all".
 DEFAULT_MESH_NODES = "inner_panel"
 ARCHITECTURES = ("MeshImpactHistoryNet", "DesignChangeHistoryNet")
@@ -105,6 +106,16 @@ def add_model_arguments(parser, keys):
         default = MODEL_DEFAULTS[key]
         option = f"--{key.replace('_', '-')}"
         if key in BOOLEAN_MODEL_KEYS:
+            parser.add_argument(option, type=parse_boolean, default=default, metavar="{true,false}")
+        else:
+            parser.add_argument(option, type=type(default), default=default)
+
+
+def add_design_change_arguments(parser):
+    """One option per DESIGN_CHANGE_DEFAULTS key, with real true/false parsing for flags."""
+    for key, default in DESIGN_CHANGE_DEFAULTS.items():
+        option = f"--{key.replace('_', '-')}"
+        if isinstance(default, bool):
             parser.add_argument(option, type=parse_boolean, default=default, metavar="{true,false}")
         else:
             parser.add_argument(option, type=type(default), default=default)
@@ -184,8 +195,7 @@ def parse_args(argv=None):
         help="Give each node that differs between near-clone designs its own token, read by the "
              "decoder after every block (DesignChangeHistoryNet); false is the plain network.",
     )
-    for key, default in DESIGN_CHANGE_DEFAULTS.items():
-        parser.add_argument(f"--{key.replace('_', '-')}", type=type(default), default=default)
+    add_design_change_arguments(parser)
     parser.add_argument("--output-dir", help="New run directory; defaults to runs/mesh_impact_history/<timestamp>.")
     parser.add_argument("--neighbor-cache-dir", help="Shared persistent kNN directory; defaults to neighbor_graphs beside inp_files.")
     parser.add_argument("--resume-from", help="Prior run directory (latest, else best checkpoint) or checkpoint file; writes a new run.")
@@ -794,12 +804,33 @@ def main(argv=None):
         checkpoint_path = output_dir / CHECKPOINT_NAME
         if not checkpoint_path.exists():
             raise RuntimeError("Training produced no finite best validation checkpoint; inspect losses and input data")
-        checkpoint = torch.load(checkpoint_path, map_location=config.device, weights_only=True)
-        model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+        from torch.utils.data import DataLoader
+        from evaluate_design_difference_r2 import (
+            design_difference_report, difference_log_values, write_design_difference_report,
+        )
         evaluator = Evaluator(model, config, preprocessor)
-        metrics, predictions, targets = evaluator.evaluate(test_loader)
-        write_json(output_dir / "metrics.json", metrics)
-        export_predictions(output_dir / "test_acceleration_histories.csv", test_dataset, predictions, targets)
+        # The training loader shuffles; export train histories in dataset order.
+        train_eval_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=False,
+                                       collate_fn=train_loader.collate_fn)
+
+        def evaluate_checkpoint(path, directory):
+            """Test metrics, train/test histories and near-clone difference R2 of one checkpoint."""
+            checkpoint = torch.load(path, map_location=config.device, weights_only=True)
+            model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+            metrics, predictions, targets = evaluator.evaluate(test_loader)
+            write_json(directory / "metrics.json", metrics)
+            export_predictions(directory / "test_acceleration_histories.csv", test_dataset, predictions, targets)
+            _, train_predictions, train_targets = evaluator.evaluate(train_eval_loader)
+            export_predictions(directory / "train_acceleration_histories.csv", train_dataset,
+                               train_predictions, train_targets)
+            difference = design_difference_report(config.data_format, config.samples_per_design, {
+                "train": (train_dataset, train_predictions, train_targets),
+                "test": (test_dataset, predictions, targets),
+            })
+            write_design_difference_report(directory, difference)
+            return metrics, predictions, targets, difference
+
+        metrics, predictions, targets, difference = evaluate_checkpoint(checkpoint_path, output_dir)
         from mesh_change_metrics import design_sensitivity_metrics
         from evaluate_design_sensitivity import write_sensitivity_report, sensitivity_log_values
         sensitivity = design_sensitivity_metrics(test_dataset, predictions, targets, config.samples_per_design)
@@ -810,20 +841,6 @@ def main(argv=None):
         logger.info("Matched-location design sensitivity: skill=%s, amplitude ratio=%s, alignment=%s; HIC15 skill=%s",
                     sensitivity["design_difference_skill"], sensitivity["difference_amplitude_ratio"],
                     sensitivity["difference_alignment_cosine"], sensitivity["hic15"]["design_difference_skill"])
-        from torch.utils.data import DataLoader
-        from evaluate_design_difference_r2 import (
-            design_difference_report, difference_log_values, write_design_difference_report,
-        )
-        # The training loader shuffles; export train histories in dataset order.
-        train_eval_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=False,
-                                       collate_fn=train_loader.collate_fn)
-        _, train_predictions, train_targets = evaluator.evaluate(train_eval_loader)
-        export_predictions(output_dir / "train_acceleration_histories.csv", train_dataset, train_predictions, train_targets)
-        difference = design_difference_report(config.data_format, config.samples_per_design, {
-            "train": (train_dataset, train_predictions, train_targets),
-            "test": (test_dataset, predictions, targets),
-        })
-        write_design_difference_report(output_dir, difference)
         difference_values = difference_log_values(difference)
         run.summary.update(difference_values)
         run.log(difference_values)
@@ -831,6 +848,19 @@ def main(argv=None):
                     difference["train"]["r2"], difference["test"]["r2"])
         wandb.log({f"test/{key}": value for key, value in metrics.items() if np.isfinite(value)})
         logger.info("Best-checkpoint test metrics (acceleration in g): %s", metrics)
+        # A long run's best validation epoch can come early, so the final epoch's
+        # network is scored too, in its own folder (same file names).
+        last_dir = output_dir / "last_checkpoint"
+        last_dir.mkdir(exist_ok=True)
+        last_metrics, _, _, last_difference = evaluate_checkpoint(output_dir / LAST_CHECKPOINT_NAME, last_dir)
+        last_values = {f"last_checkpoint/{key}": value for key, value in difference_log_values(last_difference).items()}
+        last_values.update({f"last_checkpoint/test/{key}": value for key, value in last_metrics.items()
+                            if np.isfinite(value)})
+        run.summary.update(last_values)
+        run.log(last_values)
+        logger.info("Last-checkpoint (epoch %s) test metrics (acceleration in g): %s | design-difference R2: "
+                    "train=%s, test=%s", len(history["train_losses"]), last_metrics,
+                    last_difference["train"]["r2"], last_difference["test"]["r2"])
         logger.info("Finished. Run artifacts: %s", output_dir)
         return metrics
     finally:

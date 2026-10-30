@@ -15,13 +15,15 @@ its length, the base inner-outer panel gap and its change, and an outer-panel fl
 
 ``design_change_layers`` self-attention blocks (default none) run over each
 design's change tokens plus one learned null token. After every decoder block the time queries
-read these tokens with a second cross-attention (:class:`ChangeReadout`). Its
-values are scaled by each node's displacement, and its output projection starts
-at zero. So:
+read these tokens with a second cross-attention (:class:`ChangeReadout`) whose
+output projection starts at zero, so a new model starts as exactly the backbone.
+The tokens are already only the nodes that differ between near-clones, so the
+attention alone decides which of them matter (the default since 2026-10-30).
 
-* a new model starts as exactly the backbone, and
-* a design with no displacement (each cluster's base: 0, 4, 6, 10) always gets
-  exactly the backbone prediction. The path predicts only the effect of an edit.
+Runs before 2026-10-30 also scaled each value by the node's displacement from
+its cluster base / 10 mm and the null token's by zero
+(``design_change_displacement_gate=True``). There a cluster's base design (0, 4,
+6, 10) always got exactly the backbone prediction.
 
 Training uses the backbone's plain acceleration MSE.
 
@@ -55,8 +57,9 @@ CHANGE_FEATURES = ("xyz", "impact_relative")
 
 
 def saved_design_change_kwargs(kwargs: dict) -> dict:
-    """Model kwargs of a saved DesignChangeHistoryNet; older configs used impact-relative tokens."""
-    return {"design_change_features": "impact_relative", **kwargs}
+    """Model kwargs of a saved DesignChangeHistoryNet; older configs used impact-relative
+    tokens and the displacement gate."""
+    return {"design_change_features": "impact_relative", "design_change_displacement_gate": True, **kwargs}
 
 
 class DesignChangeTable:
@@ -139,11 +142,11 @@ class DesignChangeTable:
 
 
 class ChangeReadout(nn.Module):
-    """Time queries read the change-node tokens, with displacement-scaled values.
+    """Time queries read the change-node tokens. The output projection starts at zero.
 
-    A node's value is multiplied by its displacement length / 10 mm, and the
-    null token's by zero. A query can therefore read nothing, and a design with
-    no displacement adds nothing. The output projection starts at zero.
+    With a ``gate`` (older runs) each node's value is multiplied by its
+    displacement length / 10 mm and the null token's by zero, so a design with no
+    displacement adds nothing.
     """
 
     def __init__(self, width: int, num_heads: int, dropout: float):
@@ -159,16 +162,18 @@ class ChangeReadout(nn.Module):
         nn.init.zeros_(self.output.weight)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, queries: Tensor, tokens: Tensor, gate: Tensor, valid: Tensor) -> Tensor:
-        """queries (B, T, W); tokens (B, M, W); gate and valid (B, M)."""
+    def forward(self, queries: Tensor, tokens: Tensor, gate: Tensor | None, valid: Tensor) -> Tensor:
+        """queries (B, T, W); tokens (B, M, W); gate (B, M) or None; valid (B, M)."""
         batch, steps, width = queries.shape
 
         def heads(values):
             return values.reshape(batch, -1, self.num_heads, self.head_width).transpose(1, 2)
 
         key, value = self.key_value(tokens).chunk(2, dim=-1)
+        if gate is not None:
+            value = value * gate.unsqueeze(-1)
         update = F.scaled_dot_product_attention(
-            heads(self.query(self.query_norm(queries))), heads(key), heads(value * gate.unsqueeze(-1)),
+            heads(self.query(self.query_norm(queries))), heads(key), heads(value),
             attn_mask=valid[:, None, None, :],
             dropout_p=self.dropout_p if self.training else 0.0,
         )
@@ -179,11 +184,13 @@ class DesignChangeHistoryNet(MeshImpactHistoryNet):
     """MeshImpactHistoryNet whose decoder also reads the design-change nodes directly."""
 
     def __init__(self, design_change_layers: int = 0, design_change_fourier_octaves: int = 2,
-                 design_change_features: str = "xyz", **kwargs):
+                 design_change_features: str = "xyz", design_change_displacement_gate: bool = False, **kwargs):
         if isinstance(design_change_layers, bool) or not isinstance(design_change_layers, int) or design_change_layers < 0:
             raise ValueError("design_change_layers must be a nonnegative integer")
         if design_change_features not in CHANGE_FEATURES:
             raise ValueError(f"design_change_features must be one of {CHANGE_FEATURES}; got {design_change_features!r}")
+        if not isinstance(design_change_displacement_gate, bool):
+            raise ValueError("design_change_displacement_gate must be true or false")
         if (isinstance(design_change_fourier_octaves, bool) or not isinstance(design_change_fourier_octaves, int)
                 or design_change_fourier_octaves < 1):
             raise ValueError("design_change_fourier_octaves must be a positive integer")
@@ -192,6 +199,7 @@ class DesignChangeHistoryNet(MeshImpactHistoryNet):
             raise ValueError("DesignChangeHistoryNet reads XYZ meshes; node_extra_features must be 0")
         self.design_change_layers = design_change_layers
         self.design_change_features = design_change_features
+        self.design_change_displacement_gate = design_change_displacement_gate
         # Added after every backbone module, so one seed gives the backbone the
         # same initial weights as MeshImpactHistoryNet.
         frequencies = 2 * math.pi * 2.0 ** torch.arange(design_change_fourier_octaves) / CHANGE_LONGEST_WAVELENGTH_MM
@@ -249,8 +257,10 @@ class DesignChangeHistoryNet(MeshImpactHistoryNet):
         valid = torch.cat((valid.new_ones(batch_size, 1), valid), dim=1)
         for block in self.change_blocks:
             tokens = block(tokens, padding_mask=~valid)
-        gate = static[..., 3:6].norm(dim=-1) / CHANGE_DISPLACEMENT_SCALE_MM
-        gate = torch.cat((gate.new_zeros(batch_size, 1), gate), dim=1)
+        gate = None
+        if self.design_change_displacement_gate:
+            gate = static[..., 3:6].norm(dim=-1) / CHANGE_DISPLACEMENT_SCALE_MM
+            gate = torch.cat((gate.new_zeros(batch_size, 1), gate), dim=1)
         return self.change_norm(tokens), gate, valid
 
     def _read_decoder_context(self, index: int, queries: Tensor, context) -> Tensor:
