@@ -7,6 +7,7 @@ held-out split. No mesh geometry or data outside the supplied split is read.
 
 from collections import defaultdict
 from itertools import combinations
+from types import SimpleNamespace
 
 import numpy as np
 from hic15 import batched_hic
@@ -156,7 +157,7 @@ def design_sensitivity_metrics(dataset, predictions, targets, samples_per_design
     }
 
 
-def near_clone_difference_r2(dataset, predictions, targets, samples_per_design, clusters):
+def near_clone_difference_r2(dataset, predictions, targets, samples_per_design, clusters, across=None):
     """R2 of the acceleration difference curve between near-clone designs.
 
     For every unordered pair of designs a < b in the same ``clusters`` entry and
@@ -165,7 +166,8 @@ def near_clone_difference_r2(dataset, predictions, targets, samples_per_design, 
     ``r2 = 1 - sum((p - d)^2) / sum((d - mean d)^2)`` pooled over times,
     locations and pairs. A model that gives every design the same curve at a
     location (p = 0) scores about 0. ``r2`` is ``None`` without a matched pair.
-    Inputs follow ``design_sensitivity_metrics``.
+    With ``across`` (a set of designs) only pairs with exactly one member in it
+    count. Inputs follow ``design_sensitivity_metrics``.
     """
     runs = [int(run) for run in dataset.run_numbers]
     prediction = np.asarray(predictions, dtype=np.float64).reshape(-1)
@@ -182,6 +184,8 @@ def near_clone_difference_r2(dataset, predictions, targets, samples_per_design, 
     true_parts, predicted_parts, used_pairs = [], [], []
     for a, b in combinations(designs, 2):
         if a not in cluster_of or cluster_of[a] != cluster_of.get(b):
+            continue
+        if across is not None and (a in across) == (b in across):
             continue
         locations = sorted(location for design, location in index if design == a and (b, location) in index)
         for location in locations:
@@ -205,4 +209,53 @@ def near_clone_difference_r2(dataset, predictions, targets, samples_per_design, 
         true_difference_rms_g=float(np.sqrt(np.mean(true_delta ** 2))),
         predicted_difference_rms_g=float(np.sqrt(np.mean(predicted_delta ** 2))),
     )
+    return result
+
+
+def held_out_versus_siblings(train, test, samples_per_design, clusters):
+    """Each test design against its near-clone siblings in training.
+
+    ``train`` and ``test`` are (dataset, predictions, targets) as in
+    ``near_clone_difference_r2``. Returns that R2 over (test design, training
+    sibling) pairs only, and, on every test curve with a sibling in training at
+    its location, the RMSE of the model and of the mean true curve of those
+    siblings. The sibling mean is the best a model that cannot tell near-clones
+    apart can do. All values are ``None`` when no test design has a sibling in
+    training (a whole cluster held out).
+    """
+    (train_set, train_predictions, train_targets), (test_set, test_predictions, test_targets) = train, test
+    test_designs = {(int(run) - 1) // samples_per_design for run in test_set.run_numbers}
+    positions = [getattr(split, "indentor_positions", None) for split in (train_set, test_set)]
+    combined = SimpleNamespace(run_numbers=[*train_set.run_numbers, *test_set.run_numbers],
+                               time_arrays=[*train_set.time_arrays, *test_set.time_arrays])
+    if all(position is not None for position in positions):
+        combined.indentor_positions = np.concatenate([np.asarray(position) for position in positions])
+    prediction = np.concatenate([np.ravel(train_predictions), np.ravel(test_predictions)]).astype(np.float64)
+    target = np.concatenate([np.ravel(train_targets), np.ravel(test_targets)]).astype(np.float64)
+    result = near_clone_difference_r2(combined, prediction, target, samples_per_design, clusters,
+                                      across=test_designs)
+
+    offsets = np.concatenate(([0], np.cumsum([len(time) for time in combined.time_arrays])))
+    index = {((int(run) - 1) // samples_per_design, (int(run) - 1) % samples_per_design + 1): i
+             for i, run in enumerate(combined.run_numbers)}
+    cluster_of = {int(design): name for name, members in clusters.items() for design in members}
+    model_error = sibling_error = points = curves = 0
+    for (design, location), i in index.items():
+        if design not in test_designs or design not in cluster_of:
+            continue
+        siblings = [index[(other, location)] for other in clusters[cluster_of[design]]
+                    if other not in test_designs and (other, location) in index]
+        if not siblings:
+            continue
+        truth = target[offsets[i]:offsets[i + 1]]
+        if any(not np.array_equal(combined.time_arrays[i], combined.time_arrays[j]) for j in siblings):
+            raise ValueError(f"Time grids differ between design {design} and its siblings at location {location}")
+        sibling_mean = np.mean([target[offsets[j]:offsets[j + 1]] for j in siblings], axis=0)
+        model_error += np.square(prediction[offsets[i]:offsets[i + 1]] - truth).sum()
+        sibling_error += np.square(sibling_mean - truth).sum()
+        points += len(truth)
+        curves += 1
+    result.update(num_test_curves_with_siblings=curves,
+                  model_rmse_g=float(np.sqrt(model_error / points)) if points else None,
+                  sibling_mean_rmse_g=float(np.sqrt(sibling_error / points)) if points else None)
     return result

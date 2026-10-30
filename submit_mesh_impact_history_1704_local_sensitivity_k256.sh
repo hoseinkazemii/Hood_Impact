@@ -23,16 +23,19 @@ export HOOD_MESH_NEIGHBORHOOD_CHUNK_SIZE="1024"
 # The 1704 .inp *NODE blocks list the rigid headform first. Preflight
 # verifies the boundary against two runs before training starts.
 export HOOD_MESH_IMPACTOR_NODES="286"
-export HOOD_MESH_TEST_DESIGNS="4 5"
-export HOOD_MESH_VAL_DESIGNS="11"
-export HOOD_MESH_ALLOW_CLONE_LEAK="0"
+# Cluster-B holdout. Only a wrapper's own HOOD_MESH_HOLDOUT_* variables change it
+# (..._design_change_test7.sh); stale HOOD_MESH_TEST_DESIGNS etc. never do.
+export HOOD_MESH_TEST_DESIGNS="${HOOD_MESH_HOLDOUT_TEST_DESIGNS:-4 5}"
+export HOOD_MESH_VAL_DESIGNS="${HOOD_MESH_HOLDOUT_VAL_DESIGNS:-11}"
+export HOOD_MESH_ALLOW_CLONE_LEAK="${HOOD_MESH_HOLDOUT_ALLOW_CLONE_LEAK:-0}"
 export HOOD_MESH_RUN_NAME="${HOOD_MESH_RUN_NAME:-mesh_history_1704_clusterB_local_sensitivity_k256}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_PROJECT="${WANDB_PROJECT:-hood-impact-mesh-attention}"
 
 printf 'Experiment: 2 neighborhood layers, k=256, headform (286 nodes) held out of the local graph\n'
 printf 'Decoder: temporal | ordinary acceleration MSE\n'
-printf 'Holdout: train 0,1,2,3,6,7,8,9,10 | validation 11 | test 4,5 (whole cluster B)\n'
+printf 'Holdout: validation %s | test %s | training uses the remaining designs | clone leak allowed: %s\n' \
+    "${HOOD_MESH_VAL_DESIGNS}" "${HOOD_MESH_TEST_DESIGNS}" "${HOOD_MESH_ALLOW_CLONE_LEAK}"
 mkdir -p "${PROJECT_DIR}/runs/slurm"
 exec sbatch \
     --chdir="${PROJECT_DIR}" \

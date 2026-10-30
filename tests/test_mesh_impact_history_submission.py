@@ -40,6 +40,20 @@ class SubmissionSplitTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "near-clones in training"):
                     preflight.validate_cluster_holdout(test, validation)
 
+    def test_resume_skips_the_cluster_check_its_saved_split_already_had(self):
+        # A test-7 run starts with --allow-clone-leak; its resume restores the
+        # split without that flag and must still reach the dataset checks.
+        args = preflight.parse_args(["--test-designs", "7", "--val-designs", "5"])
+        for resume_from, reached in (("saved_run", True), (None, False)):
+            with self.subTest(resume_from=resume_from):
+                args.resume_from = resume_from
+                with mock.patch.object(preflight, "parse_args", return_value=args), \
+                        mock.patch.object(preflight, "validate_runtime"), \
+                        mock.patch.object(preflight, "validate_dataset", side_effect=RuntimeError("stop")) as dataset, \
+                        mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+                    self.assertEqual(preflight.main([]), 1)
+                self.assertEqual(dataset.called, reached)
+
     def test_complete_mapping_and_design_boundaries(self):
         splits = preflight.validate_splits([2], [10])
         self.assertEqual(len(splits["train"]["run_numbers"]), 1420)
@@ -592,6 +606,38 @@ printf 'ARG=%s\\n' "$@"
         self.env.pop("HOOD_MESH_DESIGN_CHANGE_TIME_STRIDE")
         output = self.launch("submit_mesh_impact_history_1704_design_change_nodes.sh")
         self.assertIn("STRIDE=16", output)
+
+    def test_test7_launcher_changes_only_the_split_epochs_and_name_of_the_long_run(self):
+        self.stub("sbatch", """env | grep -E '^(HOOD_MESH_|WANDB_MODE=)' | sort
+printf 'ARG=%s\\n' "$@"
+""")
+        # Stale split exports from other experiments must not reach either run.
+        self.env.update(HOOD_MESH_TEST_DESIGNS="10 11", HOOD_MESH_VAL_DESIGNS="2", HOOD_MESH_ALLOW_CLONE_LEAK="1")
+
+        def submitted(script):
+            output = self.launch(script)
+            settings = dict(line.split("=", 1) for line in output.splitlines()
+                            if line.startswith(("HOOD_MESH_", "WANDB_MODE=")))
+            arguments = [line[4:] for line in output.splitlines() if line.startswith("ARG=")]
+            return settings, arguments
+
+        long, _ = submitted("submit_mesh_impact_history_1704_design_change_long.sh")
+        test7, arguments = submitted("submit_mesh_impact_history_1704_design_change_test7.sh")
+        expected = {"HOOD_MESH_TEST_DESIGNS": ("4 5", "7"), "HOOD_MESH_VAL_DESIGNS": ("11", "5"),
+                    "HOOD_MESH_ALLOW_CLONE_LEAK": ("0", "1"), "HOOD_MESH_EPOCHS": ("800", "700"),
+                    "HOOD_MESH_RUN_NAME": ("mesh_history_clusterB_k256_fourier_no_shortcuts_design_change_no_gate_800ep",
+                                           "mesh_history_test7_val5_k256_fourier_no_shortcuts_design_change_no_gate_700ep")}
+        holdout = {key for key in test7 if key.startswith("HOOD_MESH_HOLDOUT_")}
+        self.assertEqual(holdout, {"HOOD_MESH_HOLDOUT_TEST_DESIGNS", "HOOD_MESH_HOLDOUT_VAL_DESIGNS",
+                                   "HOOD_MESH_HOLDOUT_ALLOW_CLONE_LEAK"})
+        changed = {key: (long.get(key), test7.get(key)) for key in (set(long) | set(test7)) - holdout
+                   if long.get(key) != test7.get(key)}
+        self.assertEqual(changed, expected)
+        self.assertEqual(test7["WANDB_MODE"], "online")
+        self.assertEqual([a for a in arguments if a.startswith("--time=")][-1], "--time=48:00:00")
+        self.assertEqual([a for a in arguments if a.startswith("--job-name=")][-1], "--job-name=mesh_hist_dc_test7")
+        self.assertTrue(any(a.startswith("--output=") and a.endswith("/runs/slurm/mesh_history_1704_design_change_test7_%j.out")
+                            for a in arguments), arguments)
 
     def test_batch_runs_directly_with_broken_srun_and_preserves_gpu_decoder_and_split(self):
         self.env["CUDA_VISIBLE_DEVICES"] = "GPU-allocated-by-slurm"

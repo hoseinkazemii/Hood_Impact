@@ -9,6 +9,11 @@ simulation (d) and once in the prediction (p). Score with ordinary R2,
 pooled over sampled times, locations and the near-clone pairs inside one split.
 0 means the model predicts the same curve for both designs; 1 is perfect.
 
+``test_vs_train`` scores each test design against its near-clone siblings in
+training (pairs that cross the splits), next to the test RMSE of the model and
+of the siblings' mean true curve. It is empty when the test designs' whole
+cluster is held out (test 4, 5).
+
 Training writes ``design_difference_r2.json`` for every run. This command
 backfills it from a run's saved ``train_acceleration_histories.csv`` and
 ``test_acceleration_histories.csv`` without loading the model.
@@ -24,7 +29,7 @@ from types import SimpleNamespace
 
 import pandas as pd
 
-from mesh_change_metrics import near_clone_difference_r2
+from mesh_change_metrics import held_out_versus_siblings, near_clone_difference_r2
 from mesh_design_clusters import GEOMETRY_CLUSTERS
 
 REPORT_NAME = "design_difference_r2.json"
@@ -43,12 +48,23 @@ def design_difference_report(data_format, samples_per_design, splits):
         report["note"] = f"No near-clone cluster map for data format {data_format!r}; nothing to score"
     for name, (dataset, predictions, targets) in splits.items():
         report[name] = near_clone_difference_r2(dataset, predictions, targets, samples_per_design, clusters)
+    if "train" in splits and "test" in splits:
+        # A test design whose siblings stay in training (e.g. test 7 of cluster C)
+        # has no pair inside the test split; score it against those siblings.
+        report["test_vs_train"] = held_out_versus_siblings(splits["train"], splits["test"],
+                                                           samples_per_design, clusters)
     return report
 
 
 def difference_log_values(report):
-    return {f"{name}/design_difference_r2": report[name]["r2"]
-            for name in SPLITS if report.get(name, {}).get("r2") is not None}
+    values = {f"{name}/design_difference_r2": report[name]["r2"]
+              for name in SPLITS if report.get(name, {}).get("r2") is not None}
+    across = report.get("test_vs_train", {})
+    for key, label in (("r2", "design_difference_r2"), ("model_rmse_g", "model_rmse_g"),
+                       ("sibling_mean_rmse_g", "sibling_mean_rmse_g")):
+        if across.get(key) is not None:
+            values[f"test_vs_train/{label}"] = across[key]
+    return values
 
 
 def write_design_difference_report(output_dir, report):
@@ -83,7 +99,7 @@ def main(argv=None):
         if missing:
             report["missing_histories"] = missing
         path = write_design_difference_report(run_dir, report)
-        scores = {name: report[name]["r2"] for name in SPLITS if name in report}
+        scores = {name: report[name]["r2"] for name in (*SPLITS, "test_vs_train") if name in report}
         print(f"{run_dir.name}: {scores}" + (f" (missing {', '.join(missing)})" if missing else "") + f" -> {path}")
 
 

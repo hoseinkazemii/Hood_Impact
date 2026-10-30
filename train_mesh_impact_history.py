@@ -846,6 +846,9 @@ def main(argv=None):
         run.log(difference_values)
         logger.info("Near-clone design-difference R2 (acceleration): train=%s, test=%s",
                     difference["train"]["r2"], difference["test"]["r2"])
+        logger.info("Test designs vs their training siblings: difference R2=%s | test RMSE model=%s g, "
+                    "sibling mean=%s g", difference["test_vs_train"]["r2"],
+                    difference["test_vs_train"]["model_rmse_g"], difference["test_vs_train"]["sibling_mean_rmse_g"])
         wandb.log({f"test/{key}": value for key, value in metrics.items() if np.isfinite(value)})
         logger.info("Best-checkpoint test metrics (acceleration in g): %s", metrics)
         # A long run's best validation epoch can come early, so the final epoch's
@@ -859,8 +862,9 @@ def main(argv=None):
         run.summary.update(last_values)
         run.log(last_values)
         logger.info("Last-checkpoint (epoch %s) test metrics (acceleration in g): %s | design-difference R2: "
-                    "train=%s, test=%s", len(history["train_losses"]), last_metrics,
-                    last_difference["train"]["r2"], last_difference["test"]["r2"])
+                    "train=%s, test=%s, test vs training siblings=%s", len(history["train_losses"]), last_metrics,
+                    last_difference["train"]["r2"], last_difference["test"]["r2"],
+                    last_difference["test_vs_train"]["r2"])
         logger.info("Finished. Run artifacts: %s", output_dir)
         return metrics
     finally:

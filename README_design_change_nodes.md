@@ -134,6 +134,24 @@ To beat, on test 4-5: the baseline's accel RMSE 15.54 g and HIC R2 0.898, and di
 Every 4th point of its histories is exactly the 63-point grid, so compare the two runs there as well as
 on all 250 points.
 
+`submit_mesh_impact_history_1704_design_change_test7.sh` is the same run with test design 7 and
+validation design 5; training is 0, 1, 2, 3, 4, 6, 8, 9, 10, 11 (700 epochs, since the training set is 11%
+larger). Design 7's edit changes the response more than any other design's:
+
+| near-clone pair | mean \|dHIC15\|, 142 locations | top-10 locations | locations > 10% |
+|---|---|---|---|
+| 4-5 | 3.7% | 8.0% | 12 |
+| 6-7, 7-8, 7-9 | 7.7-8.1% | 22-24% | 32-40 |
+| 6-8, 6-9, 8-9 | 1.5-2.8% | 1.6-3.1% | 3-6 |
+| 10-11 | 7.4% | 15.8% | 33 |
+| cluster A pairs | 1.5-3.9% | 2.9-6.9% | 2-17 |
+
+Validation 5 keeps 10-11, the only other large effect, in training. Design 7's siblings stay in training,
+so copying them is a strong baseline. `design_difference_r2.json` has a `test_vs_train` section for
+this: the difference R2 of 7 against 6, 8 and 9, and design 7's RMSE for the model and for the mean true
+curve of 6, 8 and 9 at the same location (12.7 g over all 142 locations). It is empty for the 4, 5 split,
+where the whole cluster is held out.
+
 If the job times out, `hood_impact_last_model.pt` holds the last completed epoch. Continue it on the same
 schedule with
 `bash submit_mesh_impact_history_1704_local_sensitivity_resume.sh <run dir> --time=24:00:00`.

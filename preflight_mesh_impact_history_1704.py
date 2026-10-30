@@ -378,7 +378,10 @@ def main(argv=None):
         validate_runtime(args.require_cuda)
         validate_location_shortcuts(args.impactor_nodes, args.pool_impactor_nodes, args.mesh_nodes)
         splits = validate_splits(args.test_designs, args.val_designs)
-        if args.allow_clone_leak:
+        if args.resume_from:
+            # The saved split passed (or deliberately skipped) this check when the run started.
+            print("Cluster check: SKIPPED (a resume keeps the saved split)")
+        elif args.allow_clone_leak:
             print("Cluster check: SKIPPED (--allow-clone-leak); scores may measure retrieval")
         else:
             held_clusters, val_leaks = validate_cluster_holdout(
