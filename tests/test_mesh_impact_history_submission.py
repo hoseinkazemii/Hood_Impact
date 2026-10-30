@@ -545,7 +545,7 @@ printf 'ARG=%s\\n' "$@"
         for variant in variants:
             self.assertIn(f"NAME=mesh_history_clusterB_k256_fourier_no_shortcuts_design_change_{variant}", output)
 
-    def test_long_design_change_launcher_pins_the_ungated_800_epoch_run(self):
+    def test_long_design_change_launchers_pin_the_ungated_800_epoch_runs(self):
         self.env.pop("WANDB_MODE", None)
         self.stub("sbatch", """printf 'CHANGE=%s\\nLAYERS=%s\\nOCTAVES=%s\\nFEATURES=%s\\nGATE=%s\\nMESH=%s\\n' \\
     "$HOOD_MESH_DESIGN_CHANGE_NODES" "$HOOD_MESH_DESIGN_CHANGE_LAYERS" "$HOOD_MESH_DESIGN_CHANGE_FOURIER_OCTAVES" \\
@@ -556,26 +556,42 @@ printf 'EPOCHS=%s\\nBATCH=%s\\nLR=%s\\nSEED=%s\\nDROPOUT=%s\\nWD=%s\\nK=%s\\nTES
 printf 'FILM=%s\\nRESIDUAL=%s\\nSTRIDE=%s\\nHIC=%s\\nNAME=%s\\nTRACKING=%s\\n' \\
     "$HOOD_MESH_GEOMETRY_FILM" "$HOOD_MESH_POOLING_QUERY_RESIDUAL" "$HOOD_MESH_TIME_SUBSAMPLE_STRIDE" \\
     "$HOOD_MESH_HIC_RANGE_THRESHOLD_PERCENT" "$HOOD_MESH_RUN_NAME" "$WANDB_MODE"
+printf 'FOURIER=%s/%s-%s\\n' "$HOOD_MESH_FOURIER_NUM_FREQUENCIES" "$HOOD_MESH_FOURIER_MIN_FREQUENCY_HZ" \\
+    "$HOOD_MESH_FOURIER_MAX_FREQUENCY_HZ"
 printf 'ARG=%s\\n' "$@"
 """)
-        # Stale exports from other experiments must not leak into the long run.
+        # Stale exports from other experiments must not leak into the long runs.
         self.env.update(HOOD_MESH_DROPOUT="0.4", HOOD_MESH_WEIGHT_DECAY="0.3", HOOD_MESH_LR="0.01",
                         HOOD_MESH_SEED="7", HOOD_MESH_EPOCHS="5", HOOD_MESH_RUN_NAME="stale",
                         HOOD_MESH_DESIGN_CHANGE_LAYERS="9", HOOD_MESH_DESIGN_CHANGE_FEATURES="impact_relative",
                         HOOD_MESH_DESIGN_CHANGE_DISPLACEMENT_GATE="true", HOOD_MESH_MESH_NODES="all",
-                        HOOD_MESH_GEOMETRY_FILM="all", HOOD_MESH_TIME_SUBSAMPLE_STRIDE="4")
-        output = self.launch("submit_mesh_impact_history_1704_design_change_long.sh")
-        for expected in ("CHANGE=true", "LAYERS=0", "OCTAVES=2", "FEATURES=xyz", "GATE=false", "MESH=inner_panel",
-                         "EPOCHS=800", "BATCH=8", "LR=0.0003", "SEED=42", "DROPOUT=0.1", "WD=0.00001", "K=256",
-                         "TEST=4 5", "VAL=11", "FILM=none", "RESIDUAL=false", "STRIDE=16", "HIC=0",
-                         "NAME=mesh_history_clusterB_k256_fourier_no_shortcuts_design_change_no_gate_800ep",
-                         "TRACKING=online", "mesh_history_1704_design_change_long_%j.out"):
-            self.assertIn(expected, output)
-        arguments = [line[4:] for line in output.splitlines() if line.startswith("ARG=")]
-        times = [argument for argument in arguments if argument.startswith("--time=")]
-        self.assertEqual(times[-1], "--time=48:00:00")
-        job_names = [argument for argument in arguments if argument.startswith("--job-name=")]
-        self.assertEqual(job_names[-1], "--job-name=mesh_hist_dc_long")
+                        HOOD_MESH_GEOMETRY_FILM="all", HOOD_MESH_TIME_SUBSAMPLE_STRIDE="8",
+                        HOOD_MESH_DESIGN_CHANGE_TIME_STRIDE="2", HOOD_MESH_FOURIER_NUM_FREQUENCIES="3",
+                        HOOD_MESH_FOURIER_MIN_FREQUENCY_HZ="1", HOOD_MESH_FOURIER_MAX_FREQUENCY_HZ="9")
+        variants = {"long": ("16", "6/20-640", "", "mesh_hist_dc_long"),
+                    "long_t250": ("4", "8/20-2560", "_t250", "mesh_hist_dc_long_t250")}
+        for variant, (stride, fourier, suffix, job) in variants.items():
+            with self.subTest(variant=variant):
+                output = self.launch(f"submit_mesh_impact_history_1704_design_change_{variant}.sh")
+                for expected in ("CHANGE=true", "LAYERS=0", "OCTAVES=2", "FEATURES=xyz", "GATE=false",
+                                 "MESH=inner_panel", "EPOCHS=800", "BATCH=8", "LR=0.0003", "SEED=42", "DROPOUT=0.1",
+                                 "WD=0.00001", "K=256", "TEST=4 5", "VAL=11", "FILM=none", "RESIDUAL=false",
+                                 f"STRIDE={stride}", f"FOURIER={fourier}", "HIC=0",
+                                 f"NAME=mesh_history_clusterB_k256_fourier_no_shortcuts_design_change_no_gate_800ep{suffix}",
+                                 "TRACKING=online", f"mesh_history_1704_design_change_{variant}_%j.out"):
+                    self.assertIn(expected, output)
+                arguments = [line[4:] for line in output.splitlines() if line.startswith("ARG=")]
+                times = [argument for argument in arguments if argument.startswith("--time=")]
+                self.assertEqual(times[-1], "--time=48:00:00")
+                job_names = [argument for argument in arguments if argument.startswith("--job-name=")]
+                self.assertEqual(job_names[-1], f"--job-name={job}")
+        # Only the dedicated variable moves the plain launcher's grid; the stale
+        # HOOD_MESH_TIME_SUBSAMPLE_STRIDE=8 never does.
+        output = self.launch("submit_mesh_impact_history_1704_design_change_nodes.sh")
+        self.assertIn("STRIDE=2", output)
+        self.env.pop("HOOD_MESH_DESIGN_CHANGE_TIME_STRIDE")
+        output = self.launch("submit_mesh_impact_history_1704_design_change_nodes.sh")
+        self.assertIn("STRIDE=16", output)
 
     def test_batch_runs_directly_with_broken_srun_and_preserves_gpu_decoder_and_split(self):
         self.env["CUDA_VISIBLE_DEVICES"] = "GPU-allocated-by-slurm"

@@ -44,6 +44,9 @@ export HOOD_MESH_DROPOUT="0.1"
 export HOOD_MESH_WEIGHT_DECAY="0.00001"
 # Pin the rest of the 3458374 settings so stale exports cannot leak in.
 export HOOD_MESH_EPOCHS="800" HOOD_MESH_BATCH_SIZE="8" HOOD_MESH_LR="0.0003" HOOD_MESH_SEED="42"
+export HOOD_MESH_DESIGN_CHANGE_TIME_STRIDE="16"
+export HOOD_MESH_FOURIER_NUM_FREQUENCIES="6" HOOD_MESH_FOURIER_MIN_FREQUENCY_HZ="20"
+export HOOD_MESH_FOURIER_MAX_FREQUENCY_HZ="640"
 export HOOD_MESH_RUN_NAME="mesh_history_clusterB_k256_fourier_no_shortcuts_design_change_no_gate_800ep"
 
 printf 'Long run: 800 epochs | change readout without displacement gate | inner panel | XYZ tokens\n'

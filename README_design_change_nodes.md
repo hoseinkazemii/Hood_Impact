@@ -128,6 +128,12 @@ For HIC on either one, run `python evaluate_mesh_impact_hic.py <dir> --data-dir 
 To beat, on test 4-5: the baseline's accel RMSE 15.54 g and HIC R2 0.898, and difference R2 > 0
 (better than predicting the same history for both designs).
 
+`submit_mesh_impact_history_1704_design_change_long_t250.sh` is the same run on a 4x finer time grid:
+250 points (stride 4) instead of 63, with Fourier time features at 20-2560 Hz (8 doublings) instead of
+20-640 Hz. A full-size training step measured 1.00-1.02x the 63-point one, so it also fits in 48 h.
+Every 4th point of its histories is exactly the 63-point grid, so compare the two runs there as well as
+on all 250 points.
+
 If the job times out, `hood_impact_last_model.pt` holds the last completed epoch. Continue it on the same
 schedule with
 `bash submit_mesh_impact_history_1704_local_sensitivity_resume.sh <run dir> --time=24:00:00`.
