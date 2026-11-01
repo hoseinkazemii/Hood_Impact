@@ -843,6 +843,8 @@ class Trainer:
                 time = batch["time"].to(self.config.device)
                 time_batch = batch["time_batch"].to(self.config.device)
                 target = batch["acceleration"].to(self.config.device)  # (T_total,)
+                # Teacher forcing: the model reads the true earlier chunks.
+                history = {"history": target} if getattr(self.model, "teacher_forcing_chunks", 0) else {}
 
                 pred = self.model(
                     mesh,
@@ -851,6 +853,7 @@ class Trainer:
                     time,
                     time_batch,
                     batch_size=batch_size,
+                    **history,
                 )  # (T_total,)
 
             loss = self.criterion(pred, target)
@@ -865,7 +868,9 @@ class Trainer:
         return total_loss / max(num_batches, 1)
 
     @torch.no_grad()
-    def validate(self) -> Tuple[float, float]:
+    def validate(self, teacher_forced: bool = False) -> Tuple[float, float]:
+        """Validation loss and MAE. A teacher-forcing model rolls out unless
+        ``teacher_forced``, which feeds it the true earlier chunks."""
         self.model.eval()
 
         total_loss = 0.0
@@ -908,6 +913,7 @@ class Trainer:
                     time,
                     time_batch,
                     batch_size=batch_size,
+                    **({"history": target} if teacher_forced else {}),
                 )  # (T_total,)
 
                 loss = self.criterion(pred, target)
@@ -954,13 +960,20 @@ class Trainer:
                   f"Val Loss: {val_loss:.6f} | "
                   f"Val MAE: {val_mae:.4f} {unit} | "
                   f"LR: {current_lr:.2e}")
-            wandb.log({
+            values = {
                 "epoch": epoch + 1,
                 "train/loss": train_loss,
                 "val/loss": val_loss,
                 "val/mae_g": val_mae,
                 "lr": current_lr,
-            })
+            }
+            if getattr(self.model, "teacher_forcing_chunks", 0):
+                # Checkpoints are chosen on the rollout loss above, as the model
+                # is used; this is the same model fed the true earlier chunks.
+                values["val/teacher_forced_loss"], values["val/teacher_forced_mae_g"] = self.validate(teacher_forced=True)
+                print(f"          Val Loss fed the true earlier chunks: {values['val/teacher_forced_loss']:.6f} | "
+                      f"Val MAE: {values['val/teacher_forced_mae_g']:.4f} {unit}")
+            wandb.log(values)
 
             # Early stopping check
             if val_loss < self.best_val_loss:
@@ -1129,7 +1142,9 @@ class Evaluator:
         self.preprocessor = preprocessor
         
     @torch.no_grad()
-    def evaluate(self, test_loader: DataLoader) -> Dict:
+    def evaluate(self, test_loader: DataLoader, teacher_forced: bool = False) -> Dict:
+        """A teacher-forcing model rolls out unless ``teacher_forced``, which
+        feeds it the true earlier chunks."""
         self.model.eval()
 
         all_preds = []
@@ -1168,6 +1183,7 @@ class Evaluator:
                     time,
                     time_batch,
                     batch_size=batch_size,
+                    **({"history": target} if teacher_forced else {}),
                 )
 
                 pred_denorm = self.preprocessor.inverse_transform_acceleration(pred.cpu().numpy())

@@ -59,7 +59,7 @@ EXPERIMENT_MODEL_KEYS = tuple(
     if key.startswith("neighborhood_") or key in ("impactor_nodes", "impact_conditioning")
     or key == "time_encoding" or key.startswith("fourier_")
     or key in ("pooling_query_residual", "pool_impactor_nodes")
-    or key.startswith("geometry_")
+    or key.startswith("geometry_") or key == "teacher_forcing_chunks"
 )
 
 
@@ -298,14 +298,18 @@ def validate_cuda_model(data, decoder=MODEL_DEFAULTS["decoder"], neighbor_cache_
         start = model.impactor_nodes
         model.neighbor_cache.register_geometry(data["mesh_geometries"][0][start:],
                                               mesh[start:] * model.mesh_scale, model.neighborhood_k)
-    prediction = model(
-        mesh=mesh,
-        mesh_batch=torch.zeros(len(mesh), device="cuda", dtype=torch.long),
-        indentor=impact,
-        time=time,
-        time_batch=torch.zeros(len(time), device="cuda", dtype=torch.long),
-        batch_size=1,
-    )
+    inputs = dict(mesh=mesh, mesh_batch=torch.zeros(len(mesh), device="cuda", dtype=torch.long),
+                  indentor=impact, time=time,
+                  time_batch=torch.zeros(len(time), device="cuda", dtype=torch.long), batch_size=1)
+    if model.teacher_forcing_chunks:
+        # Validation and test roll out chunk by chunk; training feeds the true
+        # accelerations, which any finite history stands in for here.
+        with torch.no_grad():
+            rollout = model(**inputs)
+        if rollout.shape != time.shape or not torch.isfinite(rollout).all():
+            raise ValueError("CUDA model probe produced an invalid rollout history")
+        inputs["history"] = torch.sin(3 * time)
+    prediction = model(**inputs)
     if prediction.shape != time.shape or not torch.isfinite(prediction).all():
         raise ValueError("CUDA model probe produced an invalid acceleration history")
     prediction.square().mean().backward()
@@ -326,12 +330,15 @@ def validate_cuda_model(data, decoder=MODEL_DEFAULTS["decoder"], neighbor_cache_
             readout.output.weight.grad is None or not readout.output.weight.grad.abs().sum() > 0
             for readout in model.change_readouts):
         raise ValueError("CUDA model probe produced no gradient for a design-change readout")
+    history_gradient = model.history_embedding[0].weight.grad if model.teacher_forcing_chunks else None
+    if model.teacher_forcing_chunks and (history_gradient is None or not history_gradient.abs().sum() > 0):
+        raise ValueError("CUDA model probe produced no gradient for the teacher-forcing history embedding")
     torch.cuda.synchronize()
     print(f"GPU: {torch.cuda.get_device_name(0)} | decoder={decoder} | "
           f"time_encoding={model.time_encoding} ({model.time_feature_count} features) | "
           f"neighborhood_layers={len(model.neighborhood_blocks)} | "
-          f"geometry_film={model.geometry_film} | design_change_nodes={design_changes is not None} "
-          f"forward/backward: passed")
+          f"geometry_film={model.geometry_film} | design_change_nodes={design_changes is not None} | "
+          f"teacher_forcing_chunks={model.teacher_forcing_chunks} forward/backward: passed")
     if model.neighborhood_blocks:
         print(f"Neighbor graph cache: built={model.neighbor_cache.builds} | loaded from disk={model.neighbor_cache.disk_hits}")
 

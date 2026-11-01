@@ -65,6 +65,7 @@ else
     printf 'Design-change nodes: %s | displacement gate: %s\n' "${HOOD_MESH_DESIGN_CHANGE_NODES:-false}" \
         "${HOOD_MESH_DESIGN_CHANGE_DISPLACEMENT_GATE:-false (training default)}"
     printf 'Mesh nodes: %s\n' "${HOOD_MESH_MESH_NODES:-inner_panel (training default)}"
+    printf 'Teacher forcing chunks: %s\n' "${HOOD_MESH_TEACHER_FORCING_CHUNKS:-0 (off, training default)}"
 fi
 printf 'W&B: %s | project: %s | entity: %s\n' "${WANDB_MODE}" "${WANDB_PROJECT}" "${WANDB_ENTITY:-default team}"
 module list 2>&1 || true
@@ -87,6 +88,7 @@ for option in NEIGHBORHOOD_LAYERS:neighborhood-layers NEIGHBORHOOD_K:neighborhoo
     DESIGN_CHANGE_FOURIER_OCTAVES:design-change-fourier-octaves \
     DESIGN_CHANGE_FEATURES:design-change-features \
     DESIGN_CHANGE_DISPLACEMENT_GATE:design-change-displacement-gate MESH_NODES:mesh-nodes \
+    TEACHER_FORCING_CHUNKS:teacher-forcing-chunks \
     BATCH_SIZE:batch-size TIME_SUBSAMPLE_STRIDE:time-subsample-stride MAX_TRAIN_TIME:max-train-time; do
     variable="HOOD_MESH_${option%%:*}"
     if [[ -n "${!variable}" ]]; then

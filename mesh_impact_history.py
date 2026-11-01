@@ -71,7 +71,9 @@ class HistoryDecoderBlock(nn.Module):
         )
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, queries: Tensor, memory: Tensor, padding_mask: Tensor) -> Tensor:
+    def forward(self, queries: Tensor, memory: Tensor, padding_mask: Tensor,
+                time_mask: Tensor | None = None) -> Tensor:
+        """``time_mask`` (T, T), True where a time may not read another (teacher forcing)."""
         normalized_memory = self.memory_norm(memory)
         update = self.cross_attention(
             self.query_norm(queries), normalized_memory, normalized_memory,
@@ -81,7 +83,7 @@ class HistoryDecoderBlock(nn.Module):
         normalized_time = self.time_norm(queries)
         update = self.time_attention(
             normalized_time, normalized_time, normalized_time,
-            key_padding_mask=padding_mask, need_weights=False,
+            key_padding_mask=padding_mask, attn_mask=time_mask, need_weights=False,
         )[0]
         queries = queries + self.dropout(update)
         return queries + self.dropout(self.feedforward(self.feedforward_norm(queries)))
@@ -116,10 +118,11 @@ class MeshOnlyDecoderBlock(nn.Module):
         )
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, queries: Tensor, memory: Tensor, padding_mask: Tensor) -> Tensor:
+    def forward(self, queries: Tensor, memory: Tensor, padding_mask: Tensor,
+                time_mask: Tensor | None = None) -> Tensor:
         # Keep the common decoder interface. All operations are independent
         # across queries, so padded times cannot affect real predictions.
-        del padding_mask
+        del padding_mask, time_mask
         normalized_memory = self.memory_norm(memory)
         update = self.cross_attention(
             self.query_norm(queries), normalized_memory, normalized_memory,
@@ -283,6 +286,17 @@ class MeshImpactHistoryNet(nn.Module):
     using the first three columns as coordinates. The common/residual model
     (common_residual.py) uses them for the explicit deviation of a design from
     its reference hood. With 0 (the default) the network is unchanged.
+
+    Teacher forcing. ``teacher_forcing_chunks`` > 0 splits each history into
+    that many contiguous chunks of ceil(T / chunks) times and predicts them in
+    order. Every time query also embeds the acceleration one chunk earlier
+    (none in the first chunk), and the temporal attention is block-causal: a
+    time reads only the times of its own and earlier chunks. A chunk's output
+    therefore depends on the accelerations of earlier chunks only. ``forward``
+    with ``history`` (training) feeds the true accelerations, all chunks in
+    one pass; without it (validation, test, inference) the model rolls out,
+    feeding each chunk its own prediction of the earlier ones. Needs the
+    ``"temporal"`` decoder. With 0 (the default) the network is unchanged.
     """
 
     def __init__(
@@ -309,6 +323,7 @@ class MeshImpactHistoryNet(nn.Module):
         geometry_film: str = "none",
         geometry_fourier_octaves: int = 5,
         node_extra_features: int = 0,
+        teacher_forcing_chunks: int = 0,
     ):
         super().__init__()
         integer_options = {
@@ -361,6 +376,12 @@ class MeshImpactHistoryNet(nn.Module):
         if geometry_film == "all" and not neighborhood_layers:
             raise ValueError("geometry_film='all' injects after neighborhood blocks; "
                              "set neighborhood_layers > 0 or use geometry_film='latent'")
+        if (isinstance(teacher_forcing_chunks, bool) or not isinstance(teacher_forcing_chunks, int)
+                or teacher_forcing_chunks < 0 or teacher_forcing_chunks == 1):
+            raise ValueError("teacher_forcing_chunks must be 0 (off) or an integer of at least 2")
+        if teacher_forcing_chunks and decoder != "temporal":
+            raise ValueError("teacher forcing passes earlier chunks through the temporal attention; "
+                             "use decoder='temporal'")
 
         self.decoder = decoder
         self.impact_conditioning = impact_conditioning
@@ -376,6 +397,7 @@ class MeshImpactHistoryNet(nn.Module):
         self.pool_impactor_nodes = pool_impactor_nodes
         self.geometry_film = geometry_film
         self.node_extra_features = node_extra_features
+        self.teacher_forcing_chunks = teacher_forcing_chunks
 
         # The shared preprocessor fits mesh and impact scalers independently.
         # Store their affine maps in the checkpoint so relative coordinates
@@ -461,6 +483,12 @@ class MeshImpactHistoryNet(nn.Module):
             self.latent_geometry_film = nn.ModuleList([FiLM(width) for _ in range(latent_layers)])
         if geometry_film == "all":
             self.node_geometry_film = nn.ModuleList([FiLM(width) for _ in range(neighborhood_layers)])
+        if teacher_forcing_chunks:
+            # Input: the normalized acceleration one chunk earlier and 1 where
+            # that exists (0 in the first chunk). Added to the time queries.
+            self.history_embedding = nn.Sequential(
+                nn.Linear(2, width), nn.GELU(), nn.Linear(width, width),
+            )
 
     @torch.no_grad()
     def set_time_scaler(self, mean: float, scale: float) -> None:
@@ -696,6 +724,7 @@ class MeshImpactHistoryNet(nn.Module):
         time: Tensor,
         time_batch: Tensor,
         batch_size: int | None = None,
+        history: Tensor | None = None,
     ) -> Tensor:
         """Return one normalized acceleration per input time, in the same order.
 
@@ -707,12 +736,22 @@ class MeshImpactHistoryNet(nn.Module):
             time: Normalized, already-subsampled times, shape (sum_times,).
             time_batch: Time sample membership, shape (sum_times,).
             batch_size: Optional B; inferred from indentor when omitted.
+            history: Teacher forcing only: the true normalized accelerations
+                at ``time``, shape (sum_times,). Each chunk then reads the true
+                earlier chunks. Without it a teacher-forcing model feeds each
+                chunk its own predictions of the earlier ones.
         """
         if batch_size is None:
             if indentor.ndim != 2:
                 raise ValueError("indentor must have shape (batch_size, 2)")
             batch_size = indentor.shape[0]
         self._validate_inputs(mesh, mesh_batch, indentor, time, time_batch, batch_size)
+        if history is not None:
+            if not self.teacher_forcing_chunks:
+                raise ValueError("history is read only by a model with teacher_forcing_chunks > 0")
+            if (history.shape != time.shape or history.dtype != time.dtype or history.device != time.device
+                    or not torch.isfinite(history).all()):
+                raise ValueError("history must be finite and match time in shape, dtype and device")
         condition = self.impact_embedding(indentor)
 
         # Encoding each mesh separately avoids padding tens of thousands of
@@ -744,11 +783,13 @@ class MeshImpactHistoryNet(nn.Module):
         if self.impact_conditioning == "legacy_additive":
             queries = queries + condition[:, None, :]
         decoder_context = self._decoder_context(mesh, mesh_batch, indentor, batch_size)
-        for index, block in enumerate(self.decoder_blocks):
-            queries = block(queries, memory, padding_mask)
-            if decoder_context is not None:
-                queries = self._read_decoder_context(index, queries, decoder_context)
-        padded_acceleration = self.acceleration_head(queries).squeeze(-1)
+        if self.teacher_forcing_chunks:
+            if padding_mask.any():
+                raise ValueError("Teacher forcing chunks the time grid; every sample needs the same number of times")
+            padded_history = None if history is None else torch.stack([history[index] for index in time_indices])
+            padded_acceleration = self._decode_chunks(queries, memory, padding_mask, decoder_context, padded_history)
+        else:
+            padded_acceleration = self._decode(queries, memory, padding_mask, decoder_context)
 
         # Restore even interleaved input time batches without cross-sample
         # attention or predictions for padded positions.
@@ -756,3 +797,37 @@ class MeshImpactHistoryNet(nn.Module):
         for b, index in enumerate(time_indices):
             output = output.index_copy(0, index, padded_acceleration[b, :index.numel()])
         return output
+
+    def _decode(self, queries: Tensor, memory: Tensor, padding_mask: Tensor, decoder_context,
+                time_mask: Tensor | None = None) -> Tensor:
+        """(B, T, W) time queries -> (B, T) normalized accelerations."""
+        for index, block in enumerate(self.decoder_blocks):
+            queries = block(queries, memory, padding_mask, time_mask)
+            if decoder_context is not None:
+                queries = self._read_decoder_context(index, queries, decoder_context)
+        return self.acceleration_head(queries).squeeze(-1)
+
+    def _decode_chunks(self, queries: Tensor, memory: Tensor, padding_mask: Tensor, decoder_context,
+                       history: Tensor | None) -> Tensor:
+        """Teacher forcing with ``history`` (B, T); rollout chunk by chunk without it."""
+        steps = queries.shape[1]
+        size = math.ceil(steps / self.teacher_forcing_chunks)
+        position = torch.arange(steps, device=queries.device)
+        chunk = position // size
+        # Block-causal: True where a time may not read another, i.e. a later chunk.
+        time_mask = chunk[None, :] > chunk[:, None]
+        known = (position >= size).expand(len(queries), -1)
+
+        def decode(accelerations):
+            # Time i reads the acceleration at i - size: the same place one chunk earlier.
+            previous = F.pad(accelerations[:, :steps - size], (size, 0))
+            history_queries = self.history_embedding(torch.stack((previous, known.to(previous.dtype)), dim=-1))
+            return self._decode(queries + history_queries, memory, padding_mask, decoder_context, time_mask)
+
+        if history is not None:
+            return decode(history)
+        # Chunk k's outputs depend only on chunks before k, which hold predictions by then.
+        prediction = queries.new_zeros(queries.shape[:2])
+        for index in range(int(chunk[-1]) + 1):
+            prediction = torch.where(chunk == index, decode(prediction), prediction)
+        return prediction

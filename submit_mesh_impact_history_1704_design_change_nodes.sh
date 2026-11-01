@@ -47,6 +47,8 @@ export HOOD_MESH_POOL_IMPACTOR_NODES="false"
 # Only a wrapper's own HOOD_MESH_DESIGN_CHANGE_TIME_STRIDE changes the time grid
 # (..._long_t250.sh: 4, i.e. 250 of the 1000 samples instead of 63).
 export HOOD_MESH_TIME_SUBSAMPLE_STRIDE="${HOOD_MESH_DESIGN_CHANGE_TIME_STRIDE:-16}"
+# Likewise only ..._teacher_forcing.sh's own variable turns on chunked teacher forcing.
+export HOOD_MESH_TEACHER_FORCING_CHUNKS="${HOOD_MESH_DESIGN_CHANGE_TEACHER_FORCING_CHUNKS:-0}"
 export HOOD_MESH_HIC_RANGE_THRESHOLD_PERCENT="0"
 export HOOD_MESH_MAX_TRAIN_TIME=""
 export HOOD_MESH_LOCATION_HOLDOUT=""
@@ -70,6 +72,7 @@ printf 'Training: %s epochs | batch %s | lr %s | weight decay %s | seed %s | pla
     "${HOOD_MESH_EPOCHS}" "${HOOD_MESH_BATCH_SIZE}" "${HOOD_MESH_LR}" \
     "${HOOD_MESH_WEIGHT_DECAY}" "${HOOD_MESH_SEED}"
 printf 'Time grid: stride %s of the 1000 source samples\n' "${HOOD_MESH_TIME_SUBSAMPLE_STRIDE}"
+printf 'Teacher forcing chunks: %s (0 = off)\n' "${HOOD_MESH_TEACHER_FORCING_CHUNKS}"
 printf 'W&B tracking: %s (startup retries online; WANDB_MODE=offline records to disk only)\n' "${WANDB_MODE}"
 mkdir -p "${PROJECT_DIR}/runs/slurm"
 # The baseline needed 11.5 h on one GH200; the change path adds a few percent.

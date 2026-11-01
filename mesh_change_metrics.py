@@ -259,3 +259,58 @@ def held_out_versus_siblings(train, test, samples_per_design, clusters):
                   model_rmse_g=float(np.sqrt(model_error / points)) if points else None,
                   sibling_mean_rmse_g=float(np.sqrt(sibling_error / points)) if points else None)
     return result
+
+
+def time_window_metrics(train, test, samples_per_design, num_windows, teacher_forced=None):
+    """Test RMSE in each of ``num_windows`` contiguous windows of the time grid.
+
+    ``train`` and ``test`` are (dataset, predictions, targets) as in
+    ``near_clone_difference_r2``. The windows are the chunks a teacher-forcing
+    model predicts in turn: ceil(T / num_windows) times each. Besides the
+    model, each window scores ``teacher_forced`` (the same model fed the true
+    earlier chunks, predictions in test order) when given, and the location
+    mean: the mean true training curve at the test curve's impact location,
+    which ignores the geometry. Location-mean RMSE uses only test curves whose
+    location is in training.
+    """
+    (train_set, _, train_targets), (test_set, predictions, targets) = train, test
+    grids = [*train_set.time_arrays, *test_set.time_arrays]
+    if any(not np.array_equal(grids[0], grid) for grid in grids):
+        raise ValueError("Time windows need one time grid shared by all training and test runs")
+    steps = len(grids[0])
+    size = -(-steps // num_windows)
+    edges = list(range(0, steps, size)) + [steps]
+
+    def curves(values, dataset):
+        return np.asarray(values, dtype=np.float64).reshape(len(dataset.run_numbers), steps)
+
+    def location(run):
+        return (int(run) - 1) % samples_per_design
+
+    truth = curves(targets, test_set)
+    training = curves(train_targets, train_set)
+    train_locations = np.array([location(run) for run in train_set.run_numbers])
+    test_locations = np.array([location(run) for run in test_set.run_numbers])
+    means = {place: training[train_locations == place].mean(axis=0) for place in set(train_locations.tolist())}
+    covered = np.array([place in means for place in test_locations.tolist()])
+    location_mean = np.array([means.get(place, np.zeros(steps)) for place in test_locations.tolist()])
+
+    def rmse(prediction, rows=None):
+        if prediction is None or (rows is not None and not rows.any()):
+            return None
+        error = curves(prediction, test_set) - truth
+        error = error if rows is None else error[rows]
+        return [float(np.sqrt(np.square(error[:, a:b]).mean())) for a, b in zip(edges[:-1], edges[1:])]
+
+    times_ms = 1e3 * np.asarray(grids[0], dtype=np.float64)
+    return {
+        "num_windows": len(edges) - 1,
+        "window_ms": [[float(times_ms[a]), float(times_ms[b - 1])] for a, b in zip(edges[:-1], edges[1:])],
+        "window_points": [b - a for a, b in zip(edges[:-1], edges[1:])],
+        "model_rmse_g": rmse(predictions),
+        "teacher_forced_rmse_g": rmse(teacher_forced),
+        "location_mean_rmse_g": rmse(location_mean, covered),
+        "test_signal_std_g": [float(truth[:, a:b].std()) for a, b in zip(edges[:-1], edges[1:])],
+        "num_test_curves": len(truth),
+        "num_test_curves_with_location_mean": int(covered.sum()),
+    }

@@ -348,6 +348,11 @@ class TrainingRoundTripTests(unittest.TestCase):
     def test_neighborhood_train_reload_and_predict(self):
         self._train_reload_and_predict("temporal", ["--neighborhood-layers", "2", "--neighborhood-k", "4"])
 
+    def test_teacher_forcing_train_reload_and_predict(self):
+        # Exported and reloaded predictions are rollouts; teacher_forced/ holds the
+        # same test set fed the true earlier chunks.
+        self._train_reload_and_predict("temporal", ["--teacher-forcing-chunks", "3"])
+
     def _train_reload_and_predict(self, decoder, extra_args=()):
         from train_mesh_impact_history import CHECKPOINT_NAME, HistoryPredictor, main
         from utils.utils import Config
@@ -407,9 +412,20 @@ class TrainingRoundTripTests(unittest.TestCase):
                 "prediction_times.npy", "training_history.json", "training_history.csv",
                 "training_history.png", "wandb_run.json",
                 "metrics.json", "test_acceleration_histories.csv",
-                "train_acceleration_histories.csv", "design_difference_r2.json",
+                "train_acceleration_histories.csv", "design_difference_r2.json", "time_windows.json",
             ):
                 self.assertTrue((run_dir / artifact).is_file(), artifact)
+            windows = json.loads((run_dir / "time_windows.json").read_text(encoding="utf-8"))
+            chunks = int(extra_args[list(extra_args).index("--teacher-forcing-chunks") + 1]) \
+                if "--teacher-forcing-chunks" in extra_args else 0
+            steps = len(raw_times[::Config.time_subsample_stride])
+            size = -(-steps // (chunks or 5))
+            self.assertEqual(windows["window_points"], [min(size, steps - start) for start in range(0, steps, size)])
+            self.assertEqual(windows["teacher_forced_rmse_g"] is None, not chunks)
+            for directory in (run_dir, run_dir / "last_checkpoint"):
+                self.assertEqual((directory / "teacher_forced" / "metrics.json").is_file(), bool(chunks))
+                self.assertEqual((directory / "teacher_forced" / "test_acceleration_histories.csv").is_file(),
+                                 bool(chunks))
             # The legacy format has no near-clone cluster map, so nothing is scored.
             difference = json.loads((run_dir / "design_difference_r2.json").read_text(encoding="utf-8"))
             self.assertIsNone(difference["train"]["r2"])
@@ -437,6 +453,9 @@ class TrainingRoundTripTests(unittest.TestCase):
 
             predictor = HistoryPredictor.from_run(run_dir)
             self.assertEqual(predictor.model.decoder, decoder)
+            self.assertEqual(predictor.model.teacher_forcing_chunks, chunks)
+            self.assertEqual(saved["architecture"]["kwargs"]["teacher_forcing_chunks"], chunks)
+            self.assertEqual(saved["training"]["teacher_forcing"] is None, not chunks)
             if decoder == "temporal":
                 # Old run configs omitted the decoder. Strict checkpoint reload
                 # must still reconstruct the original temporal architecture.

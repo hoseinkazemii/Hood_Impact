@@ -66,6 +66,10 @@ MODEL_DEFAULTS = {
     # Geometry memory injection (FiLM); "none" adds no parameters.
     "geometry_film": "none",
     "geometry_fourier_octaves": 5,
+    # Predict the history in this many time chunks, each reading the earlier
+    # ones: true accelerations in training, its own predictions in validation
+    # and test. 0 is the plain network.
+    "teacher_forcing_chunks": 0,
 }
 BOOLEAN_MODEL_KEYS = tuple(key for key, value in MODEL_DEFAULTS.items() if isinstance(value, bool))
 # Decoder path over the near-clone change nodes (mesh_design_change.py), used
@@ -78,6 +82,9 @@ DESIGN_CHANGE_DEFAULTS = {"design_change_layers": 0, "design_change_fourier_octa
 # Fresh runs see only the hood inner panel; runs saved without the key used "all".
 DEFAULT_MESH_NODES = "inner_panel"
 ARCHITECTURES = ("MeshImpactHistoryNet", "DesignChangeHistoryNet")
+# time_windows.json splits test errors into the teacher-forcing chunks, or this
+# many windows for other models.
+TIME_WINDOWS = 5
 # Fresh experiments hold out the whole B cluster. Resumes restore saved splits.
 DEFAULT_TEST_DESIGNS = (4, 5)
 DEFAULT_VAL_DESIGNS = (11,)
@@ -382,6 +389,14 @@ def resolved_config(config, args, model_kwargs, prediction_grid):
     data_config.update({key: str(Path(getattr(config, key)).resolve()) for key in path_keys})
     data_config["mesh_nodes"] = config.mesh_nodes
     architecture = "DesignChangeHistoryNet" if getattr(args, "design_change_nodes", False) else "MeshImpactHistoryNet"
+    teacher_forcing = None
+    if model_kwargs.get("teacher_forcing_chunks"):
+        teacher_forcing = {
+            "chunks": model_kwargs["teacher_forcing_chunks"],
+            "training_input": "true accelerations of the earlier chunks",
+            "validation_and_test_input": "the model's own predictions of the earlier chunks (rollout)",
+            "checkpoint_selection": "rollout validation loss",
+        }
     return {
         "format_version": 1,
         "architecture": {"name": architecture, "kwargs": model_kwargs},
@@ -407,6 +422,7 @@ def resolved_config(config, args, model_kwargs, prediction_grid):
             "batch_sampling": "shuffle",
             "scheduler": "CosineAnnealingLR",
             "gradient_clip_norm": 1.0,
+            "teacher_forcing": teacher_forcing,
         },
         "prediction_grid": prediction_grid,
         "wandb": {
@@ -455,7 +471,8 @@ def initialize_wandb(args, initial_config, output_dir, logger):
                                attempt, attempts, exc, WANDB_RETRY_DELAY_SECONDS)
                 time.sleep(WANDB_RETRY_DELAY_SECONDS)
         run.define_metric("epoch")
-        for metric in ("train/loss", "val/loss", "val/mae_g", "lr"):
+        for metric in ("train/loss", "val/loss", "val/mae_g", "lr",
+                       "val/teacher_forced_loss", "val/teacher_forced_mae_g"):
             run.define_metric(metric, step_metric="epoch")
         actual_mode = run.settings.mode
         metadata = {
@@ -808,13 +825,19 @@ def main(argv=None):
         from evaluate_design_difference_r2 import (
             design_difference_report, difference_log_values, write_design_difference_report,
         )
+        from mesh_change_metrics import time_window_metrics
         evaluator = Evaluator(model, config, preprocessor)
         # The training loader shuffles; export train histories in dataset order.
         train_eval_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=False,
                                        collate_fn=train_loader.collate_fn)
 
-        def evaluate_checkpoint(path, directory):
-            """Test metrics, train/test histories and near-clone difference R2 of one checkpoint."""
+        def evaluate_checkpoint(path, directory, prefix=""):
+            """Test metrics, train/test histories, near-clone difference R2 and time windows of one checkpoint.
+
+            A teacher-forcing model is scored as it is used, rolling out from its
+            own predictions. Its test set is scored again fed the true earlier
+            chunks, into ``directory/teacher_forced``: the best case for rollout.
+            """
             checkpoint = torch.load(path, map_location=config.device, weights_only=True)
             model.load_state_dict(checkpoint["model_state_dict"], strict=True)
             metrics, predictions, targets = evaluator.evaluate(test_loader)
@@ -828,6 +851,31 @@ def main(argv=None):
                 "test": (test_dataset, predictions, targets),
             })
             write_design_difference_report(directory, difference)
+            values, forced = {}, None
+            if model.teacher_forcing_chunks:
+                forced_dir = directory / "teacher_forced"
+                forced_dir.mkdir(exist_ok=True)
+                forced_metrics, forced, _ = evaluator.evaluate(test_loader, teacher_forced=True)
+                write_json(forced_dir / "metrics.json", forced_metrics)
+                export_predictions(forced_dir / "test_acceleration_histories.csv", test_dataset, forced, targets)
+                values.update({f"teacher_forced/test/{key}": value for key, value in forced_metrics.items()
+                               if np.isfinite(value)})
+                logger.info("%sTest metrics fed the true earlier chunks (acceleration in g): %s", prefix, forced_metrics)
+            if matching_grid:
+                windows = time_window_metrics((train_dataset, train_predictions, train_targets),
+                                              (test_dataset, predictions, targets), config.samples_per_design,
+                                              model.teacher_forcing_chunks or TIME_WINDOWS, teacher_forced=forced)
+                write_json(directory / "time_windows.json", windows)
+                names = ("model_rmse_g", "teacher_forced_rmse_g", "location_mean_rmse_g")
+                for name in names:
+                    for index, value in enumerate(windows[name] or ()):
+                        values[f"time_windows/{name}/window_{index + 1}"] = value
+                logger.info("%sTest RMSE (g) per time window %s ms: model %s | fed the true earlier chunks %s | "
+                            "location mean of the training designs %s", prefix, windows["window_ms"],
+                            *(np.round(windows[name], 2).tolist() if windows[name] else None for name in names))
+            values = {prefix + key: value for key, value in values.items()}
+            run.summary.update(values)
+            run.log(values)
             return metrics, predictions, targets, difference
 
         metrics, predictions, targets, difference = evaluate_checkpoint(checkpoint_path, output_dir)
@@ -855,7 +903,8 @@ def main(argv=None):
         # network is scored too, in its own folder (same file names).
         last_dir = output_dir / "last_checkpoint"
         last_dir.mkdir(exist_ok=True)
-        last_metrics, _, _, last_difference = evaluate_checkpoint(output_dir / LAST_CHECKPOINT_NAME, last_dir)
+        last_metrics, _, _, last_difference = evaluate_checkpoint(output_dir / LAST_CHECKPOINT_NAME, last_dir,
+                                                                  prefix="last_checkpoint/")
         last_values = {f"last_checkpoint/{key}": value for key, value in difference_log_values(last_difference).items()}
         last_values.update({f"last_checkpoint/test/{key}": value for key, value in last_metrics.items()
                             if np.isfinite(value)})

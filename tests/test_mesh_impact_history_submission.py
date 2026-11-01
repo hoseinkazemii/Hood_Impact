@@ -639,6 +639,55 @@ printf 'ARG=%s\\n' "$@"
         self.assertTrue(any(a.startswith("--output=") and a.endswith("/runs/slurm/mesh_history_1704_design_change_test7_%j.out")
                             for a in arguments), arguments)
 
+    def test_teacher_forcing_launcher_changes_only_chunks_epochs_and_name_of_the_long_run(self):
+        self.stub("sbatch", """env | grep -E '^(HOOD_MESH_|WANDB_MODE=)' | sort
+printf 'ARG=%s\\n' "$@"
+""")
+        # Stale exports from other experiments must not reach either run.
+        self.env.update(HOOD_MESH_TEST_DESIGNS="10 11", HOOD_MESH_VAL_DESIGNS="2", HOOD_MESH_ALLOW_CLONE_LEAK="1",
+                        HOOD_MESH_TEACHER_FORCING_CHUNKS="7")
+
+        def submitted(script):
+            output = self.launch(script)
+            settings = dict(line.split("=", 1) for line in output.splitlines()
+                            if line.startswith(("HOOD_MESH_", "WANDB_MODE=")))
+            arguments = [line[4:] for line in output.splitlines() if line.startswith("ARG=")]
+            return settings, arguments
+
+        long, _ = submitted("submit_mesh_impact_history_1704_design_change_long.sh")
+        forced, arguments = submitted("submit_mesh_impact_history_1704_design_change_teacher_forcing.sh")
+        own = {key for key in forced if key.startswith(("HOOD_MESH_HOLDOUT_", "HOOD_MESH_DESIGN_CHANGE_TEACHER"))}
+        self.assertEqual(own, {"HOOD_MESH_HOLDOUT_TEST_DESIGNS", "HOOD_MESH_HOLDOUT_VAL_DESIGNS",
+                               "HOOD_MESH_HOLDOUT_ALLOW_CLONE_LEAK", "HOOD_MESH_DESIGN_CHANGE_TEACHER_FORCING_CHUNKS"})
+        changed = {key: (long.get(key), forced.get(key)) for key in (set(long) | set(forced)) - own
+                   if long.get(key) != forced.get(key)}
+        self.assertEqual(changed, {
+            "HOOD_MESH_TEACHER_FORCING_CHUNKS": ("0", "5"), "HOOD_MESH_EPOCHS": ("800", "100"),
+            "HOOD_MESH_RUN_NAME": ("mesh_history_clusterB_k256_fourier_no_shortcuts_design_change_no_gate_800ep",
+                                   "mesh_history_clusterB_k256_fourier_no_shortcuts_design_change_no_gate_"
+                                   "teacher_forced_5chunks"),
+        })
+        for key, value in (("HOOD_MESH_TEST_DESIGNS", "4 5"), ("HOOD_MESH_VAL_DESIGNS", "11"),
+                           ("HOOD_MESH_ALLOW_CLONE_LEAK", "0"), ("HOOD_MESH_TIME_SUBSAMPLE_STRIDE", "16"),
+                           ("HOOD_MESH_DESIGN_CHANGE_DISPLACEMENT_GATE", "false"), ("WANDB_MODE", "online")):
+            self.assertEqual(forced[key], value, key)
+        self.assertEqual([a for a in arguments if a.startswith("--time=")][-1], "--time=10:00:00")
+        self.assertEqual([a for a in arguments if a.startswith("--job-name=")][-1], "--job-name=mesh_hist_dc_teacher")
+        self.assertTrue(any(a.startswith("--output=") and
+                            a.endswith("/runs/slurm/mesh_history_1704_design_change_teacher_forcing_%j.out")
+                            for a in arguments), arguments)
+        # The batch job hands the chunk count to both preflight and training.
+        self.env.update(HOOD_MESH_TEACHER_FORCING_CHUNKS="5")
+        output = self.launch("run_mesh_impact_history_1704.sbatch")
+        commands = [line for line in output.splitlines() if line.startswith("PYTHON")]
+        self.assertEqual(len(commands), 2)
+        for command in commands:
+            self.assertIn("<--teacher-forcing-chunks> <5>", command)
+        self.assertIn("Teacher forcing chunks: 5", output)
+        for parse in (preflight.parse_args, training.parse_args):
+            self.assertEqual(parse([]).teacher_forcing_chunks, 0)
+            self.assertEqual(parse(["--teacher-forcing-chunks", "5"]).teacher_forcing_chunks, 5)
+
     def test_batch_runs_directly_with_broken_srun_and_preserves_gpu_decoder_and_split(self):
         self.env["CUDA_VISIBLE_DEVICES"] = "GPU-allocated-by-slurm"
         for decoder in ("", "temporal", "mesh_only"):
