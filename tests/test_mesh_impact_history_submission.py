@@ -559,7 +559,7 @@ printf 'ARG=%s\\n' "$@"
         for variant in variants:
             self.assertIn(f"NAME=mesh_history_clusterB_k256_fourier_no_shortcuts_design_change_{variant}", output)
 
-    def test_long_design_change_launchers_pin_the_ungated_800_epoch_runs(self):
+    def test_ungated_design_change_launchers_pin_the_long_and_t250_runs(self):
         self.env.pop("WANDB_MODE", None)
         self.stub("sbatch", """printf 'CHANGE=%s\\nLAYERS=%s\\nOCTAVES=%s\\nFEATURES=%s\\nGATE=%s\\nMESH=%s\\n' \\
     "$HOOD_MESH_DESIGN_CHANGE_NODES" "$HOOD_MESH_DESIGN_CHANGE_LAYERS" "$HOOD_MESH_DESIGN_CHANGE_FOURIER_OCTAVES" \\
@@ -582,21 +582,21 @@ printf 'ARG=%s\\n' "$@"
                         HOOD_MESH_GEOMETRY_FILM="all", HOOD_MESH_TIME_SUBSAMPLE_STRIDE="8",
                         HOOD_MESH_DESIGN_CHANGE_TIME_STRIDE="2", HOOD_MESH_FOURIER_NUM_FREQUENCIES="3",
                         HOOD_MESH_FOURIER_MIN_FREQUENCY_HZ="1", HOOD_MESH_FOURIER_MAX_FREQUENCY_HZ="9")
-        variants = {"long": ("16", "6/20-640", "", "mesh_hist_dc_long"),
-                    "long_t250": ("4", "8/20-2560", "_t250", "mesh_hist_dc_long_t250")}
-        for variant, (stride, fourier, suffix, job) in variants.items():
+        variants = {"long": ("16", "6/20-640", "800", "_800ep", "48:00:00", "mesh_hist_dc_long"),
+                    "t250": ("4", "8/20-2560", "100", "_t250", "07:00:00", "mesh_hist_dc_t250")}
+        for variant, (stride, fourier, epochs, suffix, limit, job) in variants.items():
             with self.subTest(variant=variant):
                 output = self.launch(f"submit_mesh_impact_history_1704_design_change_{variant}.sh")
                 for expected in ("CHANGE=true", "LAYERS=0", "OCTAVES=2", "FEATURES=xyz", "GATE=false",
-                                 "MESH=inner_panel", "EPOCHS=800", "BATCH=8", "LR=0.0003", "SEED=42", "DROPOUT=0.1",
+                                 "MESH=inner_panel", f"EPOCHS={epochs}", "BATCH=8", "LR=0.0003", "SEED=42", "DROPOUT=0.1",
                                  "WD=0.00001", "K=256", "TEST=4 5", "VAL=11", "FILM=none", "RESIDUAL=false",
                                  f"STRIDE={stride}", f"FOURIER={fourier}", "HIC=0",
-                                 f"NAME=mesh_history_clusterB_k256_fourier_no_shortcuts_design_change_no_gate_800ep{suffix}",
+                                 f"NAME=mesh_history_clusterB_k256_fourier_no_shortcuts_design_change_no_gate{suffix}",
                                  "TRACKING=online", f"mesh_history_1704_design_change_{variant}_%j.out"):
                     self.assertIn(expected, output)
                 arguments = [line[4:] for line in output.splitlines() if line.startswith("ARG=")]
                 times = [argument for argument in arguments if argument.startswith("--time=")]
-                self.assertEqual(times[-1], "--time=48:00:00")
+                self.assertEqual(times[-1], f"--time={limit}")
                 job_names = [argument for argument in arguments if argument.startswith("--job-name=")]
                 self.assertEqual(job_names[-1], f"--job-name={job}")
         # Only the dedicated variable moves the plain launcher's grid; the stale
@@ -624,9 +624,9 @@ printf 'ARG=%s\\n' "$@"
         long, _ = submitted("submit_mesh_impact_history_1704_design_change_long.sh")
         test7, arguments = submitted("submit_mesh_impact_history_1704_design_change_test7.sh")
         expected = {"HOOD_MESH_TEST_DESIGNS": ("4 5", "7"), "HOOD_MESH_VAL_DESIGNS": ("11", "5"),
-                    "HOOD_MESH_ALLOW_CLONE_LEAK": ("0", "1"), "HOOD_MESH_EPOCHS": ("800", "700"),
+                    "HOOD_MESH_ALLOW_CLONE_LEAK": ("0", "1"), "HOOD_MESH_EPOCHS": ("800", "100"),
                     "HOOD_MESH_RUN_NAME": ("mesh_history_clusterB_k256_fourier_no_shortcuts_design_change_no_gate_800ep",
-                                           "mesh_history_test7_val5_k256_fourier_no_shortcuts_design_change_no_gate_700ep")}
+                                           "mesh_history_test7_val5_k256_fourier_no_shortcuts_design_change_no_gate")}
         holdout = {key for key in test7 if key.startswith("HOOD_MESH_HOLDOUT_")}
         self.assertEqual(holdout, {"HOOD_MESH_HOLDOUT_TEST_DESIGNS", "HOOD_MESH_HOLDOUT_VAL_DESIGNS",
                                    "HOOD_MESH_HOLDOUT_ALLOW_CLONE_LEAK"})
@@ -634,7 +634,7 @@ printf 'ARG=%s\\n' "$@"
                    if long.get(key) != test7.get(key)}
         self.assertEqual(changed, expected)
         self.assertEqual(test7["WANDB_MODE"], "online")
-        self.assertEqual([a for a in arguments if a.startswith("--time=")][-1], "--time=48:00:00")
+        self.assertEqual([a for a in arguments if a.startswith("--time=")][-1], "--time=07:30:00")
         self.assertEqual([a for a in arguments if a.startswith("--job-name=")][-1], "--job-name=mesh_hist_dc_test7")
         self.assertTrue(any(a.startswith("--output=") and a.endswith("/runs/slurm/mesh_history_1704_design_change_test7_%j.out")
                             for a in arguments), arguments)
@@ -671,7 +671,7 @@ printf 'ARG=%s\\n' "$@"
                            ("HOOD_MESH_ALLOW_CLONE_LEAK", "0"), ("HOOD_MESH_TIME_SUBSAMPLE_STRIDE", "16"),
                            ("HOOD_MESH_DESIGN_CHANGE_DISPLACEMENT_GATE", "false"), ("WANDB_MODE", "online")):
             self.assertEqual(forced[key], value, key)
-        self.assertEqual([a for a in arguments if a.startswith("--time=")][-1], "--time=10:00:00")
+        self.assertEqual([a for a in arguments if a.startswith("--time=")][-1], "--time=07:00:00")
         self.assertEqual([a for a in arguments if a.startswith("--job-name=")][-1], "--job-name=mesh_hist_dc_teacher")
         self.assertTrue(any(a.startswith("--output=") and
                             a.endswith("/runs/slurm/mesh_history_1704_design_change_teacher_forcing_%j.out")

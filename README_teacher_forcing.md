@@ -60,7 +60,7 @@ bash submit_mesh_impact_history_1704_design_change_teacher_forcing.sh
 5 chunks, 100 epochs, and otherwise the no-gate design-change model of the long runs: inner panel, XYZ change
 tokens, no change self-attention layers, k256 FiLM neighborhoods, Fourier time 20-640 Hz, stride 16 (63
 points), test 4,5 | validation 11, batch 8, lr 3e-4, dropout 0.1, weight decay 1e-5, seed 42. Time limit
-10 h. On a laptop RTX 5050, a full-size teacher-forced training step took the same time as a plain one (5.56
+7 h. On a laptop RTX 5050, a full-size teacher-forced training step took the same time as a plain one (5.56
 vs 5.54 s) and a rollout evaluation step 0.8% longer; the extra validation pass adds about 4% per epoch, so
 about 5.5 h on one GH200.
 

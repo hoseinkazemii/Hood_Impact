@@ -45,7 +45,7 @@ export HOOD_MESH_POOLING_QUERY_RESIDUAL="false"
 export HOOD_MESH_POOL_IMPACTOR_NODES="false"
 # Pin the comparison settings even if another experiment's values are exported.
 # Only a wrapper's own HOOD_MESH_DESIGN_CHANGE_TIME_STRIDE changes the time grid
-# (..._long_t250.sh: 4, i.e. 250 of the 1000 samples instead of 63).
+# (..._t250.sh: 4, i.e. 250 of the 1000 samples instead of 63).
 export HOOD_MESH_TIME_SUBSAMPLE_STRIDE="${HOOD_MESH_DESIGN_CHANGE_TIME_STRIDE:-16}"
 # Likewise only ..._teacher_forcing.sh's own variable turns on chunked teacher forcing.
 export HOOD_MESH_TEACHER_FORCING_CHUNKS="${HOOD_MESH_DESIGN_CHANGE_TEACHER_FORCING_CHUNKS:-0}"

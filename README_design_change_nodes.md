@@ -128,15 +128,22 @@ For HIC on either one, run `python evaluate_mesh_impact_hic.py <dir> --data-dir 
 To beat, on test 4-5: the baseline's accel RMSE 15.54 g and HIC R2 0.898, and difference R2 > 0
 (better than predicting the same history for both designs).
 
-`submit_mesh_impact_history_1704_design_change_long_t250.sh` is the same run on a 4x finer time grid:
-250 points (stride 4) instead of 63, with Fourier time features at 20-2560 Hz (8 doublings) instead of
-20-640 Hz. A full-size training step measured 1.00-1.02x the 63-point one, so it also fits in 48 h.
-Every 4th point of its histories is exactly the 63-point grid, so compare the two runs there as well as
-on all 250 points.
+### 100-epoch runs: fine time grid and test design 7 (2026-11-01)
 
-`submit_mesh_impact_history_1704_design_change_test7.sh` is the same run with test design 7 and
-validation design 5; training is 0, 1, 2, 3, 4, 6, 8, 9, 10, 11 (700 epochs, since the training set is 11%
-larger). Design 7's edit changes the response more than any other design's:
+These two use the no-gate settings of the long run but keep 3458374's 100 epochs. 3458374 took 5.2 h
+end to end, so they request 7-7.5 h instead of 48 h, which DeltaAI can backfill.
+
+`submit_mesh_impact_history_1704_design_change_t250.sh` runs on a 4x finer time grid: 250 points
+(stride 4) instead of 63, with Fourier time features at 20-2560 Hz (8 doublings) instead of 20-640 Hz.
+Its 63-point partner is the plain `submit_mesh_impact_history_1704_design_change_nodes.sh`. A full-size
+training step measured 1.00-1.02x the 63-point one, so it needs about 5.4 h (7 h requested). Every 4th
+point of its histories is exactly the 63-point grid, so compare the two runs there as well as on all
+250 points.
+
+`submit_mesh_impact_history_1704_design_change_test7.sh` uses test design 7 and validation design 5;
+training is 0, 1, 2, 3, 4, 6, 8, 9, 10, 11. The training set is 11% larger, so an epoch takes about 205 s
+instead of 185 s and the run needs about 5.8 h (7.5 h requested). Design 7's edit changes the response
+more than any other design's:
 
 | near-clone pair | mean \|dHIC15\|, 142 locations | top-10 locations | locations > 10% |
 |---|---|---|---|
@@ -152,9 +159,10 @@ this: the difference R2 of 7 against 6, 8 and 9, and design 7's RMSE for the mod
 curve of 6, 8 and 9 at the same location (12.7 g over all 142 locations). It is empty for the 4, 5 split,
 where the whole cluster is held out.
 
-If the job times out, `hood_impact_last_model.pt` holds the last completed epoch. Continue it on the same
+If a job times out, `hood_impact_last_model.pt` holds the last completed epoch. Continue it on the same
 schedule with
-`bash submit_mesh_impact_history_1704_local_sensitivity_resume.sh <run dir> --time=24:00:00`.
+`bash submit_mesh_impact_history_1704_local_sensitivity_resume.sh <run dir> --time=<remaining time>`
+(24 h for the long run, 3 h for the 100-epoch runs).
 
 Before the dataset loads, the preflight finds the change nodes from the decks and runs a CUDA
 forward/backward pass through the change path. The first run builds

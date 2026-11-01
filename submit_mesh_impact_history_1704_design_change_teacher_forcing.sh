@@ -27,11 +27,12 @@
 # stride 16, test 4,5 | validation 11, batch 8, lr 3e-4, dropout 0.1, weight
 # decay 1e-5, seed 42, plain acceleration MSE. 100 epochs, as a first test;
 # 3458374 took 5.2 h per 100 epochs, and the extra validation pass and decoder
-# rollouts add a few percent.
+# rollouts add a few percent, so ~5.5 h; 7 h leaves margin and is short enough
+# to backfill on DeltaAI.
 #
 # A timeout keeps hood_impact_last_model.pt from the last completed epoch;
 # continue it (same schedule and split) with
-#   bash submit_mesh_impact_history_1704_local_sensitivity_resume.sh <run dir> --time=08:00:00
+#   bash submit_mesh_impact_history_1704_local_sensitivity_resume.sh <run dir> --time=03:00:00
 #
 # Submit from any directory; extra arguments are forwarded to sbatch.
 #   bash submit_mesh_impact_history_1704_design_change_teacher_forcing.sh
@@ -57,7 +58,7 @@ export HOOD_MESH_RUN_NAME="mesh_history_clusterB_k256_fourier_no_shortcuts_desig
 
 printf 'Teacher forcing: 5 time chunks | true earlier chunks in training, rollout in validation and test | 100 epochs\n'
 exec bash "${PROJECT_DIR}/submit_mesh_impact_history_1704_design_change_nodes.sh" \
-    --job-name=mesh_hist_dc_teacher --time=10:00:00 \
+    --job-name=mesh_hist_dc_teacher --time=07:00:00 \
     --output="${PROJECT_DIR}/runs/slurm/mesh_history_1704_design_change_teacher_forcing_%j.out" \
     --error="${PROJECT_DIR}/runs/slurm/mesh_history_1704_design_change_teacher_forcing_%j.err" \
     "$@"
