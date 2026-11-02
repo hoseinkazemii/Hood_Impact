@@ -290,7 +290,7 @@ class MeshImpactHistoryNet(nn.Module):
     Teacher forcing. ``teacher_forcing_chunks`` > 0 splits each history into
     that many contiguous chunks of ceil(T / chunks) times and predicts them in
     order. Every time query also embeds the acceleration one chunk earlier
-    (none in the first chunk), and the temporal attention is block-causal: a
+    (0 in the first chunk), and the temporal attention is block-causal: a
     time reads only the times of its own and earlier chunks. A chunk's output
     therefore depends on the accelerations of earlier chunks only. ``forward``
     with ``history`` (training) feeds the true accelerations, all chunks in
@@ -484,10 +484,10 @@ class MeshImpactHistoryNet(nn.Module):
         if geometry_film == "all":
             self.node_geometry_film = nn.ModuleList([FiLM(width) for _ in range(neighborhood_layers)])
         if teacher_forcing_chunks:
-            # Input: the normalized acceleration one chunk earlier and 1 where
-            # that exists (0 in the first chunk). Added to the time queries.
+            # Input: the normalized acceleration one chunk earlier (0 in the
+            # first chunk). Added to the time queries.
             self.history_embedding = nn.Sequential(
-                nn.Linear(2, width), nn.GELU(), nn.Linear(width, width),
+                nn.Linear(1, width), nn.GELU(), nn.Linear(width, width),
             )
 
     @torch.no_grad()
@@ -816,12 +816,11 @@ class MeshImpactHistoryNet(nn.Module):
         chunk = position // size
         # Block-causal: True where a time may not read another, i.e. a later chunk.
         time_mask = chunk[None, :] > chunk[:, None]
-        known = (position >= size).expand(len(queries), -1)
 
         def decode(accelerations):
             # Time i reads the acceleration at i - size: the same place one chunk earlier.
             previous = F.pad(accelerations[:, :steps - size], (size, 0))
-            history_queries = self.history_embedding(torch.stack((previous, known.to(previous.dtype)), dim=-1))
+            history_queries = self.history_embedding(previous.unsqueeze(-1))
             return self._decode(queries + history_queries, memory, padding_mask, decoder_context, time_mask)
 
         if history is not None:

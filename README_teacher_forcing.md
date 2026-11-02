@@ -23,8 +23,8 @@ With `teacher_forcing_chunks = C`, a history of T times is split into C contiguo
 ceil(T / C) times (the last can be shorter). For the 63-point grid and C = 5: 13, 13, 13, 13 and 11
 points, 0-4.8, 5.2-10.0, 10.4-15.2, 15.6-20.4 and 20.8-24.8 ms.
 
-- Every time query adds an embedding of the acceleration one chunk earlier, at the same place in that chunk,
-  plus a flag that is 0 in the first chunk (which reads no acceleration).
+- Every time query adds an embedding of the acceleration one chunk earlier, at the same place in that chunk
+  (0 in the first chunk, which has no earlier chunk).
 - The temporal self-attention is block-causal: a time reads only the times of its own chunk and earlier
   chunks. The mesh and change-node cross-attentions are per time, as before.
 
