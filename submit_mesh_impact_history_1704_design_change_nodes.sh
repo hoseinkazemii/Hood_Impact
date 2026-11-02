@@ -78,8 +78,11 @@ mkdir -p "${PROJECT_DIR}/runs/slurm"
 # The baseline needed 11.5 h on one GH200; the change path adds a few percent.
 # 14 h leaves margin while still backfilling (job 3440305 queued ~1.5 days at 24 h);
 # a timeout resumes from the latest checkpoint via the *_resume.sh wrapper.
+# Host memory: the 800-epoch inner-panel run 3491260 peaked at 7.2 GiB RSS
+# (sacct samples, so short spikes can be missed); 24 GB instead of the batch
+# script's 96 GB leaves margin and fits more partly used nodes.
 exec bash "${PROJECT_DIR}/submit_mesh_impact_history_1704_fourier_k256.sh" \
-    --job-name=mesh_hist_design_change --time=14:00:00 \
+    --job-name=mesh_hist_design_change --time=14:00:00 --mem=24g \
     --output="${PROJECT_DIR}/runs/slurm/mesh_history_1704_design_change_nodes_%j.out" \
     --error="${PROJECT_DIR}/runs/slurm/mesh_history_1704_design_change_nodes_%j.err" \
     "$@"

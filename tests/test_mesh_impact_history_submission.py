@@ -597,6 +597,8 @@ printf 'ARG=%s\\n' "$@"
                 arguments = [line[4:] for line in output.splitlines() if line.startswith("ARG=")]
                 times = [argument for argument in arguments if argument.startswith("--time=")]
                 self.assertEqual(times[-1], f"--time={limit}")
+                memory = [argument for argument in arguments if argument.startswith("--mem=")]
+                self.assertEqual(memory[-1], "--mem=24g")
                 job_names = [argument for argument in arguments if argument.startswith("--job-name=")]
                 self.assertEqual(job_names[-1], f"--job-name={job}")
         # Only the dedicated variable moves the plain launcher's grid; the stale
@@ -635,6 +637,7 @@ printf 'ARG=%s\\n' "$@"
         self.assertEqual(changed, expected)
         self.assertEqual(test7["WANDB_MODE"], "online")
         self.assertEqual([a for a in arguments if a.startswith("--time=")][-1], "--time=07:30:00")
+        self.assertEqual([a for a in arguments if a.startswith("--mem=")][-1], "--mem=24g")
         self.assertEqual([a for a in arguments if a.startswith("--job-name=")][-1], "--job-name=mesh_hist_dc_test7")
         self.assertTrue(any(a.startswith("--output=") and a.endswith("/runs/slurm/mesh_history_1704_design_change_test7_%j.out")
                             for a in arguments), arguments)
@@ -672,6 +675,7 @@ printf 'ARG=%s\\n' "$@"
                            ("HOOD_MESH_DESIGN_CHANGE_DISPLACEMENT_GATE", "false"), ("WANDB_MODE", "online")):
             self.assertEqual(forced[key], value, key)
         self.assertEqual([a for a in arguments if a.startswith("--time=")][-1], "--time=07:00:00")
+        self.assertEqual([a for a in arguments if a.startswith("--mem=")][-1], "--mem=24g")
         self.assertEqual([a for a in arguments if a.startswith("--job-name=")][-1], "--job-name=mesh_hist_dc_teacher")
         self.assertTrue(any(a.startswith("--output=") and
                             a.endswith("/runs/slurm/mesh_history_1704_design_change_teacher_forcing_%j.out")
