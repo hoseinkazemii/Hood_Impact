@@ -286,7 +286,7 @@ class MeshImpactHistoryNet(nn.Module):
         dropout: float = 0.1,
         decoder: str = "temporal",
         neighborhood_layers: int = 0,
-        neighborhood_k: int = 16,
+        neighborhood_k: int = 256,
         neighborhood_scale_mm: float = 20.0,
         neighborhood_chunk_size: int = 1024,
         impactor_nodes: int = 0,

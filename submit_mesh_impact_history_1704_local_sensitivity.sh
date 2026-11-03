@@ -17,7 +17,7 @@ fi
 # Pin the neighborhood architecture and holdout even if older experiments remain exported.
 export HOOD_MESH_DECODER="temporal"
 export HOOD_MESH_NEIGHBORHOOD_LAYERS="2"
-export HOOD_MESH_NEIGHBORHOOD_K="16"
+export HOOD_MESH_NEIGHBORHOOD_K="256"
 export HOOD_MESH_NEIGHBORHOOD_SCALE_MM="20"
 export HOOD_MESH_NEIGHBORHOOD_CHUNK_SIZE="1024"
 # The 1704 .inp *NODE blocks list the rigid headform first. Preflight
@@ -30,7 +30,7 @@ export HOOD_MESH_RUN_NAME="${HOOD_MESH_RUN_NAME:-mesh_history_1704_clusterB_loca
 export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_PROJECT="${WANDB_PROJECT:-hood-impact-mesh-attention}"
 
-printf 'Experiment: 2 neighborhood layers, k=16, headform (286 nodes) held out of the local graph\n'
+printf 'Experiment: 2 neighborhood layers, k=256, headform (286 nodes) held out of the local graph\n'
 printf 'Decoder: temporal | ordinary acceleration MSE\n'
 printf 'Holdout: train 0,1,2,3,6,7,8,9,10 | validation 11 | test 4,5 (whole cluster B)\n'
 mkdir -p "${PROJECT_DIR}/runs/slurm"
