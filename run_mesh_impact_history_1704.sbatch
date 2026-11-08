@@ -24,13 +24,14 @@ PROJECT_DIR=$PWD
 PYTORCH_MODULE=${HOOD_MESH_PYTORCH_MODULE:-python/miniforge3_pytorch/2.10.0}
 MESH_VENV=${HOOD_MESH_VENV:-${PROJECT_DIR}/.venv-mesh-history}
 if ! type module >/dev/null 2>&1; then
-    echo "ERROR: DeltaAI's module command is unavailable in the job environment." >&2
+    echo "ERROR: The cluster's module command is unavailable in the job environment." >&2
     exit 2
 fi
 module load "${PYTORCH_MODULE}"
 if [[ ! -r "${MESH_VENV}/bin/activate" ]]; then
     echo "ERROR: Environment not found: ${MESH_VENV}" >&2
-    echo "Run bash -l setup_mesh_impact_history_env.sh first, or set HOOD_MESH_VENV." >&2
+    echo "Run bash -l setup_mesh_impact_history_env.sh (DeltaAI) or setup_mesh_impact_history_env_delta.sh" >&2
+    echo "(Delta) first, or set HOOD_MESH_VENV." >&2
     exit 2
 fi
 # shellcheck disable=SC1090

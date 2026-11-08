@@ -10,7 +10,7 @@ if [[ -n "${HOOD_MESH_RESUME_FROM:-}" ]]; then
     exit 2
 fi
 if ! command -v sbatch >/dev/null 2>&1; then
-    echo "ERROR: sbatch is unavailable. Run this on the DeltaAI login node." >&2
+    echo "ERROR: sbatch is unavailable. Run this on a DeltaAI or Delta login node." >&2
     exit 127
 fi
 
