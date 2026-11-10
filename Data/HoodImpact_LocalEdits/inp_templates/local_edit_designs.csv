@@ -1,0 +1,15 @@
+design,description,site,x0,y0,axis_deg,dz_mm,half_length_mm,half_width_mm,g0_mm,g1_mm,n_nodes_site,n_nodes_moved
+N1,"both diagonals at x=30: 12.5 mm shallower",diag_x30,30.00,423.31,19.66,12.5,60.0,45.0,3.0,31.0,104,211
+N1,"both diagonals at x=30: 12.5 mm shallower",diag_x30_mirror,30.00,-112.62,-19.66,12.5,60.0,45.0,3.0,31.0,107,211
+N2,"both diagonals at x=30: 20 mm deeper",diag_x30,30.00,423.31,19.66,-20.0,60.0,45.0,3.0,31.0,104,212
+N2,"both diagonals at x=30: 20 mm deeper",diag_x30_mirror,30.00,-112.62,-19.66,-20.0,60.0,45.0,3.0,31.0,108,212
+N3,"horizontal beam at x=30: 12.5 mm shallower",horiz_x30,30.00,155.34,0.00,12.5,60.0,45.0,3.0,29.5,105,105
+N4,"both diagonals + horizontal beam at x=30: 12.5 mm shallower",diag_x30,30.00,423.31,19.66,12.5,60.0,45.0,3.0,31.0,104,316
+N4,"both diagonals + horizontal beam at x=30: 12.5 mm shallower",diag_x30_mirror,30.00,-112.62,-19.66,12.5,60.0,45.0,3.0,31.0,107,316
+N4,"both diagonals + horizontal beam at x=30: 12.5 mm shallower",horiz_x30,30.00,155.34,0.00,12.5,60.0,45.0,3.0,29.5,105,316
+N5,"both diagonals at x=-60 (front): 10 mm shallower",diag_xm60,-60.00,391.15,19.66,10.0,60.0,45.0,3.0,28.5,107,215
+N5,"both diagonals at x=-60 (front): 10 mm shallower",diag_xm60_mirror,-60.00,-80.46,-19.66,10.0,60.0,45.0,3.0,28.5,108,215
+N6,"vertical beam, both segments: 14 mm shallower",vert_y330,274.80,330.00,91.18,14.0,60.0,45.0,3.0,34.5,113,215
+N6,"vertical beam, both segments: 14 mm shallower",vert_y330_mirror,274.80,-19.31,-91.18,14.0,60.0,45.0,3.0,34.5,102,215
+N7,"both diagonals at x=470 (right span): 15 mm shallower",diag_x470,470.00,583.67,20.44,15.0,60.0,45.0,3.0,39.0,126,250
+N7,"both diagonals at x=470 (right span): 15 mm shallower",diag_x470_mirror,470.00,-272.98,-20.44,15.0,60.0,45.0,3.0,39.0,124,250
