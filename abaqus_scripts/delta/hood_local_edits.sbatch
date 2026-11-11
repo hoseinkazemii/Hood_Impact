@@ -21,15 +21,20 @@
 # results appear in Data/HoodImpact_LocalEdits/output_history_acc as they come.
 #
 # Walltime: ~2 h per run on one Delta core (55.6k increments), so the campaign
-# needs ~195 h of wall time on 12 lanes (~2,350 core-hours). The job queues
-# its own follow-up (afterany) at the start, so a walltime kill continues
-# automatically; runs marked ok are never redone. Chaining stops when all runs
-# are done, after LOCAL_EDITS_CHAIN_LEFT follow-ups (default 6), or when a
-# whole job made no progress.
+# needs ~195 h of wall time on 12 lanes (~2,350 core-hours), done as a chain
+# of 12-h jobs (~5 rounds of 12 runs each, so ~20 jobs). 12-h jobs start much
+# sooner than 2-day ones: the scheduler fits them into gaps (backfill).
+# A lane only starts a run that is expected to finish before the job's end
+# (batch_generate.py --deadline), so no solve is killed half-way; the job
+# queues its own follow-up (afterany) at the start, with the same time limit,
+# and the follow-up solves what is left; runs marked ok are never redone.
+# Chaining stops when all runs are done, after LOCAL_EDITS_CHAIN_LEFT
+# follow-ups (default 30), or when a whole job made no progress.
 #
 # Submit (the Code directory is found from this script's own path, so the
 # current directory does not matter; the Slurm log goes to the current directory):
 #     cd <Code dir> && sbatch abaqus_scripts/delta/hood_local_edits.sbatch
+# A different piece length for the whole chain: sbatch -t 24:00:00 abaqus_scripts/...
 #
 # Monitor:  squeue -u hkazemi ; tail -f hood_local_edits_<jobid>.out
 #           cat Data/HoodImpact_LocalEdits/job_logs/status.txt
@@ -40,8 +45,8 @@
 #SBATCH -J hood_local_edits
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=12
-#SBATCH --mem=36g
-#SBATCH -t 47:30:00
+#SBATCH --mem=24g
+#SBATCH -t 12:00:00
 #SBATCH -o hood_local_edits_%j.out
 set -u
 
@@ -67,7 +72,7 @@ mkdir -p "$LOGDIR"
 status() { echo "$(date '+%F %T') job $SLURM_JOB_ID: $*" | tee -a "$LOGDIR/status.txt"; }
 
 LANES="${LOCAL_EDITS_LANES:-12}"
-CHAIN_LEFT="${LOCAL_EDITS_CHAIN_LEFT:-6}"
+CHAIN_LEFT="${LOCAL_EDITS_CHAIN_LEFT:-30}"
 PREV_OK="${LOCAL_EDITS_PREV_OK:--1}"
 umask 002
 WORK="${LOCAL_EDITS_WORK:-/u/hkazemi/hood_local_edits_scratch}"
@@ -127,10 +132,26 @@ if [ "$OK_START" -eq "$PREV_OK" ]; then
     exit 1
 fi
 
+# this job's end (lanes start no run that would not finish by then) and time limit
+DEADLINE="${SLURM_JOB_END_TIME:-}"
+if [ -z "$DEADLINE" ]; then
+    END_STR=$(squeue -h -j "$SLURM_JOB_ID" -o %e 2>/dev/null)
+    case "$END_STR" in 20[0-9][0-9]-*) DEADLINE=$(date -d "$END_STR" +%s 2>/dev/null) || DEADLINE="" ;; esac
+fi
+case "$DEADLINE" in *[!0-9]*|"") DEADLINE="" ;; esac
+[ -n "$DEADLINE" ] && [ "$DEADLINE" -le "$(date +%s)" ] && DEADLINE=""
+TIME_LIMIT=$(squeue -h -j "$SLURM_JOB_ID" -o %l 2>/dev/null)
+case "$TIME_LIMIT" in *[!0-9:-]*|"") TIME_LIMIT="" ;; esac
+if [ -n "$DEADLINE" ]; then
+    status "time limit ${TIME_LIMIT:-?}; no run is started that would end after $(date -d "@$DEADLINE" '+%F %T')"
+else
+    status "WARNING: could not read this job's end time; runs in progress at the walltime are lost"
+fi
+
 # queue the follow-up now: it starts when this job ends, even after a walltime kill
 NEXT=""
 if [ "$CHAIN_LEFT" -gt 0 ]; then
-    if NEXT=$(sbatch --parsable --dependency=afterany:"$SLURM_JOB_ID" \
+    if NEXT=$(sbatch --parsable --dependency=afterany:"$SLURM_JOB_ID" ${TIME_LIMIT:+--time="$TIME_LIMIT"} \
             --export=ALL,LOCAL_EDITS_CHAIN_LEFT=$((CHAIN_LEFT - 1)),LOCAL_EDITS_PREV_OK="$OK_START" \
             "$ROOT/$SELF" 2>&1); then
         status "queued follow-up job $NEXT"
@@ -159,7 +180,7 @@ status "decks ready: $N_DECKS"
 solve() {
     python -u abaqus_scripts/batch_generate.py \
         --inp-dir "$DATA/inp_files" --work-dir "$WORK" --scratch-dir "$SCRATCH" \
-        --out-dir "$DATA" --runs "$1" --lanes "$LANES"
+        --out-dir "$DATA" --runs "$1" --lanes "$LANES" ${DEADLINE:+--deadline "$DEADLINE"}
     sync_logs
 }
 

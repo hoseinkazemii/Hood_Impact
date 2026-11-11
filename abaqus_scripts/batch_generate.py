@@ -21,6 +21,10 @@ Robustness:
     * per-run Abaqus console -> <run_dir>/solve_console.txt
     * incremental metrics CSV, resume-safe: runs marked ok are skipped, so
       the same command can simply be resubmitted after a walltime kill
+    * optional --deadline (the Slurm job's end): a run is only started when
+      it is expected to finish before it (90th-percentile solve time so far,
+      +10%, +10 min), so a job ends cleanly instead of being killed mid-solve;
+      the runs left over are solved by the next job
     * big solver files (.odb .abq .pac .stt ...) deleted after successful
       extraction; kept: raw acceleration csv, SAE1000 csv, logs
 
@@ -61,6 +65,8 @@ METRIC_FIELDS = ["run", "status", "cpus", "solve_s", "n_raw_points",
 SOLVE_ATTEMPTS = 3
 RETRY_WAIT_S = 90
 LAUNCH_SPACING_S = 15
+DEFAULT_RUN_S = 4 * 3600      # expected run time until 5 solve times are known
+END_MARGIN_S = 600            # extraction, post-processing and job wrap-up
 
 log_lock = threading.Lock()
 metrics_lock = threading.Lock()
@@ -89,6 +95,34 @@ def load_done(metrics_csv):
                 if row.get("status") == "ok":
                     done.add(int(row["run"]))
     return done
+
+
+class RunClock(object):
+    """Says whether a run started now is expected to finish before the deadline."""
+
+    def __init__(self, deadline, metrics_csv):
+        self.deadline = deadline
+        self.times = []
+        self.lock = threading.Lock()
+        if os.path.exists(metrics_csv):
+            with open(metrics_csv, newline="") as f:
+                for row in csv.DictReader(f):
+                    if row.get("status") == "ok" and row.get("solve_s"):
+                        self.times.append(float(row["solve_s"]))
+
+    def add(self, solve_s):
+        with self.lock:
+            self.times.append(float(solve_s))
+
+    def expected_s(self):
+        with self.lock:
+            if len(self.times) < 5:
+                return DEFAULT_RUN_S
+            t = sorted(self.times)
+            return 1.1 * t[int(0.9 * (len(t) - 1))] + END_MARGIN_S
+
+    def fits(self):
+        return self.deadline is None or time.time() + self.expected_s() <= self.deadline
 
 
 def append_metrics(metrics_csv, row):
@@ -158,12 +192,14 @@ def console_tail(console_path, n=5):
         return ""
 
 
-def process_one(run, args, abaqus, log):
+def process_one(run, args, abaqus, log, clock):
     """solve (cpus=1) -> extract -> SAE1000 + HIC -> publish csv -> cleanup"""
     job = "HoodImpact_%d" % run
     inp_path = os.path.join(args.inp_dir, "%s.inp" % job)
     if not os.path.exists(inp_path):
         return {"run": run, "status": "missing_inp", "note": inp_path}
+    if not clock.fits():
+        return {"run": run, "status": "deferred"}
 
     run_dir = os.path.join(args.work_dir, "run_%d" % run)
     os.makedirs(run_dir, exist_ok=True)
@@ -191,6 +227,10 @@ def process_one(run, args, abaqus, log):
     for attempt in range(1, SOLVE_ATTEMPTS + 1):
         if solved:
             break
+        if not clock.fits():
+            cleanup_big_files(run_dir, log)
+            cleanup_scratch_dir(run_scratch, log)
+            return {"run": run, "status": "deferred"}
         lck = os.path.join(run_dir, "%s.lck" % job)
         if os.path.exists(lck):
             os.remove(lck)
@@ -264,6 +304,10 @@ def main():
                          "<out-dir>/output_history_acc/")
     ap.add_argument("--abaqus", default=None,
                     help="abaqus launcher (default: 'abaqus' on PATH)")
+    ap.add_argument("--deadline", type=float, default=None,
+                    help="unix time by which every run must be finished (the "
+                         "Slurm job's end); runs that would not finish in time "
+                         "are left for the next job")
     args = ap.parse_args()
 
     os.makedirs(args.work_dir, exist_ok=True)
@@ -275,6 +319,7 @@ def main():
     runs = rhi.parse_runs(args.runs)
     done = load_done(metrics_csv)
     todo = [r for r in runs if r not in done]
+    clock = RunClock(args.deadline, metrics_csv)
 
     log("=" * 70)
     log("BATCH GENERATION: %d runs requested, %d lanes x cpus=%d"
@@ -282,12 +327,16 @@ def main():
     log("abaqus  : %s" % abaqus)
     log("already ok (skipped): %d" % len(done & set(runs)))
     log("to solve            : %d runs" % len(todo))
+    if args.deadline is not None:
+        log("deadline            : %s (expected run time now %.0f min)"
+            % (datetime.datetime.fromtimestamp(args.deadline).strftime("%m-%d %H:%M"),
+               clock.expected_s() / 60))
     log("=" * 70)
 
     t_start = time.time()
-    n_done = n_ok = n_fail = 0
+    n_done = n_ok = n_fail = n_deferred = 0
     with ThreadPoolExecutor(max_workers=args.lanes) as pool:
-        futures = {pool.submit(process_one, run, args, abaqus, log): run
+        futures = {pool.submit(process_one, run, args, abaqus, log, clock): run
                    for run in todo}
         for fut in as_completed(futures):
             run = futures[fut]
@@ -295,12 +344,16 @@ def main():
                 row = fut.result()
             except Exception as e:
                 row = {"run": run, "status": "crashed", "note": str(e)[:200]}
+            if row["status"] == "deferred":
+                n_deferred += 1
+                continue
             row["finished_at"] = datetime.datetime.now().isoformat(timespec="seconds")
             append_metrics(metrics_csv, row)
             n_done += 1
 
             if row["status"] == "ok":
                 n_ok += 1
+                clock.add(row["solve_s"])
                 elapsed = time.time() - t_start
                 rate = elapsed / n_done
                 eta = datetime.datetime.now() + datetime.timedelta(
@@ -319,6 +372,9 @@ def main():
                 log("MILESTONE %d/%d done (%d ok, %d failed)"
                     % (n_done, len(todo), n_ok, n_fail))
 
+    if n_deferred:
+        log("DEADLINE: %d runs not started (expected %.0f min each, too little "
+            "time left); the next job solves them" % (n_deferred, clock.expected_s() / 60))
     log("BATCH COMPLETE: %d ok, %d failed. Metrics -> %s"
         % (n_ok, n_fail, metrics_csv))
 

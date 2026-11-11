@@ -88,9 +88,16 @@ tarball was unpacked in. The job:
 **Budget.** A run takes about 2 h on one Delta core: 55.6k increments at ~0.13 s each. 1162 runs on
 12 lanes come to about 195 h of wall time, or about 2,350 core-hours.
 
-**Follow-up jobs.** Each job queues its own follow-up (`afterany`), so a walltime kill continues on
-its own; finished runs are never redone. The chain stops when every run is done, after 6
-follow-ups, or when a whole job finished no run.
+**12-hour jobs.** The campaign runs as a chain of 12-h jobs, about 5 rounds of 12 runs each, so
+about 20 jobs. A 2-day job can wait days with reason `(Priority)`: the scheduler can only start it
+where 12 cores stay free for 2 days, while a 12-h job fits into gaps between other jobs (backfill).
+A lane only starts a run that is expected to finish before the job ends, so no solve is cut off
+half-way. For a different length, e.g. `sbatch -t 24:00:00 abaqus_scripts/delta/hood_local_edits.sbatch`;
+the follow-ups keep it.
+
+**Follow-up jobs.** Each job queues its own follow-up (`afterany`) as soon as it starts; finished
+runs are never redone. The chain stops when every run is done, after 30 follow-ups, or when a
+whole job finished no run.
 
 **Right after submitting**, `squeue -u hkazemi` should show the running job and a
 follow-up waiting with reason `(Dependency)`. If the queue is empty a minute after the job started,
@@ -110,6 +117,7 @@ On Delta:
 
 ```bash
 squeue -u hkazemi
+sprio -j <jobid>                              # while pending: why it waits (AGE, FAIRSHARE)
 cat Data/HoodImpact_LocalEdits/job_logs/status.txt
 tail -f hood_local_edits_<jobid>.out         # in the folder you submitted from
 scancel -u hkazemi -n hood_local_edits       # stops the running job and the queued follow-up
