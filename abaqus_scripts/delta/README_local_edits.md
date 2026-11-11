@@ -76,7 +76,9 @@ If home is short of space, the old `inp_files` folders of `HoodImpact_600_EuroNC
 sbatch abaqus_scripts/delta/hood_local_edits.sbatch
 ```
 
-The job:
+The job finds its Code directory from the script's own path, so it reads and writes
+`<Code dir>/Data/HoodImpact_LocalEdits` wherever you submit from. That has to be the folder the
+tarball was unpacked in. The job:
 
 1. writes all 1162 decks (about 10 minutes);
 2. solves the 11 pilot runs (one round of 12 lanes, about 2 h);
@@ -90,12 +92,27 @@ The job:
 its own; finished runs are never redone. The chain stops when every run is done, after 6
 follow-ups, or when a whole job finished no run.
 
-Monitor and stop:
+**Right after submitting**, `squeue -u hkazemi` should show the running job and a
+follow-up waiting with reason `(Dependency)`. If the queue is empty a minute after the job started,
+it stopped at a check; `job_logs/status.txt` says which.
+
+**Tracking.** Everything is written inside `Data/HoodImpact_LocalEdits/`, so downloading that
+folder shows the state:
+
+| file | content |
+|---|---|
+| `job_logs/status.txt` | one line per stage of every job: start, follow-up queued, decks ready, pilot gate, finished, or the error that stopped it |
+| `job_logs/hood_local_edits_<jobid>.out` | the Slurm log, refreshed every 10 minutes and when the job ends |
+| `generation_metrics.csv` | one row per finished run (`status`, `n_raw_points`), refreshed every 10 minutes |
+| `output_history_acc/` | results, one csv per finished run, written as each run completes |
+
+On Delta:
 
 ```bash
 squeue -u hkazemi
-tail -f hood_local_edits_<jobid>.out
-scancel -u hkazemi -n hood_local_edits      # stops the running job and the queued follow-up
+cat Data/HoodImpact_LocalEdits/job_logs/status.txt
+tail -f hood_local_edits_<jobid>.out         # in the folder you submitted from
+scancel -u hkazemi -n hood_local_edits       # stops the running job and the queued follow-up
 ```
 
 ## 3. The pilot gate
