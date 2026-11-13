@@ -1,0 +1,12 @@
+Local-edit dataset check (pilot): 11 runs considered, 11 finished
+  increments per run: 55557
+ run design  location role  dist_mm  rms_g  dhic_pct     hic  hic_d6  twin_rms_g  twin_of  d6_twin_rms_g
+   5     N1       105 near     16.6   7.93     -3.74 1037.90 1078.23         NaN      NaN            NaN
+   6     N1         9 near     20.5   7.15     -1.28  942.98  955.19         NaN      NaN            NaN
+   7     N1        40 twin     17.0   8.58     -2.89 1047.48 1078.64        2.96    105.0           2.97
+   8     N1       132  far    378.8   3.03      1.85 1381.64 1356.50         NaN      NaN            NaN
+   9     N2       105 near     16.6   6.74      1.29 1092.12 1078.23         NaN      NaN            NaN
+  10     N2         9 near     20.5   5.45      1.43  968.84  955.19         NaN      NaN            NaN
+  11     N2        40 twin     17.0   6.42      1.40 1093.69 1078.64        3.46    105.0           2.97
+
+PILOT GATE: PASS

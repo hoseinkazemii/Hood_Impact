@@ -15,8 +15,19 @@
 #      (and cancels the queued follow-up job); read pilot_report.txt.
 #   4. solves the remaining runs in the manifest's solve_order (design 6 first,
 #      then the cut-line designs, then the single-beam notches), 12 single-core
-#      lanes (5 FlexNet tokens each)
+#      lanes (5 FlexNet tokens each) or the layout in campaign_layout.env (below)
 #   5. writes qa_report.txt over everything finished so far
+#
+# Layout (lanes x cores per solve). Without Data/HoodImpact_LocalEdits/
+# campaign_layout.env: 12 lanes x 1 core, 60 of the 65 tokens. A solve on N
+# cores takes floor(5 * N**0.422) tokens (8 -> 12, 16 -> 16), so multi-core
+# lanes use far more cores for the same 65 tokens. hood_cpus_test.sbatch
+# measures the fastest layout and writes cpus_test/layout.env; copy it to
+# campaign_layout.env and submit with the cores and memory it names, e.g.
+#     sbatch -c 64 --mem=64g --array=1-8%1 abaqus_scripts/delta/hood_local_edits.sbatch
+# Its lines (LOCAL_EDITS_CPUS, _LANES, _MP_MODE, _RUN_S, _REDO_OTHER_CPUS) can
+# also be given with --export, which wins over the file; lanes are cut to what
+# the job's cores allow. Chained follow-ups inherit the job's cores and memory.
 #
 # Tracking: Data/HoodImpact_LocalEdits/job_logs/status.txt gets one line per
 # stage of every job; the Slurm log and generation_metrics.csv are copied into
@@ -27,7 +38,7 @@
 # on 12 lanes, so the campaign needs ~240 h of wall time (~2,900 core-hours),
 # done as 48-h jobs (Delta's cpu maximum; ~300 runs each, so ~5-6 jobs). The
 # queue wait was about the same for 12-h and 48-h requests, so fewer, longer
-# jobs finish sooner. 12 cores because the license allows 12 single-core lanes.
+# jobs finish sooner. 12 cores = the default 12 single-core lanes (see Layout).
 # A lane only starts a run that is expected to finish before the job's end
 # (batch_generate.py --deadline), so no solve is killed half-way; the job
 # queues its own follow-up (afterany) at the start, with the same time limit,
@@ -93,7 +104,23 @@ stop_chain() {
     return 0
 }
 
+# layout: --export variables > campaign_layout.env > 12 single-core lanes
+LAYOUT_FILE="$DATA/campaign_layout.env"
+if [ -f "$LAYOUT_FILE" ]; then
+    while IFS='=' read -r KEY VAL; do
+        case "$KEY" in
+            LOCAL_EDITS_CPUS|LOCAL_EDITS_LANES|LOCAL_EDITS_MP_MODE|LOCAL_EDITS_RUN_S|LOCAL_EDITS_REDO_OTHER_CPUS)
+                VAL="${VAL%%#*}"; VAL="${VAL//[[:space:]]/}"
+                [ -z "${!KEY+x}" ] && printf -v "$KEY" '%s' "$VAL" ;;
+        esac
+    done < "$LAYOUT_FILE"
+fi
+CPUS="${LOCAL_EDITS_CPUS:-1}"
 LANES="${LOCAL_EDITS_LANES:-12}"
+MP_MODE="${LOCAL_EDITS_MP_MODE:-}"
+RUN_S="${LOCAL_EDITS_RUN_S:-}"
+REDO="${LOCAL_EDITS_REDO_OTHER_CPUS:-0}"
+ALLOC="${SLURM_CPUS_PER_TASK:-12}"
 CHAIN_LEFT="${LOCAL_EDITS_CHAIN_LEFT:-30}"
 PREV_OK="${LOCAL_EDITS_PREV_OK:--1}"
 ARRAY_ID="${SLURM_ARRAY_JOB_ID:-}"     # set when submitted as a job array (--array=1-8%1)
@@ -149,18 +176,36 @@ key = (lambda r: int(r["solve_order"])) if "solve_order" in rows[0] else (lambda
 open(sys.argv[2], "w").write("\n".join(r["run"] for r in sorted(rows, key=key)) + "\n")
 EOF
 [ -s "$ORDER" ] || { status "ERROR: could not write the solve order $ORDER"; stop_chain; exit 1; }
+# ok runs; with REDO=1 only those solved on $CPUS cores count
 count_ok() {
-    python - "$METRICS" <<'EOF'
+    python - "$METRICS" "$CPUS" "$REDO" <<'EOF'
 import csv, os, sys
-p = sys.argv[1]
-print(len({r["run"] for r in csv.DictReader(open(p)) if r["status"] == "ok"}) if os.path.exists(p) else 0)
+p, cpus, redo = sys.argv[1], int(sys.argv[2]), sys.argv[3] == "1"
+def same(r):
+    try:
+        return int(float(r.get("cpus") or 1)) == cpus
+    except ValueError:
+        return False
+print(len({r["run"] for r in csv.DictReader(open(p)) if r["status"] == "ok" and (not redo or same(r))})
+      if os.path.exists(p) else 0)
 EOF
 }
+if [ "$CPUS" -gt "$ALLOC" ]; then
+    status "ERROR: the layout needs $CPUS cores per solve but this job has $ALLOC; submit with -c $((CPUS * LANES)) (see $LAYOUT_FILE)"
+    stop_chain
+    exit 1
+fi
+if [ $((LANES * CPUS)) -gt "$ALLOC" ]; then
+    status "WARNING: $LANES lanes x $CPUS cores do not fit the job's $ALLOC cores; using $((ALLOC / CPUS)) lanes"
+    LANES=$((ALLOC / CPUS))
+fi
+LAYOUT="lanes $LANES x cpus $CPUS${MP_MODE:+ ($MP_MODE)}, ~$((LANES * $(python -c "print(int(5 * $CPUS ** 0.422 + 1e-9))"))) tokens"
+[ "$REDO" = "1" ] && LAYOUT="$LAYOUT; re-solving runs finished with another cpus count"
 OK_START=$(count_ok)
 if [ -n "$ARRAY_ID" ]; then
-    status "runs: $N_TOTAL in the plan, $OK_START already ok; lanes $LANES; task ${SLURM_ARRAY_TASK_ID:-?} of job array $ARRAY_ID"
+    status "runs: $N_TOTAL in the plan, $OK_START already ok; $LAYOUT; task ${SLURM_ARRAY_TASK_ID:-?} of job array $ARRAY_ID"
 else
-    status "runs: $N_TOTAL in the plan, $OK_START already ok; lanes $LANES; follow-ups left $CHAIN_LEFT"
+    status "runs: $N_TOTAL in the plan, $OK_START already ok; $LAYOUT; follow-ups left $CHAIN_LEFT"
 fi
 if [ "$OK_START" -ge "$N_TOTAL" ]; then
     status "all runs are ok; nothing left to solve"
@@ -178,6 +223,13 @@ if [ -n "${OTHERS// /}" ]; then
     stop_chain
     exit 1
 fi
+# the cpus test (hood_cpus_test.sbatch) needs every token: wait for it (max ~140 min)
+for WAIT_MIN in $(seq 1 140); do
+    TEST=$(squeue -h -u "$USER" -n hood_cpus_test -t RUNNING -o %A 2>/dev/null | tr '\n' ' ')
+    [ -z "${TEST// /}" ] && break
+    [ "$WAIT_MIN" = 1 ] && status "waiting for the cpus test job $TEST to end (it needs the license to itself)"
+    sleep 60
+done
 
 # this job's end (lanes start no run that would not finish by then) and time limit
 DEADLINE="${SLURM_JOB_END_TIME:-}"
@@ -199,6 +251,7 @@ fi
 # walltime kill. A job array needs none: its next task is already waiting (and ageing).
 if [ -z "$ARRAY_ID" ] && [ "$CHAIN_LEFT" -gt 0 ]; then
     if NEXT=$(sbatch --parsable --dependency=afterany:"$SLURM_JOB_ID" ${TIME_LIMIT:+--time="$TIME_LIMIT"} \
+            --cpus-per-task="$ALLOC" ${SLURM_MEM_PER_NODE:+--mem="${SLURM_MEM_PER_NODE}M"} \
             --export=ALL,LOCAL_EDITS_CHAIN_LEFT=$((CHAIN_LEFT - 1)),LOCAL_EDITS_PREV_OK="$OK_START" \
             "$ROOT/$SELF" 2>&1); then
         status "queued follow-up job $NEXT"
@@ -226,7 +279,9 @@ status "decks ready: $N_DECKS"
 solve() {   # solve --runs <list> | --runs-file <file>
     python -u abaqus_scripts/batch_generate.py \
         --inp-dir "$DATA/inp_files" --work-dir "$WORK" --scratch-dir "$SCRATCH" \
-        --out-dir "$DATA" --lanes "$LANES" ${DEADLINE:+--deadline "$DEADLINE"} "$@"
+        --out-dir "$DATA" --lanes "$LANES" --cpus "$CPUS" ${MP_MODE:+--mp-mode "$MP_MODE"} \
+        ${RUN_S:+--default-run-s "$RUN_S"} $([ "$REDO" = "1" ] && echo --redo-other-cpus) \
+        ${DEADLINE:+--deadline "$DEADLINE"} "$@"
     sync_logs
 }
 

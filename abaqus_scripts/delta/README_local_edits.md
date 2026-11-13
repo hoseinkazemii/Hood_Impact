@@ -161,6 +161,59 @@ tail -f hood_local_edits_<jobid>.out         # in the folder you submitted from
 scancel -u hkazemi -n hood_local_edits       # stops the running task and the pending ones
 ```
 
+## 2b. Faster: multi-core lanes (measure first)
+
+The license has 65 `abaqus` tokens, not 65 cores. A solve on N cores checks out
+`floor(5 * N**0.422)` tokens: 1 core costs 5, 8 cores 12, 16 cores 16. Single-core lanes therefore
+stop at 13 cores, while the same 65 tokens can run, for example, 5 lanes x 8 cores (40 cores) or
+4 lanes x 16 cores (64 cores). Editing the count in the license file does not work: every FEATURE
+line is signed (`SIGN=`), and a changed line is rejected outright.
+
+How much faster that is depends on how well Abaqus/Explicit scales on this ~40k-element model. Using
+N cores also splits the hood into N domains, which changes the floating-point order; contact,
+plasticity and beam buckling can grow that roundoff. Results are not less accurate, but the dataset
+is about small design differences, so the noise this adds to (design - D6) must stay far below them.
+`hood_cpus_test.sbatch` measures both in one job (~1.5 h, 2h15 limit, 64 cores):
+
+| phase | what it does |
+|---|---|
+| solo | the start of run 1's step on 1, 4, 8, 16, 32 cores, one at a time; the speed of each, and the tokens it holds according to the license server (`lmstat -a`) |
+| layout | the 3 best layouts predicted from solo, all their lanes solving together (contention on the node) |
+| noise | the 11 pilot runs (D6, N1, N2 at locations 9, 40, 105, 132; all finished on 1 core) in full on the chosen layout, run 5 twice. Per run: 1 vs N cores (RMS g, peak, HIC15). Per pair (N1/N2 - D6 at the same location): R2 of the N-core difference curve against the 1-core one, and the HIC change on both |
+
+**Noise verdict.** PASS only if run 5 repeats bit for bit on N cores and every near/twin pair keeps
+R2 >= 0.95 and its HIC change within 0.5 percentage points. The far pair (379 mm) is reported, not
+gated: the report says whether its 3 g difference stands above solver noise. Plot:
+`cpus_test/noise/noise_pairs.png` (1-core vs N-core difference curves); tables `noise_runs.csv`,
+`noise_pairs.csv`; the N-core curves themselves are next to them for any further check on Windows.
+If the verdict is FAIL, stay on 12 single-core lanes (`scontrol release` the held jobs).
+
+Steps:
+
+```bash
+squeue -u hkazemi -n hood_local_edits        # the test needs every token: no campaign job may run
+scontrol hold <pending job or array id>      # keep the next campaign task from starting
+# let the running task end, or scancel it (its unfinished runs are solved again later)
+sbatch abaqus_scripts/delta/hood_cpus_test.sbatch
+cat Data/HoodImpact_LocalEdits/cpus_test/report.txt
+```
+
+`report.txt` ends with the chosen layout, the campaign time it implies, the noise verdict and the
+exact submit line; `cpus_test/layout.env` holds the same layout with the verdict on its second line.
+If the verdict is PASS, run the campaign with it:
+
+```bash
+scancel <held campaign jobs>                 # they were submitted with 12 cores
+cp Data/HoodImpact_LocalEdits/cpus_test/layout.env Data/HoodImpact_LocalEdits/campaign_layout.env
+sbatch -c <cores> --mem=<mem> --array=1-8%1 abaqus_scripts/delta/hood_local_edits.sbatch
+```
+
+The campaign log then shows `lanes L x cpus N`. Remove `campaign_layout.env` to go back to 12
+single-core lanes. A multi-core layout sets `LOCAL_EDITS_REDO_OTHER_CPUS=1`: the runs already
+finished on one core are solved again on N cores, so every pair in the dataset comes from one solver
+setting. `CPUS_TEST_PHASES=noise` repeats only the noise test (another job) if the first one ran
+out of time; `CPUS_TEST_NOISE_RUNS=1-16` adds more finished runs.
+
 ## 3. The pilot gate
 
 The pilot is runs 1–11:

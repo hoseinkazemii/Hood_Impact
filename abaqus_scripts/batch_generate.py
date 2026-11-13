@@ -6,11 +6,13 @@ HoodImpact_<run>.inp decks with Abaqus/Explicit, extract the headform
 acceleration, SAE1000-filter it, compute HIC15, and keep only the small
 result files. There is no reference comparison for the new runs.
 
-Parallelisation: N concurrent SINGLE-CORE solves (--lanes). On Delta the
-constraint is the FlexNet license pool (65 "abaqus" tokens; one cpus=1 job
-checks out 5 tokens -> 13 lanes max; default 12 leaves headroom for other
-license users) and the CPU-hour budget (single-core solves are the most
-core-hour-efficient way to produce samples).
+Parallelisation: --lanes concurrent solves of --cpus cores each. On Delta the
+constraint is the FlexNet license pool (65 "abaqus" tokens). A solve checks out
+floor(5 * cpus**0.422) tokens (1 -> 5, 8 -> 12, 16 -> 16), so single-core lanes
+cap the job at 13 cores, while multi-core lanes use far more cores for the same
+tokens: faster in wall time, at some cost in core-hours. Measure before choosing
+(cpus_scaling_test.py, delta/hood_cpus_test.sbatch). Defaults (12 x cpus=1)
+are the original single-core layout.
 
 Robustness:
     * success detected from artefacts, not exit codes: .sta must contain
@@ -107,27 +109,37 @@ class Log(object):
                     pass
 
 
-def load_done(metrics_csv):
+def row_cpus(row):
+    try:
+        return int(float(row.get("cpus") or 1))
+    except ValueError:
+        return 1
+
+
+def load_done(metrics_csv, cpus=None):
+    """Runs with an ok row; with cpus given, only rows solved on that many cores."""
     done = set()
     if os.path.exists(metrics_csv):
         with open(metrics_csv, newline="") as f:
             for row in csv.DictReader(f):
-                if row.get("status") == "ok":
+                if row.get("status") == "ok" and (cpus is None or row_cpus(row) == cpus):
                     done.add(int(row["run"]))
     return done
 
 
 class RunClock(object):
-    """Says whether a run started now is expected to finish before the deadline."""
+    """Says whether a run started now is expected to finish before the deadline.
+    Only solve times of the same cpus count are used."""
 
-    def __init__(self, deadline, metrics_csv):
+    def __init__(self, deadline, metrics_csv, cpus=1, default_s=DEFAULT_RUN_S):
         self.deadline = deadline
+        self.default_s = default_s
         self.times = []
         self.lock = threading.Lock()
         if os.path.exists(metrics_csv):
             with open(metrics_csv, newline="") as f:
                 for row in csv.DictReader(f):
-                    if row.get("status") == "ok" and row.get("solve_s"):
+                    if row.get("status") == "ok" and row.get("solve_s") and row_cpus(row) == cpus:
                         self.times.append(float(row["solve_s"]))
 
     def add(self, solve_s):
@@ -137,7 +149,7 @@ class RunClock(object):
     def expected_s(self):
         with self.lock:
             if len(self.times) < 5:
-                return DEFAULT_RUN_S
+                return self.default_s
             t = sorted(self.times)
             return 1.1 * t[int(0.9 * (len(t) - 1))] + END_MARGIN_S
 
@@ -242,7 +254,7 @@ def adopt_finished(run, args, log):
 
 
 def process_one(run, args, abaqus, log, clock):
-    """solve (cpus=1) -> extract -> SAE1000 + HIC -> publish csv -> cleanup"""
+    """solve (--cpus cores) -> extract -> SAE1000 + HIC -> publish csv -> cleanup"""
     job = "HoodImpact_%d" % run
     inp_path = os.path.join(args.inp_dir, "%s.inp" % job)
     if not os.path.exists(inp_path):
@@ -270,6 +282,8 @@ def process_one(run, args, abaqus, log, clock):
     solve_cmd = [abaqus, "job=%s" % job, "input=%s" % inp_path,
                  "cpus=%d" % args.cpus, "double=both", "ask_delete=OFF",
                  "interactive"]
+    if args.cpus > 1 and args.mp_mode:
+        solve_cmd.insert(-1, "mp_mode=%s" % args.mp_mode)
     if run_scratch:
         solve_cmd.insert(-1, "scratch=%s" % run_scratch)
     t0 = time.time()
@@ -344,11 +358,18 @@ def main():
                     help="file with one run number per line, solved in that order "
                          "(replaces --runs)")
     ap.add_argument("--lanes", type=int, default=12,
-                    help="concurrent single-core Abaqus jobs (12 x 5 = 60 of "
-                         "the 65 license tokens)")
+                    help="concurrent Abaqus solves; lanes x tokens(cpus) must fit "
+                         "the 65 license tokens (12 x cpus=1 = 60)")
     ap.add_argument("--cpus", type=int, default=1,
-                    help="cpus per solve (keep 1: most core-hour-efficient, "
-                         "and lanes are sized for 5-token serial checkouts)")
+                    help="cores per solve (tokens: floor(5 * cpus**0.422))")
+    ap.add_argument("--mp-mode", default=None, choices=["threads", "mpi"],
+                    help="Abaqus mp_mode for cpus > 1 (default: Abaqus' own)")
+    ap.add_argument("--default-run-s", type=float, default=DEFAULT_RUN_S,
+                    help="expected seconds per solve until 5 solves at this cpus count "
+                         "have finished (deadline check)")
+    ap.add_argument("--redo-other-cpus", action="store_true",
+                    help="re-solve runs that finished with another cpus count, so the "
+                         "whole dataset comes from one solver setting")
     ap.add_argument("--inp-dir", required=True)
     ap.add_argument("--work-dir", required=True)
     ap.add_argument("--scratch-dir", default=None,
@@ -378,15 +399,27 @@ def main():
             raise SystemExit("%s lists a run twice" % args.runs_file)
     else:
         runs = rhi.parse_runs(args.runs)
-    done = load_done(metrics_csv)
+    done = load_done(metrics_csv, args.cpus if args.redo_other_cpus else None)
     todo = [r for r in runs if r not in done]
-    clock = RunClock(args.deadline, metrics_csv)
+    clock = RunClock(args.deadline, metrics_csv, args.cpus, args.default_run_s)
 
     log("=" * 70)
-    log("BATCH GENERATION: %d runs requested, %d lanes x cpus=%d"
-        % (len(runs), args.lanes, args.cpus))
+    log("BATCH GENERATION: %d runs requested, %d lanes x cpus=%d%s"
+        % (len(runs), args.lanes, args.cpus,
+           " (mp_mode=%s)" % args.mp_mode if args.mp_mode and args.cpus > 1 else ""))
     log("abaqus  : %s" % abaqus)
     log("already ok (skipped): %d" % len(done & set(runs)))
+    if args.redo_other_cpus:
+        # a leftover run folder would be adopted or reused as if solved with --cpus
+        redo = sorted((load_done(metrics_csv) - done) & set(todo))
+        for run in redo:
+            run_dir = os.path.join(args.work_dir, "run_%d" % run)
+            if os.path.isdir(run_dir):
+                aside = run_dir + ".other_cpus"
+                shutil.rmtree(aside, ignore_errors=True)
+                os.rename(run_dir, aside)
+        if redo:
+            log("re-solving %d runs finished with another cpus count" % len(redo))
     log("to solve            : %d runs" % len(todo))
     if args.deadline is not None:
         log("deadline            : %s (expected run time now %.0f min)"
