@@ -142,6 +142,16 @@ def main():
                 if len(g):
                     say("  near %3d-%3d mm: %4d runs  RMS median %.2f g  |dHIC| median %.1f%%"
                         % (lo, hi, len(g), g["rms_g"].median(), g["dhic_pct"].abs().median()))
+            designs_csv = os.path.join(args.data_dir, doe.DESIGNS_CSV)
+            if os.path.exists(designs_csv) and "dhic_pct" in near:
+                meta = {r["design"]: r for r in csv.DictReader(open(designs_csv))}
+                g_all = near.dropna(subset=["dhic_pct"]).assign(
+                    group=lambda t: [meta[d]["kind"] + " " + meta[d]["variant"] for d in t.design])
+                say("  near runs by kind and variant (dHIC vs D6 at the same location):")
+                for grp, g in g_all.groupby("group", sort=False):
+                    say("    %-12s %2d designs %4d runs  |dHIC| median %5.1f%%  p90 %5.1f%%  max %5.1f%%  RMS median %.2f g"
+                        % (grp, g.design.nunique(), len(g), g.dhic_pct.abs().median(), g.dhic_pct.abs().quantile(.9),
+                           g.dhic_pct.abs().max(), g.rms_g.median()))
             if "twin_rms_g" in df:
                 t = df.dropna(subset=["twin_rms_g"])
                 say("  twins: design at mirror location RMS median %.2f g, p90 %.2f g; D6 median %.2f g"

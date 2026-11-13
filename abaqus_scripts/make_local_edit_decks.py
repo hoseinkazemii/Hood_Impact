@@ -16,8 +16,11 @@ materials, fasteners, couplings, contact, mass scaling, output requests):
 
 Before writing, every design is re-checked like apply_node_edits.py (no
 headform, BC/coupling or skin nodes moved, >= 10 mm from fasteners, skin
-clearance, every edge >= 5.25 mm). Decks are written atomically, so an
-interrupted run never leaves a half deck that looks complete.
+clearance, every edge >= 3.0 mm: the smooth notches keep >= 5.25 mm, the
+creases go down to 3.0 mm, which the fixed 4.5e-7 s increment solves without
+mass scaling). Decks are written atomically, so an interrupted run never
+leaves a half deck that looks complete. With --skip-existing only the missing
+decks are written, so new designs can be added to a running campaign.
 
 Also writes, once per design, design_changes/<design>_changed_nodes.csv
 (label, x, y, z of design 6, dz): the design geometry for the ML side.

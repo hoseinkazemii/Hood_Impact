@@ -1,9 +1,9 @@
 """
 local_edit_doe.py
 =================
-Design of experiments for learning LOCAL design changes: 51 beam-notch edits of
-hood design 6 (HoodImpact_31.inp, cluster C) and the impact locations each one
-is solved at. Pure numpy/scipy, no Abaqus needed.
+Design of experiments for learning LOCAL design changes: 72 beam edits of hood
+design 6 (HoodImpact_31.inp, cluster C) and the impact locations each one is
+solved at. Pure numpy/scipy, no Abaqus needed.
 
 Designs
 -------
@@ -18,7 +18,8 @@ cae_local_edit_designs.py (same result to 1e-4 mm on N1-N7):
     dz    = DZ * w_len * w_gap                           |across| <= HALF_WIDTH
 
 DZ > 0 raises the channel floor (shallower, softer beam), DZ < 0 lowers it.
-12 sites x 4 variants + 3 combinations:
+
+Single-beam notches, 12 sites x 4 variants (N1-N49 without N4):
 
     S  standard  largest raise keeping every edge >= 5.25 mm, L = 60 mm
     H  half      half of S (at diagonal x = -130, where S is only 7 mm, the
@@ -26,10 +27,29 @@ DZ > 0 raises the channel floor (shallower, softer beam), DZ < 0 lowers it.
     D  deeper    -20 mm (even site index) or -10 mm (odd), L = 60 mm
     L  length    largest raise at L = 35 mm, or L = 90 mm where the longer box
                  stays clear of beam junctions
-    C  two standard notches at once (additivity checks)
+    K  crease    (only diagonal and centre beam at x = 30 and x = 100) as below
 
-N1-N7 keep the names and parameters of the first batch; N8-N51 are new. The
-base design is "D6".
+Cut lines, 5 positions x 4 variants (N4, N50-N68): the centre beam AND both
+diagonals edited at about the same x, which cuts every load path across the
+hood there. The old design 7 did this at x ~ 80 (floor raised 18-20 mm over
+~40 mm of beam) and changed the clean-start HIC by -15 to -42 % over a wide
+region, while single-beam notches change it by 1-4 %, about the noise:
+
+    S   standard     both sites at their standard raise, L = 60 mm (N4, N50,
+                     N51 were the first-batch "combinations")
+    K   crease       20 mm raise, or the most that keeps every edge >= 3.0 mm,
+                     over L = 30 mm: a short, sharp crease like design 7
+    KH  half crease  half of K, L = 30 mm
+    D   deeper       -20 mm at both sites, L = 60 mm
+
+Creases may go below the 5.25 mm edge rule of the smooth notches. Every run
+uses a fixed 4.5e-7 s increment, which is stable for elements down to ~2.3 mm
+(aluminium plate wave speed 5.07 km/s), and the deck's mass scaling (target
+5e-7 s) only adds mass below ~2.5 mm, so an edge floor of CHECK_MIN_EDGE_MM =
+3.0 mm adds no mass and no time-step difference between designs.
+
+N1-N7 keep the names and parameters of the first batch; N8-N51 came next, and
+N52-N72 are the cut lines and creases. The base design is "D6".
 
 Runs
 ----
@@ -60,8 +80,14 @@ Solver settings (applied by make_local_edit_decks.py, identical for every run):
 
 Run numbering: an 11-run pilot first (N1 and N2 at their two nearest locations
 and first twin, N1 at its first far control, D6 at the same locations), then
-D6 at its other locations, then N1..N51 with their 20 runs each (near by
-distance, twins, far).
+D6 at its other locations, then N1..N72 with their 20 runs each (near by
+distance, twins, far). Runs 1-1162 (D6 and N1-N51) were planned first and keep
+their numbers; N52-N72 are runs 1163-1582.
+
+Solve order (manifest column solve_order; the Delta job solves in this order):
+pilot, D6, cut-line creases, cut-line standard, single-beam creases, half
+creases, cut-line deeper, then the single-beam notches. The large-effect
+designs come first, so they are checked early.
 
 Usage (from the Code directory):
     python abaqus_scripts/local_edit_doe.py            # plan + write the csvs
@@ -69,8 +95,8 @@ Usage (from the Code directory):
 
 Writes Data/HoodImpact_LocalEdits/:
     local_edit_doe.csv        one row per notch (design, site, x0, y0, axis, g1, dz, half_length, mirror)
-    local_edit_designs.csv    one row per design (variant, nodes moved, checks)
-    manifest_local_edits.csv  one row per run (design, location, role, distance, headform shift)
+    local_edit_designs.csv    one row per design (kind, variant, cut line, nodes moved, checks)
+    manifest_local_edits.csv  one row per run (design, location, role, distance, headform shift, solve order)
 """
 import argparse
 import csv
@@ -99,7 +125,9 @@ HALF_WIDTH = 45.0            # mm across the beam
 G0 = 3.0                     # mm, flange gap below the skin
 MAX_GAP = 45.0               # deeper nodes belong to the perimeter frame
 BIN_MM = 0.01                # offsets binned like the CAE script
-MIN_EDGE_MM = 5.25           # deck minimum is 5.083 mm
+MIN_EDGE_MM = 5.25           # sizing rule of the smooth notches (deck minimum is 5.083 mm)
+CHECK_MIN_EDGE_MM = 3.0      # deck check for every design (see the docstring)
+CREASE_DZ, CREASE_HALF_LENGTH = 20.0, 30.0
 FASTENER_ZONE_MM = 10.0
 MIN_SKIN_CLEARANCE_MM = 2.0
 SIGNIFICANT_MM = 0.5         # a node counts as moved for distances above this
@@ -110,7 +138,8 @@ FIXED_DT = 4.5e-7            # s
 CLEARANCE_MM = 1.0           # clear gap between contact surfaces at t = 0
 CONTACT_OFFSET_MM = 1.25     # hood outer 1.5 mm / 2 + headform layer 1.0 mm / 2
 PILOT_DESIGNS = ("N1", "N2")
-VARIANT_NAMES = {"S": "standard", "H": "half raise", "D": "deeper beam", "L": "length", "C": "combination"}
+VARIANT_NAMES = {"S": "standard", "H": "half raise", "D": "deeper beam", "L": "length", "K": "crease",
+                 "KH": "half crease"}
 
 
 # --------------------------------------------------------------------- hood
@@ -228,7 +257,7 @@ class EditChecks(object):
                    fastener_mm=float(min(self.conn.query(P)[0].min(), self.conn.query(Q)[0].min())),
                    skin_min_gap=float(gap_new.min()), dz_min=float(v.min()), dz_max=float(v.max()))
         problems = []
-        if out["min_edge"] < MIN_EDGE_MM:
+        if out["min_edge"] < CHECK_MIN_EDGE_MM:
             problems.append("min edge %.3f mm" % out["min_edge"])
         if out["fastener_mm"] < FASTENER_ZONE_MM:
             problems.append("fastener %.1f mm" % out["fastener_mm"])
@@ -277,6 +306,14 @@ FIRST_BATCH = {  # name -> (site, variant, dz, half_length); N4 is a combination
 }
 COMBINATIONS = [("N4", ("diag_x30", "horiz_x30")), (None, ("diag_x100", "horiz_x100")),
                 (None, ("diag_xm130", "horiz_xm120"))]
+# cut lines: the diagonal pair and the centre beam at about the same x
+CUT_LINES = [("x=-125", ("diag_xm130", "horiz_xm120")), ("x=-50", ("diag_xm60", "horiz_xm40")),
+             ("x=30", ("diag_x30", "horiz_x30")), ("x=100", ("diag_x100", "horiz_x100")),
+             ("x=460", ("diag_x470", "horiz_x450"))]
+SINGLE_CREASES = ("diag_x30", "horiz_x30", "diag_x100", "horiz_x100")
+# solve order of the edited designs (after the pilot and D6), by (kind, variant)
+SOLVE_PRIORITY = [("cutline", "K"), ("cutline", "S"), ("single", "K"), ("cutline", "KH"), ("cutline", "D"),
+                  ("single", "S"), ("single", "H"), ("single", "D"), ("single", "L")]
 
 
 def floor_gap(hood, site):
@@ -285,18 +322,18 @@ def floor_gap(hood, site):
     return round(float(np.median(hood.gap[m])) * 2) / 2
 
 
-def max_raise(hood, site, half_length):
+def max_raise(hood, site, half_length, min_edge=MIN_EDGE_MM, top=24.0):
     best = None
-    for dz in np.arange(4.0, 24.01, 0.5):
+    for dz in np.arange(4.0, top + 0.01, 0.5):
         off, _ = design_offsets(hood, [(site, float(dz), half_length)])
-        if hood.min_edge(off) < MIN_EDGE_MM:
+        if hood.min_edge(off) < min_edge:
             break
         best = float(dz)
     return best
 
 
 def plan_designs(hood):
-    """[{name, kind, variant, notches: [(site_key, dz, half_length)]}] and the sites."""
+    """[{name, kind, variant, cut_line, notches: [(site_key, dz, half_length)]}] and the sites."""
     sites = {}
     for key, s in SITES:
         s = dict(s, key=key)
@@ -323,11 +360,37 @@ def plan_designs(hood):
             designs.append(dict(name="N%d" % n, kind="single", variant=var,
                                 notches=[(key, dz if dz is not None else max_raise(hood, s, hl), hl)]))
             n += 1
-    for name, keys in COMBINATIONS:
+    line_of = {keys: label for label, keys in CUT_LINES}
+    for name, keys in COMBINATIONS:   # N4, N50, N51: the standard variant of three cut lines
         if name is None:
             name = "N%d" % n
             n += 1
-        designs.append(dict(name=name, kind="combo", variant="C", notches=[(k, standard[k], 60.0) for k in keys]))
+        designs.append(dict(name=name, kind="cutline", variant="S", cut_line=line_of[keys],
+                            notches=[(k, standard[k], 60.0) for k in keys]))
+
+    # N52-N72: creases (cut lines and single beams), the other cut-line variants
+    crease = {}
+    for label, keys in CUT_LINES:
+        for k in keys:
+            crease[k] = max_raise(hood, sites[k], CREASE_HALF_LENGTH, CHECK_MIN_EDGE_MM, CREASE_DZ)
+    have_s = {d["cut_line"] for d in designs if d["kind"] == "cutline"}
+    new = []
+    for label, keys in CUT_LINES:
+        new.append(("cutline", "K", label, [(k, crease[k], CREASE_HALF_LENGTH) for k in keys]))
+    for label, keys in CUT_LINES:
+        new.append(("cutline", "KH", label, [(k, round(crease[k] / 2 * 2) / 2, CREASE_HALF_LENGTH) for k in keys]))
+    for label, keys in CUT_LINES:
+        if label not in have_s:
+            new.append(("cutline", "S", label, [(k, standard[k], 60.0) for k in keys]))
+    for label, keys in CUT_LINES:
+        new.append(("cutline", "D", label, [(k, -20.0, 60.0) for k in keys]))
+    for k in SINGLE_CREASES:
+        new.append(("single", "K", "", [(k, crease[k], CREASE_HALF_LENGTH)]))
+    for kind, var, label, notches in new:
+        designs.append(dict(name="N%d" % n, kind=kind, variant=var, cut_line=label, notches=notches))
+        n += 1
+    for d in designs:
+        d.setdefault("cut_line", "")
     designs.sort(key=lambda d: int(d["name"][1:]))
     return designs, sites
 
@@ -478,6 +541,19 @@ def run_rows(designs, locations, distances, plan, shifts):
             for loc in plan[d["name"]][role]:
                 if (d["name"], loc) not in done:
                     entries.append((d["name"], loc, role, False))
+    # solve order: pilot, D6, then the designs by SOLVE_PRIORITY, each design's runs together
+    by_name = {d["name"]: d for d in designs}
+
+    def rank(k):
+        name, _, _, pilot = entries[k]
+        if pilot:
+            return (0, 0, k)
+        if name == BASE_DESIGN:
+            return (1, 0, k)
+        d = by_name[name]
+        return (2, SOLVE_PRIORITY.index((d["kind"], d["variant"])), k)
+    solve_order = {k: i for i, k in enumerate(sorted(range(len(entries)), key=rank), start=1)}
+
     rows = []
     for run, (name, loc, role, pilot) in enumerate(entries, start=1):
         l = locations[idx[loc]]
@@ -487,7 +563,7 @@ def run_rows(designs, locations, distances, plan, shifts):
                          x_mm="%.4f" % l["x"], y_mm="%.4f" % l["y"], dist_to_edit_mm=dist,
                          headform_dx_mm="%.6f" % dx, headform_dy_mm="%.6f" % dy, headform_dz_mm="%.6f" % dz,
                          sphere_pen_mm="%.4f" % pen, contact_clearance_mm="%.4f" % (-pen - CONTACT_OFFSET_MM),
-                         time_increment_s="%r" % FIXED_DT))
+                         time_increment_s="%r" % FIXED_DT, solve_order=solve_order[run - 1]))
     return rows
 
 
@@ -522,7 +598,8 @@ def main():
                                  mirror=int(s["mirror"])))
         r = results[d["name"]]
         design_rows.append(dict(design=d["name"], kind=d["kind"], variant=d["variant"],
-                                variant_name=VARIANT_NAMES[d["variant"]], description=describe(sites, d["notches"]),
+                                variant_name=VARIANT_NAMES[d["variant"]], cut_line=d["cut_line"],
+                                description=describe(sites, d["notches"]),
                                 n_nodes_moved=r["n_nodes"], dz_min_mm="%.2f" % r["dz_min"], dz_max_mm="%.2f" % r["dz_max"],
                                 min_edge_mm="%.3f" % r["min_edge"], fastener_mm="%.1f" % r["fastener_mm"],
                                 skin_min_gap_mm="%.2f" % r["skin_min_gap"],

@@ -1,52 +1,73 @@
-design,kind,variant,variant_name,description,n_nodes_moved,dz_min_mm,dz_max_mm,min_edge_mm,fastener_mm,skin_min_gap_mm,near,twin,far
-N1,single,S,standard,"diagonal beams at x = 30: 12.5 mm shallower, +-60 mm",211,0.01,12.50,5.295,170.1,8.19,105 9 116 58 120 111 20 55 103 102 37 24 106 43 115 101,40 137,132 42
-N2,single,D,deeper beam,"diagonal beams at x = 30: 20 mm deeper, +-60 mm",212,-20.00,-0.01,8.595,170.1,12.16,105 9 116 58 120 111 20 55 103 102 37 24 106 43 115 101,40 137,140 12
-N3,single,S,standard,"horizontal centre beam at x = 30: 12.5 mm shallower, +-60 mm",105,0.01,12.50,5.362,194.0,7.77,141 133 106 37 134 142 35 115 116 58 62 45 20 102 91 131,139 53,111 135
-N4,combo,C,combination,"diagonal beams at x = 30: 12.5 mm shallower, +-60 mm; horizontal centre beam at x = 30: 12.5 mm shallower, +-60 mm",316,0.01,12.50,5.295,170.1,7.77,141 133 105 9 116 58 106 37 120 134 111 142 20 55 103 102,40 137,44 52
-N5,single,S,standard,"diagonal beams at x = -60: 10 mm shallower, +-60 mm",215,0.01,10.00,5.279,87.5,8.31,20 116 105 120 115 58 43 128 37 9 111 24 106 131 124 126,121 61,3 62
-N6,single,S,standard,"vertical cross beam at y = 330: 14 mm shallower, +-60 mm",215,0.01,14.00,5.331,260.9,8.99,16 91 102 84 73 82 35 103 36 62 140 134 58 44 22 69,92 28,24 66
-N7,single,S,standard,"diagonal beams at x = 470: 15 mm shallower, +-60 mm",250,0.01,15.00,5.310,73.0,8.50,7 85 48 76 96 66 36 79 22 59 71 39 25 84 49 27,8 80,35 1
-N8,single,S,standard,"diagonal beams at x = -130: 7 mm shallower, +-60 mm",212,0.01,6.99,5.282,23.0,8.50,20 128 120 116 115 43 131 105 37 60 126 24 13 58 124 142,121 17,84 118
-N9,single,H,half raise,"diagonal beams at x = -130: 10 mm deeper, +-60 mm",214,-9.98,-0.01,5.427,23.0,8.77,20 128 120 116 115 43 131 105 37 60 126 24 13 58 124 142,121 17,91 104
-N10,single,D,deeper beam,"diagonal beams at x = -130: 20 mm deeper, +-60 mm",216,-19.96,-0.01,5.356,23.0,8.92,20 128 120 116 115 131 43 105 37 60 126 24 13 58 124 142,121 17,107 134
-N11,single,L,length,"diagonal beams at x = -130: 7 mm shallower, +-35 mm",121,0.01,6.98,5.291,40.3,9.05,20 128 120 115 116 43 131 37 105 60 126 24 124 142 13 58,121 17,16 33
-N12,single,H,half raise,"diagonal beams at x = -60: 5 mm shallower, +-60 mm",213,0.01,5.00,6.741,87.5,10.00,20 116 105 120 58 115 43 128 37 9 111 24 131 106 124 126,121 61,49 73
-N13,single,D,deeper beam,"diagonal beams at x = -60: 10 mm deeper, +-60 mm",215,-10.00,-0.01,7.440,87.5,11.17,20 116 105 120 115 58 43 128 37 9 111 24 106 131 124 126,121 61,82 95
-N14,single,L,length,"diagonal beams at x = -60: 10 mm shallower, +-90 mm",320,0.01,10.00,5.253,62.5,8.30,20 105 116 120 128 58 115 43 9 37 111 131 24 106 55 126,121 40,36 96
-N15,single,H,half raise,"diagonal beams at x = 30: 6 mm shallower, +-60 mm",210,0.01,6.00,7.170,170.1,10.33,105 9 116 58 120 111 20 55 102 103 37 24 106 115 43 101,40 137,85 13
-N16,single,L,length,"diagonal beams at x = 30: 12.5 mm shallower, +-35 mm",127,0.01,12.50,5.262,192.4,8.26,105 9 116 58 120 111 55 20 102 103 24 37 106 35 115 43,40 137,69 60
-N17,single,S,standard,"diagonal beams at x = 100: 14 mm shallower, +-60 mm",215,0.01,14.00,5.311,235.4,7.96,9 103 105 58 55 102 116 111 101 84 120 16 106 24 107 37,137 138,7 45
-N18,single,H,half raise,"diagonal beams at x = 100: 7 mm shallower, +-60 mm",212,0.01,7.00,6.978,235.4,10.17,9 103 105 58 55 102 116 111 101 84 120 16 106 24 107 37,137 138,98 142
-N19,single,D,deeper beam,"diagonal beams at x = 100: 10 mm deeper, +-60 mm",214,-10.00,-0.01,6.978,235.4,12.39,9 103 105 58 55 102 116 111 101 84 120 16 106 24 107 37,137 138,48 131
-N20,single,L,length,"diagonal beams at x = 100: 14 mm shallower, +-35 mm",124,0.01,13.99,5.296,256.4,7.99,9 103 58 105 55 102 111 116 101 84 106 120 16 24 33 107,137 138,27 126
-N21,single,S,standard,"diagonal beams at x = 400: 12.5 mm shallower, +-60 mm",245,0.02,12.47,5.273,135.9,9.02,85 22 7 48 36 96 84 79 49 101 76 66 71 82 59 27,80 93,105 63
-N22,single,H,half raise,"diagonal beams at x = 400: 6 mm shallower, +-60 mm",245,0.01,5.99,6.550,135.9,10.64,85 22 7 48 36 96 84 79 49 101 76 66 71 82 59 27,80 93,112 26
-N23,single,D,deeper beam,"diagonal beams at x = 400: 20 mm deeper, +-60 mm",245,-19.95,-0.03,8.481,135.9,11.77,85 22 48 7 36 96 84 79 49 76 101 71 66 82 59 27,80 93,106 68
-N24,single,L,length,"diagonal beams at x = 400: 12.5 mm shallower, +-35 mm",138,0.01,12.41,5.264,158.3,9.05,85 22 36 96 7 48 79 84 49 101 76 82 71 27 66 59,80 93,58 74
-N25,single,H,half raise,"diagonal beams at x = 470: 7.5 mm shallower, +-60 mm",249,0.01,7.50,5.829,73.0,10.40,7 85 48 76 96 66 36 79 22 71 59 39 25 84 49 27,8 80,9 102
-N26,single,D,deeper beam,"diagonal beams at x = 470: 10 mm deeper, +-60 mm",250,-10.00,-0.01,6.485,73.0,11.80,7 85 48 76 96 66 36 79 22 59 71 39 25 84 49 27,8 80,55 1
-N27,single,L,length,"diagonal beams at x = 470: 13.5 mm shallower, +-90 mm",377,0.01,13.50,5.339,47.3,8.85,85 7 76 48 66 96 36 22 79 25 39 59 71 84 49 27,80 8,58 26
-N28,single,S,standard,"horizontal centre beam at x = -120: 11 mm shallower, +-60 mm",111,0.01,10.99,5.392,33.0,8.00,142 133 45 115 131 37 132 141 13 106 20 128 116 60 58 134,114 130,124 103
-N29,single,H,half raise,"horizontal centre beam at x = -120: 5.5 mm shallower, +-60 mm",110,0.01,5.49,6.933,33.0,9.82,142 133 45 115 37 131 141 132 13 106 20 128 116 60 58 134,114 53,4 140
-N30,single,D,deeper beam,"horizontal centre beam at x = -120: 20 mm deeper, +-60 mm",111,-19.98,-0.01,8.563,33.0,11.74,142 133 45 115 131 37 132 141 13 106 20 128 116 60 58 134,114 130,24 62
-N31,single,L,length,"horizontal centre beam at x = -120: 11 mm shallower, +-35 mm",64,0.01,10.96,5.337,63.0,8.03,142 133 45 115 131 37 132 141 20 13 106 128 116 60 58 134,114 130,124 91
-N32,single,S,standard,"horizontal centre beam at x = -40: 12 mm shallower, +-60 mm",107,0.01,11.80,5.287,123.5,7.81,133 142 141 37 115 106 45 131 134 116 20 35 58 128 132 13,53 114,101 126
-N33,single,H,half raise,"horizontal centre beam at x = -40: 6 mm shallower, +-60 mm",105,0.01,5.90,6.923,123.5,9.78,133 142 141 37 115 106 45 131 134 116 20 35 58 128 132 13,53 114,73 4
-N34,single,D,deeper beam,"horizontal centre beam at x = -40: 10 mm deeper, +-60 mm",106,-9.83,-0.01,8.170,123.4,11.65,133 142 141 37 115 106 45 131 134 116 20 35 58 128 132 13,53 114,111 82
-N35,single,L,length,"horizontal centre beam at x = -40: 12 mm shallower, +-90 mm",159,0.01,11.84,5.303,93.2,7.80,133 142 141 37 115 106 45 131 134 35 116 20 58 132 128 13,53 114,84 135
-N36,single,H,half raise,"horizontal centre beam at x = 30: 6 mm shallower, +-60 mm",104,0.01,6.00,7.273,194.0,9.98,141 133 106 37 134 142 35 115 116 58 62 20 45 102 131 91,139 53,43 22
-N37,single,D,deeper beam,"horizontal centre beam at x = 30: 20 mm deeper, +-60 mm",105,-20.00,-0.01,8.170,193.9,11.82,141 133 106 37 134 142 35 115 116 58 62 45 20 102 91 131,139 53,55 44
-N38,single,L,length,"horizontal centre beam at x = 30: 12.5 mm shallower, +-35 mm",63,0.02,12.50,5.353,217.8,7.77,141 133 106 37 134 142 35 115 116 58 62 20 102 45 91 131,139 53,60 36
-N39,single,S,standard,"horizontal centre beam at x = 100: 13.5 mm shallower, +-60 mm",102,0.01,13.50,5.354,262.2,7.72,141 134 106 133 35 37 62 91 142 58 102 115 116 140 16 73,139 90,120 79
-N40,single,H,half raise,"horizontal centre beam at x = 100: 7 mm shallower, +-60 mm",101,0.01,7.00,7.241,262.2,9.90,141 134 106 133 35 37 62 91 142 58 102 115 116 16 140 73,139 90,128 68
-N41,single,D,deeper beam,"horizontal centre beam at x = 100: 10 mm deeper, +-60 mm",102,-10.00,-0.01,9.137,262.2,12.20,141 134 106 133 35 37 62 91 142 58 102 115 116 140 16 73,139 90,69 132
-N42,single,L,length,"horizontal centre beam at x = 100: 13.5 mm shallower, +-90 mm",156,0.01,13.50,5.361,232.2,7.71,141 134 133 35 106 37 62 91 142 115 58 102 116 140 16 73,90 139,14 13
-N43,single,S,standard,"horizontal centre beam at x = 450: 14.5 mm shallower, +-60 mm",106,0.01,14.43,5.262,57.4,7.49,135 140 26 44 73 68 62 91 69 82 14 16 134 35 79 36,46 81,141 37
-N44,single,H,half raise,"horizontal centre beam at x = 450: 7 mm shallower, +-60 mm",104,0.01,6.96,7.464,57.4,9.98,135 140 26 44 73 68 62 91 69 82 14 16 134 35 79 36,46 81,133 66
-N45,single,D,deeper beam,"horizontal centre beam at x = 450: 20 mm deeper, +-60 mm",106,-19.90,-0.01,9.344,57.4,12.49,135 140 26 44 73 68 62 91 69 82 14 16 134 35 79 36,46 81,85 133
-N46,single,L,length,"horizontal centre beam at x = 450: 14.5 mm shallower, +-35 mm",63,0.22,14.41,5.271,77.3,7.49,135 140 44 26 73 68 62 91 69 82 14 16 134 35 79 36,46 81,7 141
-N47,single,H,half raise,"vertical cross beam at y = 330: 7 mm shallower, +-60 mm",214,0.02,7.00,6.719,260.9,10.79,16 91 102 82 73 84 35 103 36 62 140 134 58 44 69 9,92 28,115 76
-N48,single,D,deeper beam,"vertical cross beam at y = 330: 10 mm deeper, +-60 mm",214,-10.00,-0.03,8.211,260.9,11.93,16 91 102 73 82 84 35 103 36 62 140 134 58 44 69 9,92 28,20 71
-N49,single,L,length,"vertical cross beam at y = 330: 13 mm shallower, +-90 mm",321,0.02,13.00,5.255,255.4,8.98,16 91 84 73 102 82 35 103 62 36 140 134 22 101 44 9,92 28,39 25
-N50,combo,C,combination,"diagonal beams at x = 100: 14 mm shallower, +-60 mm; horizontal centre beam at x = 100: 13.5 mm shallower, +-60 mm",317,0.01,14.00,5.311,235.4,7.72,141 9 134 103 105 58 55 106 133 35 102 116 111 101 37 62,137 138,59 87
-N51,combo,C,combination,"diagonal beams at x = -130: 7 mm shallower, +-60 mm; horizontal centre beam at x = -120: 11 mm shallower, +-60 mm",323,0.01,10.99,5.282,23.0,8.00,142 20 128 133 45 120 116 115 43 131 37 105 60 126 132 141,121 17,107 16
+design,kind,variant,variant_name,cut_line,description,n_nodes_moved,dz_min_mm,dz_max_mm,min_edge_mm,fastener_mm,skin_min_gap_mm,near,twin,far
+N1,single,S,standard,,"diagonal beams at x = 30: 12.5 mm shallower, +-60 mm",211,0.01,12.50,5.295,170.1,8.19,105 9 116 58 120 111 20 55 103 102 37 24 106 43 115 101,40 137,132 42
+N2,single,D,deeper beam,,"diagonal beams at x = 30: 20 mm deeper, +-60 mm",212,-20.00,-0.01,8.595,170.1,12.16,105 9 116 58 120 111 20 55 103 102 37 24 106 43 115 101,40 137,140 12
+N3,single,S,standard,,"horizontal centre beam at x = 30: 12.5 mm shallower, +-60 mm",105,0.01,12.50,5.362,194.0,7.77,141 133 106 37 134 142 35 115 116 58 62 45 20 102 91 131,139 53,111 135
+N4,cutline,S,standard,x=30,"diagonal beams at x = 30: 12.5 mm shallower, +-60 mm; horizontal centre beam at x = 30: 12.5 mm shallower, +-60 mm",316,0.01,12.50,5.295,170.1,7.77,141 133 105 9 116 58 106 37 120 134 111 142 20 55 103 102,40 137,44 52
+N5,single,S,standard,,"diagonal beams at x = -60: 10 mm shallower, +-60 mm",215,0.01,10.00,5.279,87.5,8.31,20 116 105 120 115 58 43 128 37 9 111 24 106 131 124 126,121 61,3 62
+N6,single,S,standard,,"vertical cross beam at y = 330: 14 mm shallower, +-60 mm",215,0.01,14.00,5.331,260.9,8.99,16 91 102 84 73 82 35 103 36 62 140 134 58 44 22 69,92 28,24 66
+N7,single,S,standard,,"diagonal beams at x = 470: 15 mm shallower, +-60 mm",250,0.01,15.00,5.310,73.0,8.50,7 85 48 76 96 66 36 79 22 59 71 39 25 84 49 27,8 80,35 1
+N8,single,S,standard,,"diagonal beams at x = -130: 7 mm shallower, +-60 mm",212,0.01,6.99,5.282,23.0,8.50,20 128 120 116 115 43 131 105 37 60 126 24 13 58 124 142,121 17,84 118
+N9,single,H,half raise,,"diagonal beams at x = -130: 10 mm deeper, +-60 mm",214,-9.98,-0.01,5.427,23.0,8.77,20 128 120 116 115 43 131 105 37 60 126 24 13 58 124 142,121 17,91 104
+N10,single,D,deeper beam,,"diagonal beams at x = -130: 20 mm deeper, +-60 mm",216,-19.96,-0.01,5.356,23.0,8.92,20 128 120 116 115 131 43 105 37 60 126 24 13 58 124 142,121 17,107 134
+N11,single,L,length,,"diagonal beams at x = -130: 7 mm shallower, +-35 mm",121,0.01,6.98,5.291,40.3,9.05,20 128 120 115 116 43 131 37 105 60 126 24 124 142 13 58,121 17,16 33
+N12,single,H,half raise,,"diagonal beams at x = -60: 5 mm shallower, +-60 mm",213,0.01,5.00,6.741,87.5,10.00,20 116 105 120 58 115 43 128 37 9 111 24 131 106 124 126,121 61,49 73
+N13,single,D,deeper beam,,"diagonal beams at x = -60: 10 mm deeper, +-60 mm",215,-10.00,-0.01,7.440,87.5,11.17,20 116 105 120 115 58 43 128 37 9 111 24 106 131 124 126,121 61,82 95
+N14,single,L,length,,"diagonal beams at x = -60: 10 mm shallower, +-90 mm",320,0.01,10.00,5.253,62.5,8.30,20 105 116 120 128 58 115 43 9 37 111 131 24 106 55 126,121 40,36 96
+N15,single,H,half raise,,"diagonal beams at x = 30: 6 mm shallower, +-60 mm",210,0.01,6.00,7.170,170.1,10.33,105 9 116 58 120 111 20 55 102 103 37 24 106 115 43 101,40 137,85 13
+N16,single,L,length,,"diagonal beams at x = 30: 12.5 mm shallower, +-35 mm",127,0.01,12.50,5.262,192.4,8.26,105 9 116 58 120 111 55 20 102 103 24 37 106 35 115 43,40 137,69 60
+N17,single,S,standard,,"diagonal beams at x = 100: 14 mm shallower, +-60 mm",215,0.01,14.00,5.311,235.4,7.96,9 103 105 58 55 102 116 111 101 84 120 16 106 24 107 37,137 138,7 45
+N18,single,H,half raise,,"diagonal beams at x = 100: 7 mm shallower, +-60 mm",212,0.01,7.00,6.978,235.4,10.17,9 103 105 58 55 102 116 111 101 84 120 16 106 24 107 37,137 138,98 142
+N19,single,D,deeper beam,,"diagonal beams at x = 100: 10 mm deeper, +-60 mm",214,-10.00,-0.01,6.978,235.4,12.39,9 103 105 58 55 102 116 111 101 84 120 16 106 24 107 37,137 138,48 131
+N20,single,L,length,,"diagonal beams at x = 100: 14 mm shallower, +-35 mm",124,0.01,13.99,5.296,256.4,7.99,9 103 58 105 55 102 111 116 101 84 106 120 16 24 33 107,137 138,27 126
+N21,single,S,standard,,"diagonal beams at x = 400: 12.5 mm shallower, +-60 mm",245,0.02,12.47,5.273,135.9,9.02,85 22 7 48 36 96 84 79 49 101 76 66 71 82 59 27,80 93,105 63
+N22,single,H,half raise,,"diagonal beams at x = 400: 6 mm shallower, +-60 mm",245,0.01,5.99,6.550,135.9,10.64,85 22 7 48 36 96 84 79 49 101 76 66 71 82 59 27,80 93,112 26
+N23,single,D,deeper beam,,"diagonal beams at x = 400: 20 mm deeper, +-60 mm",245,-19.95,-0.03,8.481,135.9,11.77,85 22 48 7 36 96 84 79 49 76 101 71 66 82 59 27,80 93,106 68
+N24,single,L,length,,"diagonal beams at x = 400: 12.5 mm shallower, +-35 mm",138,0.01,12.41,5.264,158.3,9.05,85 22 36 96 7 48 79 84 49 101 76 82 71 27 66 59,80 93,58 74
+N25,single,H,half raise,,"diagonal beams at x = 470: 7.5 mm shallower, +-60 mm",249,0.01,7.50,5.829,73.0,10.40,7 85 48 76 96 66 36 79 22 71 59 39 25 84 49 27,8 80,9 102
+N26,single,D,deeper beam,,"diagonal beams at x = 470: 10 mm deeper, +-60 mm",250,-10.00,-0.01,6.485,73.0,11.80,7 85 48 76 96 66 36 79 22 59 71 39 25 84 49 27,8 80,55 1
+N27,single,L,length,,"diagonal beams at x = 470: 13.5 mm shallower, +-90 mm",377,0.01,13.50,5.339,47.3,8.85,85 7 76 48 66 96 36 22 79 25 39 59 71 84 49 27,80 8,58 26
+N28,single,S,standard,,"horizontal centre beam at x = -120: 11 mm shallower, +-60 mm",111,0.01,10.99,5.392,33.0,8.00,142 133 45 115 131 37 132 141 13 106 20 128 116 60 58 134,114 130,124 103
+N29,single,H,half raise,,"horizontal centre beam at x = -120: 5.5 mm shallower, +-60 mm",110,0.01,5.49,6.933,33.0,9.82,142 133 45 115 37 131 141 132 13 106 20 128 116 60 58 134,114 53,4 140
+N30,single,D,deeper beam,,"horizontal centre beam at x = -120: 20 mm deeper, +-60 mm",111,-19.98,-0.01,8.563,33.0,11.74,142 133 45 115 131 37 132 141 13 106 20 128 116 60 58 134,114 130,24 62
+N31,single,L,length,,"horizontal centre beam at x = -120: 11 mm shallower, +-35 mm",64,0.01,10.96,5.337,63.0,8.03,142 133 45 115 131 37 132 141 20 13 106 128 116 60 58 134,114 130,124 91
+N32,single,S,standard,,"horizontal centre beam at x = -40: 12 mm shallower, +-60 mm",107,0.01,11.80,5.287,123.5,7.81,133 142 141 37 115 106 45 131 134 116 20 35 58 128 132 13,53 114,101 126
+N33,single,H,half raise,,"horizontal centre beam at x = -40: 6 mm shallower, +-60 mm",105,0.01,5.90,6.923,123.5,9.78,133 142 141 37 115 106 45 131 134 116 20 35 58 128 132 13,53 114,73 4
+N34,single,D,deeper beam,,"horizontal centre beam at x = -40: 10 mm deeper, +-60 mm",106,-9.83,-0.01,8.170,123.4,11.65,133 142 141 37 115 106 45 131 134 116 20 35 58 128 132 13,53 114,111 82
+N35,single,L,length,,"horizontal centre beam at x = -40: 12 mm shallower, +-90 mm",159,0.01,11.84,5.303,93.2,7.80,133 142 141 37 115 106 45 131 134 35 116 20 58 132 128 13,53 114,84 135
+N36,single,H,half raise,,"horizontal centre beam at x = 30: 6 mm shallower, +-60 mm",104,0.01,6.00,7.273,194.0,9.98,141 133 106 37 134 142 35 115 116 58 62 20 45 102 131 91,139 53,43 22
+N37,single,D,deeper beam,,"horizontal centre beam at x = 30: 20 mm deeper, +-60 mm",105,-20.00,-0.01,8.170,193.9,11.82,141 133 106 37 134 142 35 115 116 58 62 45 20 102 91 131,139 53,55 44
+N38,single,L,length,,"horizontal centre beam at x = 30: 12.5 mm shallower, +-35 mm",63,0.02,12.50,5.353,217.8,7.77,141 133 106 37 134 142 35 115 116 58 62 20 102 45 91 131,139 53,60 36
+N39,single,S,standard,,"horizontal centre beam at x = 100: 13.5 mm shallower, +-60 mm",102,0.01,13.50,5.354,262.2,7.72,141 134 106 133 35 37 62 91 142 58 102 115 116 140 16 73,139 90,120 79
+N40,single,H,half raise,,"horizontal centre beam at x = 100: 7 mm shallower, +-60 mm",101,0.01,7.00,7.241,262.2,9.90,141 134 106 133 35 37 62 91 142 58 102 115 116 16 140 73,139 90,128 68
+N41,single,D,deeper beam,,"horizontal centre beam at x = 100: 10 mm deeper, +-60 mm",102,-10.00,-0.01,9.137,262.2,12.20,141 134 106 133 35 37 62 91 142 58 102 115 116 140 16 73,139 90,69 132
+N42,single,L,length,,"horizontal centre beam at x = 100: 13.5 mm shallower, +-90 mm",156,0.01,13.50,5.361,232.2,7.71,141 134 133 35 106 37 62 91 142 115 58 102 116 140 16 73,90 139,14 13
+N43,single,S,standard,,"horizontal centre beam at x = 450: 14.5 mm shallower, +-60 mm",106,0.01,14.43,5.262,57.4,7.49,135 140 26 44 73 68 62 91 69 82 14 16 134 35 79 36,46 81,141 37
+N44,single,H,half raise,,"horizontal centre beam at x = 450: 7 mm shallower, +-60 mm",104,0.01,6.96,7.464,57.4,9.98,135 140 26 44 73 68 62 91 69 82 14 16 134 35 79 36,46 81,133 66
+N45,single,D,deeper beam,,"horizontal centre beam at x = 450: 20 mm deeper, +-60 mm",106,-19.90,-0.01,9.344,57.4,12.49,135 140 26 44 73 68 62 91 69 82 14 16 134 35 79 36,46 81,85 133
+N46,single,L,length,,"horizontal centre beam at x = 450: 14.5 mm shallower, +-35 mm",63,0.22,14.41,5.271,77.3,7.49,135 140 44 26 73 68 62 91 69 82 14 16 134 35 79 36,46 81,7 141
+N47,single,H,half raise,,"vertical cross beam at y = 330: 7 mm shallower, +-60 mm",214,0.02,7.00,6.719,260.9,10.79,16 91 102 82 73 84 35 103 36 62 140 134 58 44 69 9,92 28,115 76
+N48,single,D,deeper beam,,"vertical cross beam at y = 330: 10 mm deeper, +-60 mm",214,-10.00,-0.03,8.211,260.9,11.93,16 91 102 73 82 84 35 103 36 62 140 134 58 44 69 9,92 28,20 71
+N49,single,L,length,,"vertical cross beam at y = 330: 13 mm shallower, +-90 mm",321,0.02,13.00,5.255,255.4,8.98,16 91 84 73 102 82 35 103 62 36 140 134 22 101 44 9,92 28,39 25
+N50,cutline,S,standard,x=100,"diagonal beams at x = 100: 14 mm shallower, +-60 mm; horizontal centre beam at x = 100: 13.5 mm shallower, +-60 mm",317,0.01,14.00,5.311,235.4,7.72,141 9 134 103 105 58 55 106 133 35 102 116 111 101 37 62,137 138,59 87
+N51,cutline,S,standard,x=-125,"diagonal beams at x = -130: 7 mm shallower, +-60 mm; horizontal centre beam at x = -120: 11 mm shallower, +-60 mm",323,0.01,10.99,5.282,23.0,8.00,142 20 128 133 45 120 116 115 43 131 37 105 60 126 132 141,121 17,107 16
+N52,cutline,K,crease,x=-125,"diagonal beams at x = -130: 17 mm shallower, +-30 mm; horizontal centre beam at x = -120: 20 mm shallower, +-30 mm",159,0.01,19.91,3.041,43.9,5.11,142 20 128 120 133 115 45 116 43 131 37 105 60 126 141 24,121 17,118 103
+N53,cutline,K,crease,x=-50,"diagonal beams at x = -60: 19.5 mm shallower, +-30 mm; horizontal centre beam at x = -40: 20 mm shallower, +-30 mm",161,0.02,19.51,3.030,113.7,5.13,133 116 20 120 105 142 37 141 115 58 43 106 128 24 9 111,61 121,22 12
+N54,cutline,K,crease,x=30,"diagonal beams at x = 30: 20 mm shallower, +-30 mm; horizontal centre beam at x = 30: 20 mm shallower, +-30 mm",158,0.01,20.00,3.482,196.4,5.21,105 141 133 116 9 58 106 37 120 111 134 55 102 142 20 103,40 61,95 52
+N55,cutline,K,crease,x=100,"diagonal beams at x = 100: 20 mm shallower, +-30 mm; horizontal centre beam at x = 100: 20 mm shallower, +-30 mm",160,0.01,20.00,3.752,260.4,5.54,9 141 134 58 105 103 55 106 35 102 111 133 116 101 37 62,137 136,98 131
+N56,cutline,K,crease,x=460,"diagonal beams at x = 470: 20 mm shallower, +-30 mm; horizontal centre beam at x = 450: 20 mm shallower, +-30 mm",180,0.01,19.99,3.864,87.1,5.66,135 7 48 85 140 44 76 26 73 96 79 66 36 68 22 59,8 47,9 63
+N57,cutline,KH,half crease,x=-125,"diagonal beams at x = -130: 8.5 mm shallower, +-30 mm; horizontal centre beam at x = -120: 10 mm shallower, +-30 mm",159,0.01,9.95,4.934,43.9,8.37,142 20 128 120 115 133 45 116 43 131 37 105 60 126 24 132,121 17,101 104
+N58,cutline,KH,half crease,x=-50,"diagonal beams at x = -60: 10 mm shallower, +-30 mm; horizontal centre beam at x = -40: 10 mm shallower, +-30 mm",161,0.01,10.00,5.301,113.7,8.34,133 116 20 120 142 105 37 141 115 58 43 106 128 24 9 45,61 121,49 3
+N59,cutline,KH,half crease,x=30,"diagonal beams at x = 30: 10 mm shallower, +-30 mm; horizontal centre beam at x = 30: 10 mm shallower, +-30 mm",156,0.01,10.00,5.958,196.4,8.62,105 141 133 116 9 58 106 37 120 111 134 55 142 20 102 24,40 61,96 79
+N60,cutline,KH,half crease,x=100,"diagonal beams at x = 100: 10 mm shallower, +-30 mm; horizontal centre beam at x = 100: 10 mm shallower, +-30 mm",158,0.01,10.00,6.334,260.4,8.90,9 141 134 58 103 105 55 106 35 102 111 133 116 101 37 62,137 136,27 48
+N61,cutline,KH,half crease,x=460,"diagonal beams at x = 470: 10 mm shallower, +-30 mm; horizontal centre beam at x = 450: 10 mm shallower, +-30 mm",180,0.01,10.00,5.666,87.2,8.98,135 7 48 85 140 44 76 26 73 96 79 66 36 68 22 71,8 47,33 106
+N62,cutline,S,standard,x=-50,"diagonal beams at x = -60: 10 mm shallower, +-60 mm; horizontal centre beam at x = -40: 12 mm shallower, +-60 mm",322,0.01,11.80,5.279,87.5,7.81,133 20 116 105 142 120 141 37 115 58 43 106 128 9 45 111,121 61,3 140
+N63,cutline,S,standard,x=460,"diagonal beams at x = 470: 15 mm shallower, +-60 mm; horizontal centre beam at x = 450: 14.5 mm shallower, +-60 mm",356,0.01,15.00,5.262,57.4,7.49,135 7 85 140 48 76 26 44 73 96 66 36 79 68 22 62,8 80,37 105
+N64,cutline,D,deeper beam,x=-125,"diagonal beams at x = -130: 20 mm deeper, +-60 mm; horizontal centre beam at x = -120: 20 mm deeper, +-60 mm",327,-19.98,-0.01,5.356,23.0,8.92,142 20 128 133 45 120 116 115 131 43 37 105 60 126 132 141,121 17,84 12
+N65,cutline,D,deeper beam,x=-50,"diagonal beams at x = -60: 20 mm deeper, +-60 mm; horizontal centre beam at x = -40: 20 mm deeper, +-60 mm",322,-20.00,-0.01,7.440,87.5,11.22,133 20 116 142 105 120 141 37 115 58 128 43 106 9 45 111,121 61,82 118
+N66,cutline,D,deeper beam,x=30,"diagonal beams at x = 30: 20 mm deeper, +-60 mm; horizontal centre beam at x = 30: 20 mm deeper, +-60 mm",317,-20.00,-0.01,8.170,170.1,11.82,141 133 105 9 116 58 106 37 120 134 142 111 20 55 103 102,40 137,42 135
+N67,cutline,D,deeper beam,x=100,"diagonal beams at x = 100: 20 mm deeper, +-60 mm; horizontal centre beam at x = 100: 20 mm deeper, +-60 mm",319,-20.00,-0.01,6.978,235.4,12.30,141 9 134 103 105 58 55 106 133 35 102 116 111 101 37 62,137 138,71 14
+N68,cutline,D,deeper beam,x=460,"diagonal beams at x = 470: 20 mm deeper, +-60 mm; horizontal centre beam at x = 450: 20 mm deeper, +-60 mm",359,-20.00,-0.01,7.037,57.4,11.86,135 7 85 140 48 76 26 44 73 96 66 36 79 68 22 62,8 80,112 1
+N69,single,K,crease,,"diagonal beams at x = 30: 20 mm shallower, +-30 mm",104,0.03,20.00,3.482,196.4,5.86,105 116 9 58 120 111 55 102 20 103 24 37 106 35 115 43,40 61,45 27
+N70,single,K,crease,,"horizontal centre beam at x = 30: 20 mm shallower, +-30 mm",54,0.01,19.99,3.559,221.7,5.21,141 133 106 37 134 142 35 115 116 58 20 62 102 45 91 131,139 53,43 44
+N71,single,K,crease,,"diagonal beams at x = 100: 20 mm shallower, +-30 mm",110,0.01,19.98,3.963,260.4,6.13,9 58 105 103 55 102 111 116 101 106 120 84 24 16 33 107,137 136,142 71
+N72,single,K,crease,,"horizontal centre beam at x = 100: 20 mm shallower, +-30 mm",50,0.01,20.00,3.752,291.8,5.54,141 134 106 35 133 37 62 91 58 102 116 142 115 16 140 20,139 90,128 120

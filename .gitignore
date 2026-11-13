@@ -89,3 +89,9 @@ Data/mesh_geometry/
 Data/acceleration_history/*.csv
 Data/acceleration_history/*.png
 Data/acceleration_history/*.svg
+
+# Abaqus input decks (generated on the cluster, ~4.7 MB each)
+*.inp
+Data/HoodImpact_LocalEdits/inp_files/
+Data/HoodImpact_LocalEdits/output_history_acc/
+Data/HoodImpact_LocalEdits/job_logs/

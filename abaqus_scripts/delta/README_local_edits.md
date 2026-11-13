@@ -1,9 +1,25 @@
 # Local-edit dataset on Delta
 
-1162 Abaqus/Explicit solves for learning local design changes:
+1582 Abaqus/Explicit solves for learning local design changes:
 
-- 51 beam-notch designs of hood design 6 (N1–N51), 20 impact locations each = 1020 runs;
+- 72 beam edits of hood design 6 (N1–N72), 20 impact locations each = 1440 runs;
 - design 6 itself ("D6") at all 142 Euro-NCAP locations = 142 runs.
+
+The edits come in two families:
+
+| family | designs | what |
+|---|---|---|
+| single-beam notches | N1–N49 without N4 (48) | one beam (a diagonal pair, the centre beam or the cross beam) made shallower or deeper over ±60 mm: standard, half, deeper, length variants at 12 sites |
+| cut lines | N4, N50–N68 (20) | the centre beam **and** both diagonals edited at about the same x (−125, −50, 30, 100, 460), which cuts every load path across the hood there: standard (±60 mm), crease (20 mm raise over ±30 mm), half crease, deeper |
+| single-beam creases | N69–N72 (4) | the crease on one beam only, at x = 30 and x = 100, to separate the crease from the cut line |
+
+Why the cut lines: the old design 7 raised all three beams by 18–20 mm over ~40 mm at x ≈ 80 and
+changed the clean-start HIC by −15 to −42 % over a wide region. The single-beam notches change it
+by 1–4 %, about the run-to-run noise (1.4 %). Runs 1–1162 (D6 and N1–N51) were planned first and
+keep their numbers; N52–N72 are runs 1163–1582.
+
+**Solve order** (manifest column `solve_order`): pilot, D6, cut-line creases, cut-line standard,
+single-beam creases, half creases, cut-line deeper, then the single-beam notches.
 
 The plan is fixed in `Data/HoodImpact_LocalEdits/`, written by `abaqus_scripts/local_edit_doe.py`:
 
@@ -27,13 +43,15 @@ Each deck is `HoodImpact_31.inp` (design 6) with three kinds of change. Every ot
 3. **The time step.** `*DYNAMIC, EXPLICIT, DIRECT USER CONTROL` with a **fixed 4.5e-7 s increment**
    for every run. The deck's variable mass scaling keeps every element's stable increment at or above
    5e-7 s, so this increment is stable for every design. It also means no two designs can differ by
-   time step, which is what contaminated the delivered near-clone pairs.
+   time step, which is what contaminated the delivered near-clone pairs. Every edited element keeps
+   its edges ≥ 3.0 mm (≥ 5.25 mm for the smooth notches); at the aluminium plate wave speed
+   (5.07 km/s) that is a stable increment ≥ 5.9e-7 s, so mass scaling adds no mass to any edit.
 
-## Which locations each design is run at (all 51 designs: 16 + 2 + 2)
+## Which locations each design is run at (all 72 designs: 16 + 2 + 2)
 
 | role | count | what |
 |---|---|---|
-| near | 16 | the 16 locations nearest the edit on the +y half and the centreline (the 16th lies 115–278 mm away, median 182 mm) |
+| near | 16 | the 16 locations nearest the edit on the +y half and the centreline (the 16th lies 115–278 mm away) |
 | twin | 2 | mirror images (`col_k -> -col_k`) of the two nearest off-centre near locations: checks the symmetry and measures noise where the signal is largest |
 | far | 2 | controls 300–450 mm from the edit, where no change is expected |
 
@@ -57,10 +75,19 @@ cd <Code dir on Delta>
 tar -xzf local_edits_delta.tar.gz
 ```
 
+**Adding designs to a running campaign.** An update tarball (`local_edits_update.tar.gz`, unpacked the same way) holds only the changed scripts and the
+three plan csvs. It can be unpacked while a job runs: the running job keeps its loaded code and run
+list, and the next job writes the missing decks and solves in the new order. Runs already finished
+are never redone.
+
+**Never delete, move or overwrite `hood_local_edits_<jobid>.out` while that job runs** (copying it is
+fine). On the NFS home a deleted log turns into a stale file handle in the running job; job
+23838174 lost 4.5 h that way before the logging was made failure-proof.
+
 ## 1. Pre-flight (login node, 1 minute)
 
 ```bash
-quota -s     # needs ~25 GB free in home: 5.5 GB decks, ~5 GB raw csvs, ~11 GB solver scratch
+quota -s     # needs ~27 GB free in home: 7.5 GB decks, ~7 GB raw csvs, ~11 GB solver scratch
 abaqus licensing lmstat -c 27000@130.126.241.64 -i | head -20   # expiry after today, ABAQUSLM UP
 conda activate hood_impact
 python abaqus_scripts/make_local_edit_decks.py --runs 1-11 --verify 1   # writes and checks the 11 pilot decks
@@ -80,27 +107,37 @@ The job finds its Code directory from the script's own path, so it reads and wri
 `<Code dir>/Data/HoodImpact_LocalEdits` wherever you submit from. That has to be the folder the
 tarball was unpacked in. The job:
 
-1. writes all 1162 decks (about 10 minutes);
+1. writes the decks that are missing (all 1582 take about 15 minutes);
 2. solves the 11 pilot runs (one round of 12 lanes, about 2 h);
 3. runs the pilot gate (`check_local_edits.py --pilot`, see `Data/HoodImpact_LocalEdits/pilot_report.txt`);
-4. solves the rest on 12 single-core lanes (5 FlexNet tokens each, 60 of the 65).
+4. solves the rest in solve order on 12 single-core lanes (5 FlexNet tokens each, 60 of the 65).
 
-**Budget.** A run takes about 2 h on one Delta core: 55.6k increments at ~0.13 s each. 1162 runs on
-12 lanes come to about 195 h of wall time, or about 2,350 core-hours.
+**Budget.** A run takes about 1.75 h on one Delta core (55.6k increments), about 6.6 runs per hour
+on 12 lanes. 1582 runs come to about 240 h of wall time, or about 2,900 core-hours.
 
-**12-hour jobs.** The campaign runs as a chain of 12-h jobs, about 5 rounds of 12 runs each, so
-about 20 jobs. A 2-day job can wait days with reason `(Priority)`: the scheduler can only start it
-where 12 cores stay free for 2 days, while a 12-h job fits into gaps between other jobs (backfill).
-A lane only starts a run that is expected to finish before the job ends, so no solve is cut off
-half-way. For a different length, e.g. `sbatch -t 24:00:00 abaqus_scripts/delta/hood_local_edits.sbatch`;
-the follow-ups keep it.
+**48-hour jobs.** The campaign runs as 48-h jobs (Delta's cpu maximum) of about 300 runs each, so
+about 5–6 jobs. The queue wait turned out about the same for 12-h and 48-h requests (~20 h), so
+fewer, longer jobs finish the campaign sooner. A lane only starts a run that is expected to finish
+before the job ends, so no solve is cut off half-way. For a different length, e.g.
+`sbatch -t 24:00:00 --array=1-12%1 abaqus_scripts/delta/hood_local_edits.sbatch`.
 
-**Follow-up jobs.** Each job queues its own follow-up (`afterany`) as soon as it starts; finished
-runs are never redone. The chain stops when every run is done, after 30 follow-ups, or when a
-whole job finished no run.
+**Follow-up jobs.** Two ways to run the jobs one after another; finished runs are never redone
+either way.
 
-**Right after submitting**, `squeue -u hkazemi` should show the running job and a
-follow-up waiting with reason `(Dependency)`. If the queue is empty a minute after the job started,
+- **Job array (preferred):** `sbatch --array=1-8%1 abaqus_scripts/delta/hood_local_edits.sbatch`.
+  All 8 tasks are eligible from the start and gain queue age while the one before them runs, so
+  each next task starts sooner. The task that finishes the last run, or one that finishes no run,
+  cancels the pending tasks.
+- **Chain:** plain `sbatch abaqus_scripts/delta/hood_local_edits.sbatch`. Each job queues its own
+  follow-up (`afterany`) as soon as it starts, but a follow-up only gains queue age once the job
+  before it has ended. The chain stops when every run is done, after 30 follow-ups, or when a whole
+  job finished no run.
+
+Only one of these jobs may run at a time (two would need 120 of the 65 license tokens): a job that
+finds another one running stops.
+
+**Right after submitting**, `squeue -u hkazemi` shows the array as `<jobid>_[1-8%1]`, pending, and
+later one running task plus the rest pending. If the queue is empty a minute after a task started,
 it stopped at a check; `job_logs/status.txt` says which.
 
 **Tracking.** Everything is written inside `Data/HoodImpact_LocalEdits/`, so downloading that
@@ -116,11 +153,12 @@ folder shows the state:
 On Delta:
 
 ```bash
+python abaqus_scripts/local_edits_progress.py --list   # done runs (never solved again), what is next
 squeue -u hkazemi
 sprio -j <jobid>                              # while pending: why it waits (AGE, FAIRSHARE)
 cat Data/HoodImpact_LocalEdits/job_logs/status.txt
 tail -f hood_local_edits_<jobid>.out         # in the folder you submitted from
-scancel -u hkazemi -n hood_local_edits       # stops the running job and the queued follow-up
+scancel -u hkazemi -n hood_local_edits       # stops the running task and the pending ones
 ```
 
 ## 3. The pilot gate
@@ -139,7 +177,7 @@ It passes only if all four of these hold:
 - the near difference is at least twice the far one.
 
 Under the old settings the far-field difference was as large as the near one; the gate is there so
-that 2,350 core-hours are not spent if the clean settings don't fix that. If it fails, nothing more
+that the campaign's core-hours are not spent if the clean settings don't fix that. If it fails, nothing more
 is solved and `pilot_gate_failed` is written. Read `pilot_report.txt` and decide:
 
 - to ignore it: `sbatch --export=ALL,SKIP_PILOT_GATE=1 abaqus_scripts/delta/hood_local_edits.sbatch`;

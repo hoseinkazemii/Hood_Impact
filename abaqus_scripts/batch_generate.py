@@ -27,6 +27,11 @@ Robustness:
       the runs left over are solved by the next job
     * big solver files (.odb .abq .pac .stt ...) deleted after successful
       extraction; kept: raw acceleration csv, SAE1000 csv, logs
+    * a run that finished and published its csv but got no metrics row (its
+      job died first) is adopted from its raw csv instead of solved again
+    * logging never raises (a stale Slurm .out on NFS once stopped a job), and
+      if the main loop dies the queued runs are cancelled, not started blind
+    * --runs-file: solve the runs in the file's order (the campaign's priority)
 
 Outputs (dataset layout mirrors the delivered 60-sample set):
     <out-dir>/output_history_acc/HoodImpact_<run>_SAE1000_interp1000.csv
@@ -76,15 +81,30 @@ _last_launch = [0.0]
 
 
 class Log(object):
+    """Console + file log that never raises: a log write that fails (e.g. the
+    Slurm .out deleted or replaced from another node on NFS -> ESTALE) must not
+    stop the solves; job 23838174 lost 4.5 h that way."""
+
     def __init__(self, path):
+        self.path = path
         self.f = open(path, "a", buffering=1)
 
     def __call__(self, msg=""):
         stamp = datetime.datetime.now().strftime("%H:%M:%S")
         line = "[%s] %s" % (stamp, msg)
         with log_lock:
-            print(line, flush=True)
-            self.f.write(line + "\n")
+            try:
+                print(line, flush=True)
+            except (OSError, ValueError):
+                pass
+            try:
+                self.f.write(line + "\n")
+            except (OSError, ValueError):
+                try:                       # reopen once (a stale handle stays stale)
+                    self.f = open(self.path, "a", buffering=1)
+                    self.f.write(line + "\n")
+                except (OSError, ValueError):
+                    pass
 
 
 def load_done(metrics_csv):
@@ -192,12 +212,44 @@ def console_tail(console_path, n=5):
         return ""
 
 
+def adopt_finished(run, args, log):
+    """A run that completed and published its result but got no metrics row
+    (its job died before recording it): rebuild the row instead of solving again."""
+    job = "HoodImpact_%d" % run
+    run_dir = os.path.join(args.work_dir, "run_%d" % run)
+    raw_csv = os.path.join(run_dir, "%s_raw_acc.csv" % job)
+    published = os.path.join(args.out_dir, "output_history_acc", "%s_SAE1000_interp1000.csv" % job)
+    if not (sta_completed(os.path.join(run_dir, "%s.sta" % job))
+            and os.path.exists(raw_csv) and os.path.exists(published)):
+        return None
+    try:
+        with postproc_lock:
+            df = pp.process_raw(raw_csv)
+        t = df["Time"].to_numpy(float)
+        g = df["A(in g)"].to_numpy(float)
+        row = {"run": run, "status": "ok", "cpus": args.cpus, "solve_s": "",
+               "n_raw_points": sum(1 for _ in open(raw_csv)) - 1,
+               "peak_g": round(float(g.max()), 4), "hic15": round(pp.compute_hic(t, g), 4),
+               "note": "adopted: finished earlier, not recorded"}
+        out_csv = os.path.join(run_dir, "%s_SAE1000_interp1000.csv" % job)
+        df.to_csv(out_csv, index=False)
+        shutil.copy2(out_csv, published)      # republish from the raw csv (same result)
+    except Exception as e:
+        log("   run %d: could not adopt the earlier result (%s); solving again" % (run, e))
+        return None
+    log("   run %d: adopted the earlier finished result" % run)
+    return row
+
+
 def process_one(run, args, abaqus, log, clock):
     """solve (cpus=1) -> extract -> SAE1000 + HIC -> publish csv -> cleanup"""
     job = "HoodImpact_%d" % run
     inp_path = os.path.join(args.inp_dir, "%s.inp" % job)
     if not os.path.exists(inp_path):
         return {"run": run, "status": "missing_inp", "note": inp_path}
+    adopted = adopt_finished(run, args, log)
+    if adopted:
+        return adopted
     if not clock.fits():
         return {"run": run, "status": "deferred"}
 
@@ -287,7 +339,10 @@ def process_one(run, args, abaqus, log, clock):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--runs", default="1-600")
+    ap.add_argument("--runs", default="1-600", help="run numbers, solved in increasing order")
+    ap.add_argument("--runs-file", default=None,
+                    help="file with one run number per line, solved in that order "
+                         "(replaces --runs)")
     ap.add_argument("--lanes", type=int, default=12,
                     help="concurrent single-core Abaqus jobs (12 x 5 = 60 of "
                          "the 65 license tokens)")
@@ -316,7 +371,13 @@ def main():
     metrics_csv = os.path.join(args.work_dir, "generation_metrics.csv")
 
     abaqus = rhi.find_abaqus(args.abaqus)
-    runs = rhi.parse_runs(args.runs)
+    if args.runs_file:
+        with open(args.runs_file) as f:
+            runs = [int(s) for s in f.read().split()]
+        if len(set(runs)) != len(runs):
+            raise SystemExit("%s lists a run twice" % args.runs_file)
+    else:
+        runs = rhi.parse_runs(args.runs)
     done = load_done(metrics_csv)
     todo = [r for r in runs if r not in done]
     clock = RunClock(args.deadline, metrics_csv)
@@ -336,47 +397,58 @@ def main():
     t_start = time.time()
     n_done = n_ok = n_fail = n_deferred = 0
     with ThreadPoolExecutor(max_workers=args.lanes) as pool:
+        # workers take the runs in this order (the solve order)
         futures = {pool.submit(process_one, run, args, abaqus, log, clock): run
                    for run in todo}
-        for fut in as_completed(futures):
-            run = futures[fut]
-            try:
-                row = fut.result()
-            except Exception as e:
-                row = {"run": run, "status": "crashed", "note": str(e)[:200]}
-            if row["status"] == "deferred":
-                n_deferred += 1
-                continue
-            row["finished_at"] = datetime.datetime.now().isoformat(timespec="seconds")
-            append_metrics(metrics_csv, row)
-            n_done += 1
-
-            if row["status"] == "ok":
-                n_ok += 1
-                clock.add(row["solve_s"])
-                elapsed = time.time() - t_start
-                rate = elapsed / n_done
-                eta = datetime.datetime.now() + datetime.timedelta(
-                    seconds=(len(todo) - n_done) * rate)
-                log("RUN %d ok: solve=%.0fs peak=%.1fg HIC15=%.0f  "
-                    "[%d/%d, ETA ~%s]"
-                    % (run, row.get("solve_s", -1), row["peak_g"],
-                       row["hic15"], n_done, len(todo),
-                       eta.strftime("%m-%d %H:%M")))
-            else:
-                n_fail += 1
-                log("RUN %d FAILED: %s (%s)"
-                    % (run, row["status"], row.get("note", "")))
-
-            if n_done % 20 == 0 or n_done == len(todo):
-                log("MILESTONE %d/%d done (%d ok, %d failed)"
-                    % (n_done, len(todo), n_ok, n_fail))
+        try:
+            for fut in as_completed(futures):
+                run = futures[fut]
+                try:
+                    row = fut.result()
+                except Exception as e:
+                    row = {"run": run, "status": "crashed", "note": str(e)[:200]}
+                if row["status"] == "deferred":
+                    n_deferred += 1
+                    continue
+                row["finished_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+                try:
+                    append_metrics(metrics_csv, row)
+                except OSError as e:
+                    log("WARNING: could not record run %d in %s (%s); the next job adopts it"
+                        % (run, metrics_csv, e))
+                n_done += 1
+                report(log, row, run, n_done, len(todo), t_start, clock)
+                if row["status"] == "ok":
+                    n_ok += 1
+                else:
+                    n_fail += 1
+                if n_done % 20 == 0 or n_done == len(todo):
+                    log("MILESTONE %d/%d done (%d ok, %d failed)"
+                        % (n_done, len(todo), n_ok, n_fail))
+        except BaseException:
+            # never let the queued runs start without anyone recording them
+            for f in futures:
+                f.cancel()
+            raise
 
     if n_deferred:
         log("DEADLINE: %d runs not started (expected %.0f min each, too little "
             "time left); the next job solves them" % (n_deferred, clock.expected_s() / 60))
     log("BATCH COMPLETE: %d ok, %d failed. Metrics -> %s"
         % (n_ok, n_fail, metrics_csv))
+
+
+def report(log, row, run, n_done, n_todo, t_start, clock):
+    if row["status"] == "ok":
+        if row.get("solve_s") not in (None, ""):
+            clock.add(row["solve_s"])
+        rate = (time.time() - t_start) / n_done
+        eta = datetime.datetime.now() + datetime.timedelta(seconds=(n_todo - n_done) * rate)
+        log("RUN %d ok: solve=%ss peak=%.1fg HIC15=%.0f  [%d/%d, ETA ~%s]%s"
+            % (run, row.get("solve_s", "?"), row["peak_g"], row["hic15"], n_done, n_todo,
+               eta.strftime("%m-%d %H:%M"), "  (%s)" % row["note"] if row.get("note") else ""))
+    else:
+        log("RUN %d FAILED: %s (%s)" % (run, row["status"], row.get("note", "")))
 
 
 if __name__ == "__main__":

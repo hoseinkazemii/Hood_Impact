@@ -1,18 +1,21 @@
 #!/bin/bash
-# Local-edit dataset: 51 beam-notch designs of hood design 6 x 20 impact
-# locations each + design 6 itself at all 142 locations = 1162 Abaqus/Explicit
-# solves, every one with a fixed 4.5e-7 s increment and the headform starting
-# 1.0 mm clear of the hood. Plan: Data/HoodImpact_LocalEdits/manifest_local_edits.csv
+# Local-edit dataset: 72 beam edits of hood design 6 x 20 impact locations each
+# + design 6 itself at all 142 locations = 1582 Abaqus/Explicit solves, every
+# one with a fixed 4.5e-7 s increment and the headform starting 1.0 mm clear
+# of the hood. Plan: Data/HoodImpact_LocalEdits/manifest_local_edits.csv
 # (abaqus_scripts/local_edit_doe.py); details in delta/README_local_edits.md.
 #
 # What one submission does:
-#   1. writes the 1162 decks if absent (make_local_edit_decks.py, ~10 min, 5.5 GB)
+#   1. writes the decks that are missing (make_local_edit_decks.py; all 1582
+#      take ~15 min and 7.5 GB, designs added to the plan later only theirs)
 #   2. solves the 11 pilot runs (one round of 12 lanes, ~2 h)
 #   3. pilot gate (check_local_edits.py --pilot): every pilot run finished,
 #      all took the same number of increments, the far control matches design 6
 #      and the near difference stands clearly above it. FAIL stops everything
 #      (and cancels the queued follow-up job); read pilot_report.txt.
-#   4. solves the remaining runs, 12 single-core lanes (5 FlexNet tokens each)
+#   4. solves the remaining runs in the manifest's solve_order (design 6 first,
+#      then the cut-line designs, then the single-beam notches), 12 single-core
+#      lanes (5 FlexNet tokens each)
 #   5. writes qa_report.txt over everything finished so far
 #
 # Tracking: Data/HoodImpact_LocalEdits/job_logs/status.txt gets one line per
@@ -20,10 +23,11 @@
 # Data/HoodImpact_LocalEdits every 10 minutes and when the job ends; finished
 # results appear in Data/HoodImpact_LocalEdits/output_history_acc as they come.
 #
-# Walltime: ~2 h per run on one Delta core (55.6k increments), so the campaign
-# needs ~195 h of wall time on 12 lanes (~2,350 core-hours), done as a chain
-# of 12-h jobs (~5 rounds of 12 runs each, so ~20 jobs). 12-h jobs start much
-# sooner than 2-day ones: the scheduler fits them into gaps (backfill).
+# Walltime: ~1.75 h per run on one Delta core (55.6k increments), ~6.6 runs/h
+# on 12 lanes, so the campaign needs ~240 h of wall time (~2,900 core-hours),
+# done as 48-h jobs (Delta's cpu maximum; ~300 runs each, so ~5-6 jobs). The
+# queue wait was about the same for 12-h and 48-h requests, so fewer, longer
+# jobs finish sooner. 12 cores because the license allows 12 single-core lanes.
 # A lane only starts a run that is expected to finish before the job's end
 # (batch_generate.py --deadline), so no solve is killed half-way; the job
 # queues its own follow-up (afterany) at the start, with the same time limit,
@@ -33,8 +37,16 @@
 #
 # Submit (the Code directory is found from this script's own path, so the
 # current directory does not matter; the Slurm log goes to the current directory):
-#     cd <Code dir> && sbatch abaqus_scripts/delta/hood_local_edits.sbatch
-# A different piece length for the whole chain: sbatch -t 24:00:00 abaqus_scripts/...
+#     cd <Code dir> && sbatch --array=1-8%1 abaqus_scripts/delta/hood_local_edits.sbatch
+# Progress (which runs are done and will not be solved again):
+#     python abaqus_scripts/local_edits_progress.py
+# As a job array throttled to one task at a time, every task is eligible from the
+# start and gains queue age while the one before it runs, so the next one starts
+# sooner; a follow-up queued with a dependency only starts ageing when the job
+# before it ends. Without --array the job chains itself as described above.
+# The task that finishes the last run (or one that makes no progress) cancels
+# the array's pending tasks. Only one of these jobs may run at a time (license):
+# a job that finds another one running stops.
 #
 # Monitor:  squeue -u hkazemi ; tail -f hood_local_edits_<jobid>.out
 #           cat Data/HoodImpact_LocalEdits/job_logs/status.txt
@@ -46,7 +58,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=24g
-#SBATCH -t 12:00:00
+#SBATCH -t 48:00:00
 #SBATCH -o hood_local_edits_%j.out
 set -u
 
@@ -70,10 +82,21 @@ MANIFEST="$DATA/manifest_local_edits.csv"
 LOGDIR="$DATA/job_logs"
 mkdir -p "$LOGDIR"
 status() { echo "$(date '+%F %T') job $SLURM_JOB_ID: $*" | tee -a "$LOGDIR/status.txt"; }
+# stop what would run after this job: the queued follow-up, or the array's pending tasks
+NEXT=""
+stop_chain() {
+    if [ -n "$ARRAY_ID" ]; then
+        scancel --state=PENDING "$ARRAY_ID" && status "cancelled the pending tasks of job array $ARRAY_ID"
+    elif [ -n "$NEXT" ]; then
+        scancel "$NEXT" && status "cancelled follow-up job $NEXT"
+    fi
+    return 0
+}
 
 LANES="${LOCAL_EDITS_LANES:-12}"
 CHAIN_LEFT="${LOCAL_EDITS_CHAIN_LEFT:-30}"
 PREV_OK="${LOCAL_EDITS_PREV_OK:--1}"
+ARRAY_ID="${SLURM_ARRAY_JOB_ID:-}"     # set when submitted as a job array (--array=1-8%1)
 umask 002
 WORK="${LOCAL_EDITS_WORK:-/u/hkazemi/hood_local_edits_scratch}"
 SCRATCH="$WORK/abaqus_scratch"
@@ -94,26 +117,38 @@ status "started on $(hostname); Code directory $ROOT; log $OUTFILE"
 
 if [ ! -f "$MANIFEST" ] || [ ! -f "$DATA/local_edit_doe.csv" ]; then
     status "ERROR: missing $MANIFEST or local_edit_doe.csv -- unpack local_edits_delta.tar.gz in $ROOT"
+    stop_chain
     exit 1
 fi
 if [ ! -f "$ROOT/Data/HoodImpact_60_IndustryLike/inp_files/HoodImpact_31.inp" ]; then
     status "ERROR: missing the base deck Data/HoodImpact_60_IndustryLike/inp_files/HoodImpact_31.inp"
+    stop_chain
     exit 1
 fi
 if [ -f "$DATA/pilot_gate_failed" ] && [ "${SKIP_PILOT_GATE:-0}" != "1" ]; then
     status "STOP: the pilot gate failed earlier (see pilot_report.txt). Delete pilot_gate_failed to retry,"
     status "      or resubmit with --export=ALL,SKIP_PILOT_GATE=1 to ignore it."
+    stop_chain
     exit 1
 fi
 
 export ABAQUSLM_LICENSE_FILE=27000@130.126.241.64
 export PATH=/scratch/bbqg/hkazemi/software/DassaultSystemes/SIMULIA/Commands:$PATH
 source /sw/external/python/anaconda3_cpu/etc/profile.d/conda.sh
-conda activate hood_impact || { status "ERROR: conda activate hood_impact failed"; exit 1; }
+conda activate hood_impact || { status "ERROR: conda activate hood_impact failed"; stop_chain; exit 1; }
 
 cd "$ROOT"
 N_TOTAL=$(( $(wc -l < "$MANIFEST") - 1 ))
 PILOT_RUNS=$(python -c "import csv; print(','.join(r['run'] for r in csv.DictReader(open('$MANIFEST')) if r['pilot'] == '1'))")
+# the campaign's solve order (manifest column solve_order; run order if absent)
+ORDER="$WORK/solve_order.txt"
+python - "$MANIFEST" "$ORDER" <<'EOF'
+import csv, sys
+rows = list(csv.DictReader(open(sys.argv[1])))
+key = (lambda r: int(r["solve_order"])) if "solve_order" in rows[0] else (lambda r: int(r["run"]))
+open(sys.argv[2], "w").write("\n".join(r["run"] for r in sorted(rows, key=key)) + "\n")
+EOF
+[ -s "$ORDER" ] || { status "ERROR: could not write the solve order $ORDER"; stop_chain; exit 1; }
 count_ok() {
     python - "$METRICS" <<'EOF'
 import csv, os, sys
@@ -122,13 +157,25 @@ print(len({r["run"] for r in csv.DictReader(open(p)) if r["status"] == "ok"}) if
 EOF
 }
 OK_START=$(count_ok)
-status "runs: $N_TOTAL in the plan, $OK_START already ok; lanes $LANES; follow-ups left $CHAIN_LEFT"
+if [ -n "$ARRAY_ID" ]; then
+    status "runs: $N_TOTAL in the plan, $OK_START already ok; lanes $LANES; task ${SLURM_ARRAY_TASK_ID:-?} of job array $ARRAY_ID"
+else
+    status "runs: $N_TOTAL in the plan, $OK_START already ok; lanes $LANES; follow-ups left $CHAIN_LEFT"
+fi
 if [ "$OK_START" -ge "$N_TOTAL" ]; then
     status "all runs are ok; nothing left to solve"
+    stop_chain
     exit 0
 fi
 if [ "$OK_START" -eq "$PREV_OK" ]; then
     status "STOP: the previous job finished no run ($OK_START ok before and after). Check its log, then resubmit by hand."
+    exit 1
+fi
+# two of these jobs at once would need 2 x 60 of the 65 license tokens
+OTHERS=$(squeue -h -u "$USER" -n hood_local_edits -t RUNNING -o %A 2>/dev/null | grep -vx "$SLURM_JOB_ID" | tr '\n' ' ')
+if [ -n "${OTHERS// /}" ]; then
+    status "STOP: another hood_local_edits job is running ($OTHERS); only one may run at a time (license)."
+    stop_chain
     exit 1
 fi
 
@@ -148,9 +195,9 @@ else
     status "WARNING: could not read this job's end time; runs in progress at the walltime are lost"
 fi
 
-# queue the follow-up now: it starts when this job ends, even after a walltime kill
-NEXT=""
-if [ "$CHAIN_LEFT" -gt 0 ]; then
+# chain mode: queue the follow-up now; it starts when this job ends, even after a
+# walltime kill. A job array needs none: its next task is already waiting (and ageing).
+if [ -z "$ARRAY_ID" ] && [ "$CHAIN_LEFT" -gt 0 ]; then
     if NEXT=$(sbatch --parsable --dependency=afterany:"$SLURM_JOB_ID" ${TIME_LIMIT:+--time="$TIME_LIMIT"} \
             --export=ALL,LOCAL_EDITS_CHAIN_LEFT=$((CHAIN_LEFT - 1)),LOCAL_EDITS_PREV_OK="$OK_START" \
             "$ROOT/$SELF" 2>&1); then
@@ -160,7 +207,6 @@ if [ "$CHAIN_LEFT" -gt 0 ]; then
         NEXT=""
     fi
 fi
-stop_chain() { [ -n "$NEXT" ] && scancel "$NEXT" && status "cancelled follow-up job $NEXT"; return 0; }
 
 echo "=== storage ==="
 quota -s 2>/dev/null | head -n 8 || true
@@ -177,16 +223,16 @@ if [ "$N_DECKS" -ne "$N_TOTAL" ]; then
 fi
 status "decks ready: $N_DECKS"
 
-solve() {
+solve() {   # solve --runs <list> | --runs-file <file>
     python -u abaqus_scripts/batch_generate.py \
         --inp-dir "$DATA/inp_files" --work-dir "$WORK" --scratch-dir "$SCRATCH" \
-        --out-dir "$DATA" --runs "$1" --lanes "$LANES" ${DEADLINE:+--deadline "$DEADLINE"}
+        --out-dir "$DATA" --lanes "$LANES" ${DEADLINE:+--deadline "$DEADLINE"} "$@"
     sync_logs
 }
 
 if [ ! -f "$DATA/pilot_gate_passed" ]; then
     status "pilot: solving runs $PILOT_RUNS"
-    solve "$PILOT_RUNS"
+    solve --runs "$PILOT_RUNS"
     if python -u abaqus_scripts/check_local_edits.py --pilot --metrics "$METRICS" --out "$DATA/pilot_report.txt"; then
         touch "$DATA/pilot_gate_passed"
         status "pilot gate PASSED (pilot_report.txt)"
@@ -200,12 +246,27 @@ if [ ! -f "$DATA/pilot_gate_passed" ]; then
     fi
 fi
 
-status "campaign: solving runs 1-$N_TOTAL ($(count_ok) ok so far)"
-solve "1-$N_TOTAL"
+NEXT_UP=$(python - "$ORDER" "$MANIFEST" "$METRICS" <<'EOF'
+import csv, os, sys
+done = {r["run"] for r in csv.DictReader(open(sys.argv[3])) if r["status"] == "ok"} if os.path.exists(sys.argv[3]) else set()
+design = {r["run"]: r["design"] for r in csv.DictReader(open(sys.argv[2]))}
+nxt = []
+for run in open(sys.argv[1]).read().split():
+    if run not in done and design[run] not in nxt:
+        nxt.append(design[run])
+print(" ".join(nxt[:6]))
+EOF
+)
+status "campaign: solving the $N_TOTAL runs in solve order ($(count_ok) ok so far; next designs: $NEXT_UP)"
+solve --runs-file "$ORDER"
 python -u abaqus_scripts/check_local_edits.py --metrics "$METRICS" --out "$DATA/qa_report.txt" || true
 
 OK_END=$(count_ok)
 status "finished this job: $OK_END of $N_TOTAL runs ok"
+if [ -n "$ARRAY_ID" ] && [ "$OK_END" -lt "$N_TOTAL" ] && [ "$OK_END" -le "$OK_START" ]; then
+    status "STOP: this job finished no run ($OK_START ok before and after). Check this log, then resubmit by hand."
+    stop_chain
+fi
 if [ "$OK_END" -ge "$N_TOTAL" ]; then
     stop_chain
     status "ALL DONE. Bring back Data/HoodImpact_LocalEdits (output_history_acc, generation_metrics.csv, *_report.txt)"
