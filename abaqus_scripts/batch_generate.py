@@ -12,7 +12,8 @@ floor(5 * cpus**0.422) tokens (1 -> 5, 8 -> 12, 16 -> 16), so single-core lanes
 cap the job at 13 cores, while multi-core lanes use far more cores for the same
 tokens: faster in wall time, at some cost in core-hours. Measure before choosing
 (cpus_scaling_test.py, delta/hood_cpus_test.sbatch). Defaults (12 x cpus=1)
-are the original single-core layout.
+are the original single-core layout; the local-edit campaign
+(delta/hood_local_edits.sbatch) runs 5 x cpus=8 with --mp-mode threads.
 
 Robustness:
     * success detected from artefacts, not exit codes: .sta must contain
@@ -48,6 +49,7 @@ Usage on Delta (inside the Slurm job; see delta/hood600.sbatch):
         --runs 1-600 --lanes 12
 """
 import os
+import re
 import csv
 import sys
 import time
@@ -224,6 +226,27 @@ def console_tail(console_path, n=5):
         return ""
 
 
+def solve_cpus(console_path):
+    """Cores of the last Abaqus solve logged in a run's solve_console.txt
+    (1 if that command names none, the Abaqus default; None if none is logged)."""
+    try:
+        with open(console_path, errors="ignore") as f:
+            cmds = [l for l in f if l.startswith("$ ") and " job=" in l]
+    except OSError:
+        return None
+    if not cmds:
+        return None
+    m = re.search(r"\bcpus=(\d+)", cmds[-1])
+    return int(m.group(1)) if m else 1
+
+
+def same_cpus(run_dir, cpus):
+    """True if the solve left in run_dir ran on `cpus` cores (unknown counts as 1,
+    the original single-core campaign), so a finished solve of another core count
+    is never adopted or reused as this one."""
+    return (solve_cpus(os.path.join(run_dir, "solve_console.txt")) or 1) == cpus
+
+
 def adopt_finished(run, args, log):
     """A run that completed and published its result but got no metrics row
     (its job died before recording it): rebuild the row instead of solving again."""
@@ -232,7 +255,8 @@ def adopt_finished(run, args, log):
     raw_csv = os.path.join(run_dir, "%s_raw_acc.csv" % job)
     published = os.path.join(args.out_dir, "output_history_acc", "%s_SAE1000_interp1000.csv" % job)
     if not (sta_completed(os.path.join(run_dir, "%s.sta" % job))
-            and os.path.exists(raw_csv) and os.path.exists(published)):
+            and os.path.exists(raw_csv) and os.path.exists(published)
+            and same_cpus(run_dir, args.cpus)):
         return None
     try:
         with postproc_lock:
@@ -287,7 +311,7 @@ def process_one(run, args, abaqus, log, clock):
     if run_scratch:
         solve_cmd.insert(-1, "scratch=%s" % run_scratch)
     t0 = time.time()
-    solved = sta_completed(sta_path) and os.path.exists(odb_path)
+    solved = sta_completed(sta_path) and os.path.exists(odb_path) and same_cpus(run_dir, args.cpus)
     if solved:
         log("   run %d: reusing existing completed solve" % run)
     for attempt in range(1, SOLVE_ATTEMPTS + 1):

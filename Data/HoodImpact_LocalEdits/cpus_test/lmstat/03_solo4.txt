@@ -1,0 +1,127 @@
+lmutil - Copyright (c) 1989-2024 Flexera. All Rights Reserved.
+Flexible License Manager status on Fri 11/13/2026 22:58
+
+License server status: 27000@130.126.241.64
+    License file(s) on 130.126.241.64: C:\Program Files\SIMULIA\License\2026\win_b64\code\bin\simulialm.LIC:
+
+130.126.241.64: license server UP (MASTER) v11.19.6
+
+Vendor daemon status (on 130.126.241.64):
+
+  ABAQUSLM: UP v11.19.6
+Feature usage info:
+
+Users of abaqus:  (Total of 65 licenses issued;  Total of 8 licenses in use)
+
+  
+"abaqus" v62.8, vendor: ABAQUSLM, expiry: 30-sep-2027
+  vendor_string: academic
+  floating license
+
+    hkazemi cn006.delta.ncsa.illinois.edu /dev/tty (v62.8) (130.126.241.64/27000 905), start Fri 11/13 22:54, 8 licenses
+
+Users of abaqus_extended:  (Total of 4 licenses issued;  Total of 0 licenses in use)
+
+Users of ams:  (Total of 1 license issued;  Total of 0 licenses in use)
+
+Users of aqua:  (Total of 65 licenses issued;  Total of 0 licenses in use)
+
+Users of cosim_acusolve:  (Total of 1 license issued;  Total of 0 licenses in use)
+
+Users of cosim_direct:  (Total of 1 license issued;  Total of 0 licenses in use)
+
+Users of cse:  (Total of 1 license issued;  Total of 0 licenses in use)
+
+Users of design:  (Total of 65 licenses issued;  Total of 0 licenses in use)
+
+Users of euler_lagrange:  (Total of 1 license issued;  Total of 0 licenses in use)
+
+Users of gpgpu:  (Total of 1 license issued;  Total of 0 licenses in use)
+
+Users of multiphysics:  (Total of 1 license issued;  Total of 0 licenses in use)
+
+Users of parallel:  (Total of 16384 licenses issued;  Total of 4 licenses in use)
+
+  
+"parallel" v62.8, vendor: ABAQUSLM, expiry: 30-sep-2027
+  vendor_string: academic
+  floating license
+
+    hkazemi cn006.delta.ncsa.illinois.edu /dev/tty (v62.6) (130.126.241.64/27000 504), start Fri 11/13 22:54, 4 licenses
+
+Users of sw_assoc_import:  (Total of 1 license issued;  Total of 0 licenses in use)
+
+Users of catiav5_assoc_import:  (Total of 1 license issued;  Total of 0 licenses in use)
+
+Users of catiav5_import:  (Total of 1 license issued;  Total of 0 licenses in use)
+
+Users of catiav6_assoc_import:  (Total of 1 license issued;  Total of 0 licenses in use)
+
+Users of tomee:  (Total of 1 license issued;  Total of 0 licenses in use)
+
+Users of pydriver:  (Total of 1 license issued;  Total of 0 licenses in use)
+
+Users of cae:  (Total of 4 licenses issued;  Total of 0 licenses in use)
+
+Users of rtgateway:  (Total of 4 licenses issued;  Total of 0 licenses in use)
+
+Users of gateway:  (Total of 4 licenses issued;  Total of 0 licenses in use)
+
+Users of safe_ex_gui:  (Total of 4 licenses issued;  Total of 0 licenses in use)
+
+Users of cfd:  (Total of 65 licenses issued;  Total of 0 licenses in use)
+
+Users of explicit:  (Total of 65 licenses issued;  Total of 8 licenses in use)
+
+  
+"explicit" v62.8, vendor: ABAQUSLM, expiry: 30-sep-2027
+  vendor_string: academic
+  floating license
+
+    hkazemi cn006.delta.ncsa.illinois.edu /dev/tty (v62.6) (130.126.241.64/27000 1005), start Fri 11/13 22:54, 8 licenses
+
+Users of foundation:  (Total of 65 licenses issued;  Total of 0 licenses in use)
+
+Users of simflow:  (Total of 65 licenses issued;  Total of 0 licenses in use)
+
+Users of standard:  (Total of 65 licenses issued;  Total of 0 licenses in use)
+
+Users of cse_token:  (Total of 65 licenses issued;  Total of 0 licenses in use)
+
+Users of safe_ex_engine:  (Total of 65 licenses issued;  Total of 0 licenses in use)
+
+Users of tosca_topo:  (Total of 65 licenses issued;  Total of 0 licenses in use)
+
+Users of tosca_shape:  (Total of 65 licenses issued;  Total of 0 licenses in use)
+
+Users of tosca_bead:  (Total of 65 licenses issued;  Total of 0 licenses in use)
+
+Users of tosca_sizing:  (Total of 65 licenses issued;  Total of 0 licenses in use)
+
+Users of tosca_int_abaqus:  (Total of 65 licenses issued;  Total of 0 licenses in use)
+
+Users of tosca_int_ansys:  (Total of 65 licenses issued;  Total of 0 licenses in use)
+
+Users of tosca_int_nastran:  (Total of 65 licenses issued;  Total of 0 licenses in use)
+
+Users of tosca_adv_nonlinear:  (Total of 65 licenses issued;  Total of 0 licenses in use)
+
+Users of tosca_adv_durability:  (Total of 65 licenses issued;  Total of 0 licenses in use)
+
+Users of tosca_adv_morph:  (Total of 65 licenses issued;  Total of 0 licenses in use)
+
+Users of tosca_smooth:  (Total of 65 licenses issued;  Total of 0 licenses in use)
+
+Users of tosca_report:  (Total of 65 licenses issued;  Total of 0 licenses in use)
+
+Users of tfluid_topo:  (Total of 65 licenses issued;  Total of 0 licenses in use)
+
+Users of tfluid_smooth:  (Total of 65 licenses issued;  Total of 0 licenses in use)
+
+Users of tfluid_parallel:  (Total of 65 licenses issued;  Total of 0 licenses in use)
+
+Users of tfluid_int_ccmp:  (Total of 65 licenses issued;  Total of 0 licenses in use)
+
+Users of tfluid_int_fluent:  (Total of 65 licenses issued;  Total of 0 licenses in use)
+
+

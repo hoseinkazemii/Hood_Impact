@@ -8,38 +8,43 @@
 # What one submission does:
 #   1. writes the decks that are missing (make_local_edit_decks.py; all 1582
 #      take ~15 min and 7.5 GB, designs added to the plan later only theirs)
-#   2. solves the 11 pilot runs (one round of 12 lanes, ~2 h)
+#   2. solves the 11 pilot runs (skipped once pilot_gate_passed exists)
 #   3. pilot gate (check_local_edits.py --pilot): every pilot run finished,
 #      all took the same number of increments, the far control matches design 6
 #      and the near difference stands clearly above it. FAIL stops everything
 #      (and cancels the queued follow-up job); read pilot_report.txt.
 #   4. solves the remaining runs in the manifest's solve_order (design 6 first,
-#      then the cut-line designs, then the single-beam notches), 12 single-core
-#      lanes (5 FlexNet tokens each) or the layout in campaign_layout.env (below)
+#      then the cut-line designs, then the single-beam notches), 5 lanes of
+#      8-core solves (Layout, below)
 #   5. writes qa_report.txt over everything finished so far
 #
-# Layout (lanes x cores per solve). Without Data/HoodImpact_LocalEdits/
-# campaign_layout.env: 12 lanes x 1 core, 60 of the 65 tokens. A solve on N
-# cores takes floor(5 * N**0.422) tokens (8 -> 12, 16 -> 16), so multi-core
-# lanes use far more cores for the same 65 tokens. hood_cpus_test.sbatch
-# measures the fastest layout and writes cpus_test/layout.env; copy it to
-# campaign_layout.env and submit with the cores and memory it names, e.g.
-#     sbatch -c 64 --mem=64g --array=1-8%1 abaqus_scripts/delta/hood_local_edits.sbatch
-# Its lines (LOCAL_EDITS_CPUS, _LANES, _MP_MODE, _RUN_S, _REDO_OTHER_CPUS) can
-# also be given with --export, which wins over the file; lanes are cut to what
-# the job's cores allow. Chained follow-ups inherit the job's cores and memory.
+# Layout: 5 lanes x 8 cores per solve (mp_mode=threads), 60 of the 65 FlexNet
+# tokens (a solve on N cores takes floor(5 * N**0.422) tokens: 1 -> 5, 8 -> 12).
+# It is the fastest layout hood_cpus_test.sbatch measured (job 23905334,
+# 2026-11-13, report in Data/HoodImpact_LocalEdits/cpus_test/): ~1000-1300 s
+# per run and ~15 runs/h, against ~6000 s and ~7 runs/h on 12 single-core
+# lanes. Its noise test passed: on 8 cores the pilot runs keep their HIC to
+# 0.03%, every design - D6 difference curve keeps R2 >= 0.998, and the same
+# deck repeats bit for bit.
+# The job asks for 64 cores although the solves use 40. The test ran that way,
+# and filling every core (4 x 16 on 64) made each solve 3x slower.
+# Runs finished on another core count (the earlier single-core ones) are solved
+# again, so the whole dataset comes from one solver setting. Never mix core
+# counts in the dataset.
+# Another layout: Data/HoodImpact_LocalEdits/campaign_layout.env, or --export
+# with LOCAL_EDITS_CPUS, _LANES, _MP_MODE, _RUN_S, _REDO_OTHER_CPUS (--export
+# wins), plus -c/--mem to match. Lanes are cut to what the job's cores allow.
+# Chained follow-ups inherit the job's cores and memory.
 #
 # Tracking: Data/HoodImpact_LocalEdits/job_logs/status.txt gets one line per
 # stage of every job; the Slurm log and generation_metrics.csv are copied into
 # Data/HoodImpact_LocalEdits every 10 minutes and when the job ends; finished
 # results appear in Data/HoodImpact_LocalEdits/output_history_acc as they come.
 #
-# Walltime: ~1.75 h per run on one Delta core (55.6k increments), ~6.6 runs/h
-# on 12 lanes, so the campaign needs ~240 h of wall time (~2,900 core-hours),
-# done as 48-h jobs (Delta's cpu maximum; ~300 runs each, so ~5-6 jobs). The
-# queue wait was about the same for 12-h and 48-h requests, so fewer, longer
-# jobs finish sooner. 12 cores = the default 12 single-core lanes (see Layout).
-# A lane only starts a run that is expected to finish before the job's end
+# Walltime: 1582 runs at ~15 runs/h need ~100-110 h of solving (~6,500-7,000
+# core-hours at 64 cores), done as 48-h jobs (Delta's cpu maximum; ~700 runs
+# each, so 3 jobs). The queue wait was about the same for 12-h and 48-h
+# requests, so fewer, longer jobs finish sooner. A lane only starts a run that is expected to finish before the job's end
 # (batch_generate.py --deadline), so no solve is killed half-way; the job
 # queues its own follow-up (afterany) at the start, with the same time limit,
 # and the follow-up solves what is left; runs marked ok are never redone.
@@ -48,7 +53,8 @@
 #
 # Submit (the Code directory is found from this script's own path, so the
 # current directory does not matter; the Slurm log goes to the current directory):
-#     cd <Code dir> && sbatch --array=1-8%1 abaqus_scripts/delta/hood_local_edits.sbatch
+#     cd <Code dir> && sbatch --array=1-4%1 abaqus_scripts/delta/hood_local_edits.sbatch
+# (3 tasks should do; the 4th is slack, and is cancelled once all runs are done)
 # Progress (which runs are done and will not be solved again):
 #     python abaqus_scripts/local_edits_progress.py
 # As a job array throttled to one task at a time, every task is eligible from the
@@ -67,8 +73,8 @@
 #SBATCH -p cpu
 #SBATCH -J hood_local_edits
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=12
-#SBATCH --mem=24g
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=64g
 #SBATCH -t 48:00:00
 #SBATCH -o hood_local_edits_%j.out
 set -u
@@ -104,7 +110,7 @@ stop_chain() {
     return 0
 }
 
-# layout: --export variables > campaign_layout.env > 12 single-core lanes
+# layout: --export variables > campaign_layout.env > 5 lanes x 8 cores (threads)
 LAYOUT_FILE="$DATA/campaign_layout.env"
 if [ -f "$LAYOUT_FILE" ]; then
     while IFS='=' read -r KEY VAL; do
@@ -115,12 +121,13 @@ if [ -f "$LAYOUT_FILE" ]; then
         esac
     done < "$LAYOUT_FILE"
 fi
-CPUS="${LOCAL_EDITS_CPUS:-1}"
-LANES="${LOCAL_EDITS_LANES:-12}"
-MP_MODE="${LOCAL_EDITS_MP_MODE:-}"
-RUN_S="${LOCAL_EDITS_RUN_S:-}"
-REDO="${LOCAL_EDITS_REDO_OTHER_CPUS:-0}"
-ALLOC="${SLURM_CPUS_PER_TASK:-12}"
+CPUS="${LOCAL_EDITS_CPUS:-8}"
+LANES="${LOCAL_EDITS_LANES:-5}"
+MP_MODE="${LOCAL_EDITS_MP_MODE:-threads}"
+RUN_S="${LOCAL_EDITS_RUN_S:-}"         # expected s per run until 5 runs on $CPUS cores are timed
+[ -z "$RUN_S" ] && [ "$CPUS" = "8" ] && RUN_S=1500    # 5 x 8 measured ~1000-1300 s; others: batch_generate's 4 h
+REDO="${LOCAL_EDITS_REDO_OTHER_CPUS:-1}"
+ALLOC="${SLURM_CPUS_PER_TASK:-64}"
 CHAIN_LEFT="${LOCAL_EDITS_CHAIN_LEFT:-30}"
 PREV_OK="${LOCAL_EDITS_PREV_OK:--1}"
 ARRAY_ID="${SLURM_ARRAY_JOB_ID:-}"     # set when submitted as a job array (--array=1-8%1)
@@ -301,9 +308,16 @@ if [ ! -f "$DATA/pilot_gate_passed" ]; then
     fi
 fi
 
-NEXT_UP=$(python - "$ORDER" "$MANIFEST" "$METRICS" <<'EOF'
+NEXT_UP=$(python - "$ORDER" "$MANIFEST" "$METRICS" "$CPUS" "$REDO" <<'EOF'
 import csv, os, sys
-done = {r["run"] for r in csv.DictReader(open(sys.argv[3])) if r["status"] == "ok"} if os.path.exists(sys.argv[3]) else set()
+def counts(r):
+    if r["status"] != "ok":
+        return False
+    try:
+        return sys.argv[5] != "1" or int(float(r.get("cpus") or 1)) == int(sys.argv[4])
+    except ValueError:
+        return False
+done = {r["run"] for r in csv.DictReader(open(sys.argv[3])) if counts(r)} if os.path.exists(sys.argv[3]) else set()
 design = {r["run"]: r["design"] for r in csv.DictReader(open(sys.argv[2]))}
 nxt = []
 for run in open(sys.argv[1]).read().split():

@@ -100,7 +100,7 @@ If home is short of space, the old `inp_files` folders of `HoodImpact_600_EuroNC
 ## 2. Submit once
 
 ```bash
-sbatch abaqus_scripts/delta/hood_local_edits.sbatch
+sbatch --array=1-4%1 abaqus_scripts/delta/hood_local_edits.sbatch
 ```
 
 The job finds its Code directory from the script's own path, so it reads and writes
@@ -108,24 +108,30 @@ The job finds its Code directory from the script's own path, so it reads and wri
 tarball was unpacked in. The job:
 
 1. writes the decks that are missing (all 1582 take about 15 minutes);
-2. solves the 11 pilot runs (one round of 12 lanes, about 2 h);
+2. solves the 11 pilot runs, only if the pilot gate has not passed yet (`pilot_gate_passed`);
 3. runs the pilot gate (`check_local_edits.py --pilot`, see `Data/HoodImpact_LocalEdits/pilot_report.txt`);
-4. solves the rest in solve order on 12 single-core lanes (5 FlexNet tokens each, 60 of the 65).
+4. solves the rest in solve order on 5 lanes of 8-core solves (`mp_mode=threads`, 12 FlexNet tokens
+   each, 60 of the 65; section 2b). The job asks for 64 cores and 64 GB: the 40 the solves use, plus
+   the headroom they had in the test.
+5. solves again every run that finished on another core count, i.e. the 23 runs done on single-core
+   lanes before 2026-11-14, so the whole dataset comes from one solver setting.
 
-**Budget.** A run takes about 1.75 h on one Delta core (55.6k increments), about 6.6 runs per hour
-on 12 lanes. 1582 runs come to about 240 h of wall time, or about 2,900 core-hours.
+**Budget.** A run takes about 1000–1300 s on 8 cores with 5 solving together (55.6k increments),
+about 15 runs per hour. 1582 runs come to about 100–110 h of wall time, or about 6,500–7,000
+core-hours at 64 cores. That is half the time of 12 single-core lanes, at about 2.5 times the
+core-hours.
 
-**48-hour jobs.** The campaign runs as 48-h jobs (Delta's cpu maximum) of about 300 runs each, so
-about 5–6 jobs. The queue wait turned out about the same for 12-h and 48-h requests (~20 h), so
-fewer, longer jobs finish the campaign sooner. A lane only starts a run that is expected to finish
-before the job ends, so no solve is cut off half-way. For a different length, e.g.
-`sbatch -t 24:00:00 --array=1-12%1 abaqus_scripts/delta/hood_local_edits.sbatch`.
+**48-hour jobs.** The campaign runs as 48-h jobs (Delta's cpu maximum) of about 700 runs each, so
+3 jobs. The queue wait turned out about the same for 12-h and 48-h requests (~20 h), so fewer,
+longer jobs finish the campaign sooner. A lane only starts a run that is expected to finish before
+the job ends, so no solve is cut off half-way. For a different length, e.g.
+`sbatch -t 24:00:00 --array=1-6%1 abaqus_scripts/delta/hood_local_edits.sbatch`.
 
 **Follow-up jobs.** Two ways to run the jobs one after another; finished runs are never redone
 either way.
 
-- **Job array (preferred):** `sbatch --array=1-8%1 abaqus_scripts/delta/hood_local_edits.sbatch`.
-  All 8 tasks are eligible from the start and gain queue age while the one before them runs, so
+- **Job array (preferred):** `sbatch --array=1-4%1 abaqus_scripts/delta/hood_local_edits.sbatch`.
+  3 tasks should finish the campaign; the 4th is slack. All 4 tasks are eligible from the start and gain queue age while the one before them runs, so
   each next task starts sooner. The task that finishes the last run, or one that finishes no run,
   cancels the pending tasks.
 - **Chain:** plain `sbatch abaqus_scripts/delta/hood_local_edits.sbatch`. Each job queues its own
@@ -136,7 +142,7 @@ either way.
 Only one of these jobs may run at a time (two would need 120 of the 65 license tokens): a job that
 finds another one running stops.
 
-**Right after submitting**, `squeue -u hkazemi` shows the array as `<jobid>_[1-8%1]`, pending, and
+**Right after submitting**, `squeue -u hkazemi` shows the array as `<jobid>_[1-4%1]`, pending, and
 later one running task plus the rest pending. If the queue is empty a minute after a task started,
 it stopped at a check; `job_logs/status.txt` says which.
 
@@ -161,13 +167,52 @@ tail -f hood_local_edits_<jobid>.out         # in the folder you submitted from
 scancel -u hkazemi -n hood_local_edits       # stops the running task and the pending ones
 ```
 
-## 2b. Faster: multi-core lanes (measure first)
+## 2b. Why 5 lanes x 8 cores (the cpus test)
 
 The license has 65 `abaqus` tokens, not 65 cores. A solve on N cores checks out
 `floor(5 * N**0.422)` tokens: 1 core costs 5, 8 cores 12, 16 cores 16. Single-core lanes therefore
 stop at 13 cores, while the same 65 tokens can run, for example, 5 lanes x 8 cores (40 cores) or
 4 lanes x 16 cores (64 cores). Editing the count in the license file does not work: every FEATURE
 line is signed (`SIGN=`), and a changed line is rejected outright.
+
+**Result** (job 23905334, 2026-11-13; everything in `Data/HoodImpact_LocalEdits/cpus_test/`):
+
+| | 1 core | 4 cores | 8 cores | 16 cores | 32 cores |
+|---|---|---|---|---|---|
+| tokens held (lmstat) | 5 | 8 | 12 | 16 | 21 |
+| speed, one solve alone | 1x | 3.4x | 6.0x | 9.6x | 11.8x |
+
+| layout, solving together | runs/h | campaign |
+|---|---|---|
+| 12 x 1 (the campaign until 2026-11-14) | ~7 | ~220 h |
+| **5 x 8** (40 of 64 cores busy) | **~15–17** | **~95–110 h** |
+| 8 x 4 (32 of 64 cores busy) | ~16 (projected) | ~100 h |
+| 4 x 16 (64 of 64 cores busy; each solve 3x slower than alone) | ~12 | ~130 h |
+
+Noise, the 11 pilot runs solved again on 5 x 8: **PASS**.
+- 1 vs 8 cores on the same deck: HIC within 0.03%, peaks within 0.15 g, curves within 0.02–0.24 g
+  RMS.
+- Every design - D6 difference keeps R2 >= 0.998 and its HIC change within 0.03 points. N1 at
+  location 9 shows 0.992 only because the 1-core run 6 turns up in the last 0.1 ms of the window.
+- Run 5 solved twice on 8 cores is bit-identical.
+- The far pair's 3 g difference (379 mm from the edit) is 100x the core-count noise, so it is a
+  real effect of the edit.
+
+The campaign therefore runs 5 x 8 by default (`hood_local_edits.sbatch`).
+
+**Changing the layout.**
+- **Overrides:** `Data/HoodImpact_LocalEdits/campaign_layout.env` or `--export` with
+  `LOCAL_EDITS_CPUS`, `_LANES`, `_MP_MODE`, `_RUN_S`, `_REDO_OTHER_CPUS`; `--export` wins. Match
+  them with `-c`/`--mem`.
+- **Back to single-core lanes:**
+  `sbatch -c 12 --mem=24g --export=ALL,LOCAL_EDITS_CPUS=1,LOCAL_EDITS_LANES=12 --array=1-8%1 abaqus_scripts/delta/hood_local_edits.sbatch`.
+  The runs finished on 8 cores are then solved again on 1 core.
+- **Never mix core counts** in the dataset.
+- **Testing another core count:** a new core count needs its own noise test first, e.g.
+  `sbatch --export=ALL,CPUS_TEST_PHASES=noise,CPUS_TEST_NOISE_CPUS=4 abaqus_scripts/delta/hood_cpus_test.sbatch`
+  for 8 x 4.
+
+**How the test works** (to repeat it):
 
 How much faster that is depends on how well Abaqus/Explicit scales on this ~40k-element model. Using
 N cores also splits the hood into N domains, which changes the floating-point order; contact,
@@ -186,7 +231,6 @@ R2 >= 0.95 and its HIC change within 0.5 percentage points. The far pair (379 mm
 gated: the report says whether its 3 g difference stands above solver noise. Plot:
 `cpus_test/noise/noise_pairs.png` (1-core vs N-core difference curves); tables `noise_runs.csv`,
 `noise_pairs.csv`; the N-core curves themselves are next to them for any further check on Windows.
-If the verdict is FAIL, stay on 12 single-core lanes (`scontrol release` the held jobs).
 
 Steps:
 
@@ -199,20 +243,9 @@ cat Data/HoodImpact_LocalEdits/cpus_test/report.txt
 ```
 
 `report.txt` ends with the chosen layout, the campaign time it implies, the noise verdict and the
-exact submit line; `cpus_test/layout.env` holds the same layout with the verdict on its second line.
-If the verdict is PASS, run the campaign with it:
-
-```bash
-scancel <held campaign jobs>                 # they were submitted with 12 cores
-cp Data/HoodImpact_LocalEdits/cpus_test/layout.env Data/HoodImpact_LocalEdits/campaign_layout.env
-sbatch -c <cores> --mem=<mem> --array=1-8%1 abaqus_scripts/delta/hood_local_edits.sbatch
-```
-
-The campaign log then shows `lanes L x cpus N`. Remove `campaign_layout.env` to go back to 12
-single-core lanes. A multi-core layout sets `LOCAL_EDITS_REDO_OTHER_CPUS=1`: the runs already
-finished on one core are solved again on N cores, so every pair in the dataset comes from one solver
-setting. `CPUS_TEST_PHASES=noise` repeats only the noise test (another job) if the first one ran
-out of time; `CPUS_TEST_NOISE_RUNS=1-16` adds more finished runs.
+exact submit line; `cpus_test/layout.env` holds the same layout with the verdict on its second line,
+ready to be copied to `campaign_layout.env`. `CPUS_TEST_PHASES=noise` repeats only the noise test;
+`CPUS_TEST_NOISE_RUNS=1-16` adds more finished runs.
 
 ## 3. The pilot gate
 
