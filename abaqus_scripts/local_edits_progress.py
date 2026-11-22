@@ -16,6 +16,7 @@ finished on another count are solved again (hood_local_edits.sbatch).
 import argparse
 import csv
 import os
+import re
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.path.dirname(HERE), "Data", "HoodImpact_LocalEdits")
@@ -69,6 +70,17 @@ def completed(run):
     return ok and os.path.exists(os.path.join(d, "HoodImpact_%d_raw_acc.csv" % run))
 
 
+def solve_cpus(run):
+    """Cores of the last solve logged in run_<n>/solve_console.txt (as batch_generate.solve_cpus)."""
+    try:
+        with open(os.path.join(WORK, "run_%d" % run, "solve_console.txt"), errors="ignore") as f:
+            cmds = [l for l in f if l.startswith("$ ") and " job=" in l]
+    except OSError:
+        return 1
+    m = re.search(r"\bcpus=(\d+)", cmds[-1]) if cmds else None
+    return int(m.group(1)) if m else 1
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--list", action="store_true", help="print the run numbers of each state")
@@ -99,7 +111,8 @@ def main():
         elif run in other:
             state[run] = "other_cpus"
         elif os.path.exists(os.path.join(acc, "HoodImpact_%d_SAE1000_interp1000.csv" % run)) and completed(run):
-            state[run] = "unrecorded"
+            # batch_generate adopts only a solve made on the campaign's core count
+            state[run] = "unrecorded" if not redo or solve_cpus(run) == cpus else "other_cpus"
         elif run in status:
             state[run] = "failed"
         else:
