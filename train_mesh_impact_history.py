@@ -150,7 +150,9 @@ def validate_location_shortcuts(impactor_nodes, pool_impactor_nodes, mesh_nodes=
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-format", choices=["legacy", "industrylike", "euroncap1704"])
+    parser.add_argument("--data-format", choices=["legacy", "industrylike", "euroncap1704", "localedits"],
+                        help="localedits: the 72 local edits of design 6 (local_edits_data.py); "
+                             "--impact-coords-path is then the run manifest and design N54 is --test-designs 54.")
     for name in ("inp-dir", "impact-coords-path", "mesh-geometry-dir", "doe-path", "acceleration-dir"):
         parser.add_argument(f"--{name}")
     parser.add_argument("--num-samples", type=int)
@@ -321,8 +323,16 @@ def build_config(args):
             raise ValueError("HIC location filtering requires the complete 12 x 142 euroncap1704 dataset")
     if args.location_holdout is not None and (config.data_format != "euroncap1704" or config.samples_per_design != 142):
         raise ValueError("The location holdout is defined on the 142-location euroncap1704 grid")
-    if args.design_change_nodes and (config.data_format != "euroncap1704" or config.samples_per_design != 142):
-        raise ValueError("Design-change nodes are found from the 142-location euroncap1704 decks")
+    if args.design_change_nodes and (config.data_format not in ("euroncap1704", "localedits")
+                                     or config.samples_per_design != 142):
+        raise ValueError("Design-change nodes need the 142-location euroncap1704 decks or the localedits tables")
+    if config.data_format == "localedits":
+        if config.samples_per_design != 142:
+            raise ValueError("localedits numbers samples as 142 * design + location; keep --samples-per-design 142")
+        if config.mesh_nodes != "inner_panel":
+            raise ValueError("localedits builds only inner-panel meshes; use --mesh-nodes inner_panel")
+        if args.design_change_nodes and args.design_change_features != "xyz":
+            raise ValueError("localedits change tables carry no panel gaps; use --design-change-features xyz")
     return config
 
 
@@ -388,6 +398,14 @@ def resolved_config(config, args, model_kwargs, prediction_grid):
     data_config = {key: getattr(config, key) for key in data_keys}
     data_config.update({key: str(Path(getattr(config, key)).resolve()) for key in path_keys})
     data_config["mesh_nodes"] = config.mesh_nodes
+    if config.data_format == "localedits":
+        data_config["local_edits"] = {
+            "sample_number": "142 * n + location for design Nn (design ID n)",
+            "base_design": "D6, excluded from training, validation, test and scalers; its true curves are only "
+                           "the reference for local_edit_metrics.json",
+            "mesh": "inner panel of one design-6 deck plus dz from design_changes/<design>_changed_nodes.csv",
+            "samples_file": "local_edit_samples.csv",
+        }
     architecture = "DesignChangeHistoryNet" if getattr(args, "design_change_nodes", False) else "MeshImpactHistoryNet"
     teacher_forcing = None
     if model_kwargs.get("teacher_forcing_chunks"):
@@ -663,7 +681,20 @@ def main(argv=None):
         run = initialize_wandb(
             args, resolved_config(config, args, model_kwargs, prediction_grid=None), output_dir, logger,
         )
-        if args.design_change_nodes:
+        local_edits = config.data_format == "localedits"
+        if args.design_change_nodes and local_edits:
+            # Every edited design's moved nodes, listed exactly by the generator.
+            from local_edits_data import BASE_DESIGN, load_design_changes, load_manifest
+            manifest = load_manifest(config.impact_coords_path)
+            design_changes, design_change_report = load_design_changes(
+                config.impact_coords_path, config.inp_dir,
+                sorted(manifest.loc[manifest["design"] != BASE_DESIGN, "design_id"].unique()),
+                mesh_nodes=config.mesh_nodes,
+            )
+            counts = [len(change["rows"]) for change in design_changes.values()]
+            logger.info("Design-change nodes: %s edited designs | %s-%s moved nodes each | base %s",
+                        len(counts), min(counts), max(counts), design_change_report["base_deck"])
+        elif args.design_change_nodes:
             # Geometry only, from every deck (held-out designs included, as their
             # change nodes come from their near-clones); no history is read.
             from design_change_nodes import find_design_changes
@@ -705,6 +736,21 @@ def main(argv=None):
         splits = resolve_splits(data, config, args.test_designs, args.val_designs)
         if source_dir is not None and splits != args.resume_splits:
             raise ValueError("Loaded train/validation/test runs differ from the saved resume split")
+        if local_edits:
+            from local_edits_data import design_name, sample_design, sample_location
+            split_of = {run: name for name, group in splits.items() for run in group["run_numbers"]}
+            pd.DataFrame({
+                "sample": data["run_numbers"], "source_run": data["source_runs"],
+                "design": [design_name(sample_design(s)) for s in data["run_numbers"]],
+                "location": [sample_location(s) for s in data["run_numbers"]],
+                "split": [split_of[s] for s in data["run_numbers"]],
+            }).to_csv(output_dir / "local_edit_samples.csv", index=False)
+            logger.info("Local edits: test %s (%s runs) | validation %s (%s runs) | training %s designs (%s runs) "
+                        "| design 6 not trained on", [design_name(d) for d in splits["test"]["design_ids"]],
+                        len(splits["test"]["run_numbers"]),
+                        [design_name(d) for d in splits["validation"]["design_ids"]],
+                        len(splits["validation"]["run_numbers"]), len(splits["train"]["design_ids"]),
+                        len(splits["train"]["run_numbers"]))
         loaders = create_data_loaders(
             data, preprocessor, config,
             test_design_ids=splits["test"]["design_ids"],
@@ -830,13 +876,21 @@ def main(argv=None):
         # The training loader shuffles; export train histories in dataset order.
         train_eval_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=False,
                                        collate_fn=train_loader.collate_fn)
+        if local_edits:
+            # Design 6 enters only here, as the reference the edit effects are measured from.
+            from local_edits_data import base_reference_curves
+            from local_edit_metrics import local_edit_log_values, local_edit_report, write_local_edit_report
+            base_curves, base_times = base_reference_curves(preprocessor)
 
         def evaluate_checkpoint(path, directory, prefix=""):
-            """Test metrics, train/test histories, near-clone difference R2 and time windows of one checkpoint.
+            """Test metrics, train/test histories, design-difference R2 and time windows of one checkpoint.
 
-            A teacher-forcing model is scored as it is used, rolling out from its
-            own predictions. Its test set is scored again fed the true earlier
-            chunks, into ``directory/teacher_forced``: the best case for rollout.
+            The difference R2 is near-clone pairs on the 1704 set and the edit
+            effect against design 6 on the local-edit set (local_edit_metrics.json,
+            with train, validation and test). A teacher-forcing model is scored as
+            it is used, rolling out from its own predictions. Its test set is
+            scored again fed the true earlier chunks, into
+            ``directory/teacher_forced``: the best case for rollout.
             """
             checkpoint = torch.load(path, map_location=config.device, weights_only=True)
             model.load_state_dict(checkpoint["model_state_dict"], strict=True)
@@ -846,12 +900,39 @@ def main(argv=None):
             _, train_predictions, train_targets = evaluator.evaluate(train_eval_loader)
             export_predictions(directory / "train_acceleration_histories.csv", train_dataset,
                                train_predictions, train_targets)
-            difference = design_difference_report(config.data_format, config.samples_per_design, {
-                "train": (train_dataset, train_predictions, train_targets),
-                "test": (test_dataset, predictions, targets),
-            })
-            write_design_difference_report(directory, difference)
             values, forced = {}, None
+            if local_edits:
+                val_dataset = val_loader.dataset
+                _, val_predictions, val_targets = evaluator.evaluate(val_loader)
+                export_predictions(directory / "validation_acceleration_histories.csv", val_dataset,
+                                   val_predictions, val_targets)
+                difference, local_runs, local_curves = local_edit_report({
+                    "train": (train_dataset, train_predictions, train_targets),
+                    "validation": (val_dataset, val_predictions, val_targets),
+                    "test": (test_dataset, predictions, targets),
+                }, base_curves, base_times, config.impact_coords_path)
+                figures = write_local_edit_report(directory, difference, local_runs, local_curves, base_times)
+                values.update(local_edit_log_values(difference))
+                if args.wandb_mode != "disabled":
+                    run.log({f"{prefix}local_edits/{Path(figure).stem}": wandb.Image(str(figure))
+                             for figure in figures})
+                for split in ("train", "validation", "test"):
+                    entry = difference["splits"][split]
+                    sibling = entry["baselines"]["sibling_copy"]
+                    logger.info("%s%s edit-effect difference R2 %s (windows 0-5/5-12/12+ ms %s) | sibling copy %s vs "
+                                "model %s on its %s runs | location mean %s | HIC change MAE %s pct points "
+                                "(copy design 6 %s)", prefix, split, entry["difference_r2"],
+                                entry["windows_difference_r2"], sibling["difference_r2"],
+                                sibling["model_r2_same_runs"], sibling["runs"],
+                                entry["baselines"]["location_mean"]["difference_r2"],
+                                entry["hic15_sampled"]["change_mae_pct_points"]["model"],
+                                entry["hic15_sampled"]["change_mae_pct_points"]["copy_d6"])
+            else:
+                difference = design_difference_report(config.data_format, config.samples_per_design, {
+                    "train": (train_dataset, train_predictions, train_targets),
+                    "test": (test_dataset, predictions, targets),
+                })
+                write_design_difference_report(directory, difference)
             if model.teacher_forcing_chunks:
                 forced_dir = directory / "teacher_forced"
                 forced_dir.mkdir(exist_ok=True)
@@ -879,24 +960,28 @@ def main(argv=None):
             return metrics, predictions, targets, difference
 
         metrics, predictions, targets, difference = evaluate_checkpoint(checkpoint_path, output_dir)
-        from mesh_change_metrics import design_sensitivity_metrics
-        from evaluate_design_sensitivity import write_sensitivity_report, sensitivity_log_values
-        sensitivity = design_sensitivity_metrics(test_dataset, predictions, targets, config.samples_per_design)
-        write_sensitivity_report(output_dir, sensitivity)
-        sensitivity_values = sensitivity_log_values(sensitivity)
-        run.summary.update(sensitivity_values)
-        run.log(sensitivity_values)
-        logger.info("Matched-location design sensitivity: skill=%s, amplitude ratio=%s, alignment=%s; HIC15 skill=%s",
-                    sensitivity["design_difference_skill"], sensitivity["difference_amplitude_ratio"],
-                    sensitivity["difference_alignment_cosine"], sensitivity["hic15"]["design_difference_skill"])
-        difference_values = difference_log_values(difference)
-        run.summary.update(difference_values)
-        run.log(difference_values)
-        logger.info("Near-clone design-difference R2 (acceleration): train=%s, test=%s",
-                    difference["train"]["r2"], difference["test"]["r2"])
-        logger.info("Test designs vs their training siblings: difference R2=%s | test RMSE model=%s g, "
-                    "sibling mean=%s g", difference["test_vs_train"]["r2"],
-                    difference["test_vs_train"]["model_rmse_g"], difference["test_vs_train"]["sibling_mean_rmse_g"])
+        if not local_edits:
+            # Matched-location comparisons across test designs and near-clone pairs (1704 set).
+            from mesh_change_metrics import design_sensitivity_metrics
+            from evaluate_design_sensitivity import write_sensitivity_report, sensitivity_log_values
+            sensitivity = design_sensitivity_metrics(test_dataset, predictions, targets, config.samples_per_design)
+            write_sensitivity_report(output_dir, sensitivity)
+            sensitivity_values = sensitivity_log_values(sensitivity)
+            run.summary.update(sensitivity_values)
+            run.log(sensitivity_values)
+            logger.info("Matched-location design sensitivity: skill=%s, amplitude ratio=%s, alignment=%s; "
+                        "HIC15 skill=%s", sensitivity["design_difference_skill"],
+                        sensitivity["difference_amplitude_ratio"], sensitivity["difference_alignment_cosine"],
+                        sensitivity["hic15"]["design_difference_skill"])
+            difference_values = difference_log_values(difference)
+            run.summary.update(difference_values)
+            run.log(difference_values)
+            logger.info("Near-clone design-difference R2 (acceleration): train=%s, test=%s",
+                        difference["train"]["r2"], difference["test"]["r2"])
+            logger.info("Test designs vs their training siblings: difference R2=%s | test RMSE model=%s g, "
+                        "sibling mean=%s g", difference["test_vs_train"]["r2"],
+                        difference["test_vs_train"]["model_rmse_g"],
+                        difference["test_vs_train"]["sibling_mean_rmse_g"])
         wandb.log({f"test/{key}": value for key, value in metrics.items() if np.isfinite(value)})
         logger.info("Best-checkpoint test metrics (acceleration in g): %s", metrics)
         # A long run's best validation epoch can come early, so the final epoch's
@@ -905,15 +990,22 @@ def main(argv=None):
         last_dir.mkdir(exist_ok=True)
         last_metrics, _, _, last_difference = evaluate_checkpoint(output_dir / LAST_CHECKPOINT_NAME, last_dir,
                                                                   prefix="last_checkpoint/")
-        last_values = {f"last_checkpoint/{key}": value for key, value in difference_log_values(last_difference).items()}
-        last_values.update({f"last_checkpoint/test/{key}": value for key, value in last_metrics.items()
-                            if np.isfinite(value)})
+        last_values = {f"last_checkpoint/test/{key}": value for key, value in last_metrics.items()
+                       if np.isfinite(value)}
+        if local_edits:
+            logger.info("Last-checkpoint (epoch %s) test metrics (acceleration in g): %s | edit-effect difference "
+                        "R2: train=%s, validation=%s, test=%s", len(history["train_losses"]), last_metrics,
+                        *(last_difference["splits"][split]["difference_r2"]
+                          for split in ("train", "validation", "test")))
+        else:
+            last_values.update({f"last_checkpoint/{key}": value
+                                for key, value in difference_log_values(last_difference).items()})
+            logger.info("Last-checkpoint (epoch %s) test metrics (acceleration in g): %s | design-difference R2: "
+                        "train=%s, test=%s, test vs training siblings=%s", len(history["train_losses"]),
+                        last_metrics, last_difference["train"]["r2"], last_difference["test"]["r2"],
+                        last_difference["test_vs_train"]["r2"])
         run.summary.update(last_values)
         run.log(last_values)
-        logger.info("Last-checkpoint (epoch %s) test metrics (acceleration in g): %s | design-difference R2: "
-                    "train=%s, test=%s, test vs training siblings=%s", len(history["train_losses"]), last_metrics,
-                    last_difference["train"]["r2"], last_difference["test"]["r2"],
-                    last_difference["test_vs_train"]["r2"])
         logger.info("Finished. Run artifacts: %s", output_dir)
         return metrics
     finally:

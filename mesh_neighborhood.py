@@ -15,9 +15,10 @@ from torch.utils.checkpoint import checkpoint
 
 
 def default_neighbor_cache_directory(data_format, inp_dir=None):
-    if inp_dir is not None and data_format in ("euroncap1704", "industrylike"):
+    datasets = {"euroncap1704": "HoodImpact_1704_EuroNCAP", "industrylike": "HoodImpact_60_IndustryLike",
+                "localedits": "HoodImpact_LocalEdits"}
+    if inp_dir is not None and data_format in datasets:
         return Path(inp_dir).parent / "neighbor_graphs"
-    datasets = {"euroncap1704": "HoodImpact_1704_EuroNCAP", "industrylike": "HoodImpact_60_IndustryLike"}
     if data_format in datasets:
         return Path("Data") / datasets[data_format] / "neighbor_graphs"
     return Path("runs") / "mesh_neighbor_graphs"
@@ -170,7 +171,11 @@ def prepare_model_neighbor_graphs(model, preprocessor, mesh_geometries, director
     """Load/build each distinct raw structural geometry once before training."""
     if not model.neighborhood_blocks:
         return None
-    model.neighbor_cache = NeighborGraphCache(directory=directory)
+    # Keep every training/validation/test hood resident: the local-edit set has
+    # 72, and an evicted graph is reloaded from disk on its next batch.
+    distinct = {NeighborGraphCache.geometry_digest(NeighborGraphCache.points(mesh[model.impactor_nodes:]))
+                for mesh in mesh_geometries}
+    model.neighbor_cache = NeighborGraphCache(capacity=max(16, len(distinct)), directory=directory)
     cache = model.neighbor_cache
     seen = set()
     for mesh in mesh_geometries:

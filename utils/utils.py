@@ -28,7 +28,7 @@ from pathlib import Path
 # Dataset formats whose mesh comes from an Abaqus .inp *NODE block (rather than
 # the legacy HoodImpactor_<run>_COORD.csv files) and whose acceleration files use
 # the HoodImpact_<run>_SAE1000_interp1000.csv naming.
-INP_MESH_FORMATS = {"industrylike", "euroncap1704"}
+INP_MESH_FORMATS = {"industrylike", "euroncap1704", "localedits"}
 # Which deck nodes become mesh rows. "all" is the whole first *NODE block
 # (headform first, then every hood node). "inner_panel" keeps only the nodes of
 # the hood inner panel's elements: no headform, outer skin, hinges or fasteners.
@@ -152,6 +152,18 @@ class Config:
             # This folder ships no standalone HIC table; generation_metrics.csv
             # carries the per-run HIC15 under `run` / `hic15` (see load_hic).
             self.hic_path = "./Data/HoodImpact_1704_EuroNCAP/generation_metrics.csv"
+        elif fmt == "localedits":
+            # 72 local edits of design 6 x 20 locations (local_edits_data.py).
+            # Sample = 142 * n + location for design Nn; design 6 itself is only
+            # a reference and is not loaded for training. impact_coords_path is
+            # the run manifest; inp_dir needs only one design-6 deck.
+            self.num_samples = 1440
+            self.samples_per_design = 142
+            self.inp_dir = "./Data/HoodImpact_LocalEdits/inp_files/"
+            self.impact_coords_path = "./Data/HoodImpact_LocalEdits/manifest_local_edits.csv"
+            self.acceleration_dir = "./Data/HoodImpact_LocalEdits/output_history_acc/"
+            self.hic_path = "./Data/HoodImpact_LocalEdits/generation_metrics.csv"
+            self.mesh_nodes = "inner_panel"
 
         for key, value in kwargs.items():
             setattr(self, key, value)
@@ -492,6 +504,10 @@ class DataPreprocessor:
         return time, acceleration
     
     def load_all_data(self) -> Dict:
+        if self.config.data_format == "localedits":
+            # Meshes come from one design-6 deck plus the change tables, runs from the manifest.
+            from local_edits_data import load_local_edit_data
+            return load_local_edit_data(self)
         if self.config.data_format in INP_MESH_FORMATS:
             doe_df = None
             impact_df = self.load_impact_coords()
