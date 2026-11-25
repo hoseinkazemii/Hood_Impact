@@ -8,6 +8,15 @@ design_change_nodes.py skip pooling. Each one becomes its own token, built from
 its XYZ in this design, normalized as the backbone's mesh input
 (``design_change_features="xyz"``, the default).
 
+``design_change_features="edit"`` (since 2026-11-24) encodes the edit itself:
+each token is the node's position in the reference design, normalized as the
+mesh, and its 3D displacement from there divided by one isotropic length,
+``change_displacement_scale`` (the trainer sets it to the RMS displacement
+length of the training designs' change nodes). Nothing in it is tied to an axis
+or to the hood. The null token's value is zero, so a design without change
+nodes gets no update from the readouts; its key still lets attention look away
+from the edit, which sets how strongly the edit acts at each time.
+
 Runs before 2026-10-26 used ``"impact_relative"`` tokens instead: the XY offset
 from the impact point and its distance (/ 250 mm), sin/cos of the offset at
 wavelengths 800 / 2^k mm, the displacement from the cluster base (/ 10 mm) and
@@ -51,9 +60,11 @@ CHANGE_POSITION_SCALE_MM = 250.0
 CHANGE_DISPLACEMENT_SCALE_MM = 10.0
 CHANGE_LONGEST_WAVELENGTH_MM = 800.0
 TABLE_FILE = "design_change_nodes.npz"
-# Change-token inputs: the node's XYZ (default), or the impact-relative position,
-# displacement, panel gap and panel flag that runs before 2026-10-26 used.
-CHANGE_FEATURES = ("xyz", "impact_relative")
+# Change-token inputs: the node's XYZ (default), the impact-relative position,
+# displacement, panel gap and panel flag that runs before 2026-10-26 used, or
+# the edit: reference position and displacement (since 2026-11-24).
+CHANGE_FEATURES = ("xyz", "impact_relative", "edit")
+CHANGE_INPUTS = {"xyz": 3, "edit": 6}
 
 
 def saved_design_change_kwargs(kwargs: dict) -> dict:
@@ -144,9 +155,9 @@ class DesignChangeTable:
 class ChangeReadout(nn.Module):
     """Time queries read the change-node tokens. The output projection starts at zero.
 
-    With a ``gate`` (older runs) each node's value is multiplied by its
-    displacement length / 10 mm and the null token's by zero, so a design with no
-    displacement adds nothing.
+    With a ``gate`` each value is multiplied by it. Older runs gated by the
+    displacement length / 10 mm and the null token by zero, so a design with no
+    displacement adds nothing; "edit" tokens gate only the null token, by zero.
     """
 
     def __init__(self, width: int, num_heads: int, dropout: float):
@@ -205,7 +216,7 @@ class DesignChangeHistoryNet(MeshImpactHistoryNet):
         frequencies = 2 * math.pi * 2.0 ** torch.arange(design_change_fourier_octaves) / CHANGE_LONGEST_WAVELENGTH_MM
         self.register_buffer("change_frequencies", frequencies.float(), persistent=False)
         width = self.width
-        inputs = 3 if design_change_features == "xyz" else 10 + 4 * design_change_fourier_octaves
+        inputs = CHANGE_INPUTS.get(design_change_features, 10 + 4 * design_change_fourier_octaves)
         self.change_embedding = nn.Sequential(
             nn.Linear(inputs, width), nn.GELU(),
             nn.Linear(width, width), nn.LayerNorm(width),
@@ -221,16 +232,35 @@ class DesignChangeHistoryNet(MeshImpactHistoryNet):
         ])
         # Plain attribute, never a buffer: it is derived from the decks.
         self.design_changes = None
+        if design_change_features == "edit":
+            # Set from the training designs before use; NaN until then.
+            self.register_buffer("change_displacement_scale", torch.full((), float("nan")))
+
+    @torch.no_grad()
+    def set_change_displacement_scale(self, scale_mm: float) -> None:
+        """The one length (mm) every displacement of an "edit" token is divided by."""
+        if self.design_change_features != "edit":
+            raise ValueError("Only design_change_features='edit' tokens carry displacements")
+        if not math.isfinite(scale_mm) or scale_mm <= 0:
+            raise ValueError("The change displacement scale must be finite and positive")
+        self.change_displacement_scale.fill_(float(scale_mm))
 
     def change_features(self, static: Tensor, impact_mm: Tensor) -> Tensor:
         """Token inputs from static rows (B, M, S) and impact XY (B, 2) in mm.
 
         "xyz": (B, M, 3), the node's coordinates in this design, normalized as the
-        backbone's mesh input. "impact_relative": (B, M, 10 + 4 * octaves).
+        backbone's mesh input. "edit": (B, M, 6), the node's reference position,
+        normalized the same way, then its displacement / change_displacement_scale.
+        "impact_relative": (B, M, 10 + 4 * octaves).
         """
         base, displacement = static[..., :3], static[..., 3:6]
         if self.design_change_features == "xyz":
             return (base + displacement - self.mesh_mean) / self.mesh_scale
+        if self.design_change_features == "edit":
+            if not torch.isfinite(self.change_displacement_scale):
+                raise RuntimeError("Set the edit tokens' displacement scale (set_change_displacement_scale) first")
+            return torch.cat(((base - self.mesh_mean) / self.mesh_scale,
+                              displacement / self.change_displacement_scale), dim=-1)
         relative = base[..., :2] - impact_mm[:, None, :]
         phases = (relative.unsqueeze(-1) * self.change_frequencies).flatten(2)
         return torch.cat((
@@ -261,10 +291,24 @@ class DesignChangeHistoryNet(MeshImpactHistoryNet):
         if self.design_change_displacement_gate:
             gate = static[..., 3:6].norm(dim=-1) / CHANGE_DISPLACEMENT_SCALE_MM
             gate = torch.cat((gate.new_zeros(batch_size, 1), gate), dim=1)
+        elif self.design_change_features == "edit":
+            # Zero value for the null token only: no edit, no update.
+            gate = torch.cat((static.new_zeros(batch_size, 1), static.new_ones(batch_size, static.shape[1])), dim=1)
         return self.change_norm(tokens), gate, valid
 
     def _read_decoder_context(self, index: int, queries: Tensor, context) -> Tensor:
         return self.change_readouts[index](queries, *context)
+
+
+def change_displacement_rms(changes, designs) -> float:
+    """RMS displacement length (mm) of the moved change nodes of ``designs``: the "edit" tokens' scale."""
+    lengths = [np.linalg.norm(np.asarray(changes[design]["static"][:, 3:6], dtype=np.float64), axis=1)
+               for design in designs if design in changes]
+    lengths = np.concatenate(lengths) if lengths else np.zeros(0)
+    lengths = lengths[lengths > 0]
+    if not len(lengths):
+        raise ValueError("The training designs move no change node, so edit tokens have no displacement scale")
+    return float(np.sqrt(np.mean(np.square(lengths))))
 
 
 def register_design_changes(model, changes, meshes, designs, transform_mesh):

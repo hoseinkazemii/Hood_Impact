@@ -32,13 +32,27 @@
 # location 114. Their two single-beam creases (N69/N70, N71/N72), half-depth
 # creases (N59, N60) and standard-depth cut lines (N4, N50) stay in training.
 #
-# Model: the earlier design-change default (run 3501305) unchanged: inner panel
-# (18,182 nodes), 2 neighborhood layers (k=256, 20 mm), FiLM impact conditioning,
-# Fourier time (6 pairs, 20-640 Hz), temporal decoder, change tokens = XYZ of
-# each design's moved nodes (50-377 nodes, exact from design_changes/), no
+# Model: the earlier design-change default (run 3501305) except that all 256
+# pooling tokens read the whole hood (no radial bias around the impact) and kNN
+# offsets are in units of the mesh's median k-th-neighbour distance (no fixed
+# 20 mm): inner panel (18,182 nodes), 2 neighborhood layers (k=256), FiLM impact conditioning,
+# Fourier time (6 pairs, 20-640 Hz), temporal decoder, change tokens of each
+# design's moved nodes (50-377 nodes, exact from design_changes/), no
 # change self-attention, no displacement gate, 63 time points, 100 epochs,
 # batch 8, lr 3e-4, weight decay 1e-5, dropout 0.1, seed 42, plain acceleration
 # MSE, best checkpoint by validation loss.
+#
+# Edit encoding (since 2026-11-24; both on by default):
+#   HOOD_LOCAL_EDITS_CHANGE_FEATURES=edit  each change token = the node's design-6
+#       position + its 3D displacement / one isotropic length (RMS of the training
+#       displacements), null token with zero value. xyz = position after the edit
+#       only (runs before 2026-11-24).
+#   HOOD_LOCAL_EDITS_REFERENCE=true  output = design 6's simulated curve at the same
+#       impact + s * network, with that curve also an input to every time query;
+#       s = training RMSE of copying design 6, head starts at zero (= copy design 6).
+#       false = absolute prediction (runs before 2026-11-24).
+# Ablations: sbatch --export=ALL,HOOD_LOCAL_EDITS_CHANGE_FEATURES=xyz run_mesh_change_local_edits_delta.sbatch
+# (reference only), or ...,HOOD_LOCAL_EDITS_REFERENCE=false (edit tokens only).
 #
 # Results in runs/mesh_impact_history/<stamp>_<job>_localedits/:
 #   local_edit_metrics.json         edit-effect difference R2 (design - design 6),
@@ -91,9 +105,26 @@ export WANDB_PROJECT=${WANDB_PROJECT:-hood-impact-mesh-attention}
 DATA_ROOT=${HOOD_MESH_DATA_ROOT:-${PROJECT_DIR}/Data/HoodImpact_LocalEdits}
 TEST_DESIGN=${HOOD_LOCAL_EDITS_TEST_DESIGN:-54}
 VAL_DESIGN=${HOOD_LOCAL_EDITS_VAL_DESIGN:-55}
+CHANGE_FEATURES=${HOOD_LOCAL_EDITS_CHANGE_FEATURES:-edit}
+REFERENCE=${HOOD_LOCAL_EDITS_REFERENCE:-true}
+if [[ "${CHANGE_FEATURES}" != edit && "${CHANGE_FEATURES}" != xyz ]]; then
+    echo "ERROR: HOOD_LOCAL_EDITS_CHANGE_FEATURES must be edit or xyz, not ${CHANGE_FEATURES}" >&2
+    exit 2
+fi
+if [[ "${REFERENCE}" != true && "${REFERENCE}" != false ]]; then
+    echo "ERROR: HOOD_LOCAL_EDITS_REFERENCE must be true or false, not ${REFERENCE}" >&2
+    exit 2
+fi
+VARIANT=${CHANGE_FEATURES}
+if [[ "${REFERENCE}" == true ]]; then
+    VARIANT=${VARIANT}_ref
+fi
+if [[ -n "${HOOD_MESH_RESUME_FROM:-}" ]]; then
+    VARIANT=resumed  # a resume keeps the saved run's settings, whatever these variables say
+fi
 JOB_ID=${SLURM_JOB_ID:-local}
-OUTPUT_DIR=${PROJECT_DIR}/runs/mesh_impact_history/$(date +%Y%m%d_%H%M%S)_${JOB_ID}_localedits
-RUN_NAME=mesh_change_localedits_test_N${TEST_DESIGN}_val_N${VAL_DESIGN}_${JOB_ID}
+OUTPUT_DIR=${PROJECT_DIR}/runs/mesh_impact_history/$(date +%Y%m%d_%H%M%S)_${JOB_ID}_localedits_${VARIANT}
+RUN_NAME=mesh_change_localedits_${VARIANT}_test_N${TEST_DESIGN}_val_N${VAL_DESIGN}_${JOB_ID}
 
 COMMON=(--device cuda --output-dir "${OUTPUT_DIR}" --run-name "${RUN_NAME}"
         --wandb-mode "${WANDB_MODE}" --wandb-project "${WANDB_PROJECT}")
@@ -112,11 +143,13 @@ else
         --test-designs "${TEST_DESIGN}" --val-designs "${VAL_DESIGN}"
         --mesh-nodes inner_panel
         --design-change-nodes true --design-change-layers 0 --design-change-fourier-octaves 2
-        --design-change-features xyz --design-change-displacement-gate false
+        --design-change-features "${CHANGE_FEATURES}" --design-change-displacement-gate false
+        --reference-response "${REFERENCE}"
         --decoder temporal --impact-conditioning film
         --time-encoding fourier --fourier-num-frequencies 6
         --fourier-min-frequency-hz 20 --fourier-max-frequency-hz 640
-        --neighborhood-layers 2 --neighborhood-k 256 --neighborhood-scale-mm 20 --neighborhood-chunk-size 1024
+        --neighborhood-layers 2 --neighborhood-k 256 --neighborhood-scale-mm 0 --neighborhood-chunk-size 1024
+        --local-latents 0
         --pooling-query-residual false --pool-impactor-nodes false --geometry-film none
         --teacher-forcing-chunks 0 --time-subsample-stride 16
         --width 128 --num-heads 4 --num-latents 256 --latent-layers 3 --temporal-layers 2 --dropout 0.1

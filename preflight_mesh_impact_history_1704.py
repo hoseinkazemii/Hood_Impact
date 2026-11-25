@@ -58,7 +58,7 @@ EXPERIMENT_MODEL_KEYS = tuple(
     key for key in MODEL_DEFAULTS
     if key.startswith("neighborhood_") or key in ("impactor_nodes", "impact_conditioning")
     or key == "time_encoding" or key.startswith("fourier_")
-    or key in ("pooling_query_residual", "pool_impactor_nodes")
+    or key in ("pooling_query_residual", "pool_impactor_nodes", "local_latents")
     or key.startswith("geometry_") or key == "teacher_forcing_chunks"
 )
 
@@ -259,12 +259,17 @@ def validate_runtime(require_cuda):
 
 
 def validate_cuda_model(data, decoder=MODEL_DEFAULTS["decoder"], neighbor_cache_dir=None,
-                        design_changes=None, design_change_options=None, **neighborhood_options):
+                        design_changes=None, design_change_options=None, reference=None, **neighborhood_options):
     """Exercise the selected decoder and learned spatial-bias gradients.
 
     With ``design_changes`` (find_design_changes output) the probe is a
     DesignChangeHistoryNet whose first run is read with an edited design's
     change nodes, so the change readouts must receive a gradient.
+
+    With ``reference`` = (times, acceleration in g) of the reference design at
+    the first run's impact, the probe reads it as its reference response: the
+    untrained model must return it exactly, and the reference input must get a
+    gradient.
     """
     # Standardize this one example only for numerical stability in the probe.
     # These temporary statistics never reach training or a saved checkpoint.
@@ -281,6 +286,8 @@ def validate_cuda_model(data, decoder=MODEL_DEFAULTS["decoder"], neighbor_cache_
     time = torch.as_tensor((time - time_mean) / time_scale, device="cuda")
     model_kwargs = dict(width=16, num_heads=2, num_latents=4, latent_layers=1,
                         temporal_layers=1, dropout=0.0, decoder=decoder, **neighborhood_options)
+    if reference is not None:
+        model_kwargs["reference_response"] = True
     if design_changes is None:
         model = MeshImpactHistoryNet(**model_kwargs).to("cuda")
     else:
@@ -291,8 +298,22 @@ def validate_cuda_model(data, decoder=MODEL_DEFAULTS["decoder"], neighbor_cache_
                       if np.abs(change["static"][:, 3:6]).max(initial=0) > 0)
         model.design_changes = DesignChangeTable.from_changes(design_changes)
         model.design_changes.register(mesh[model.impactor_nodes:], edited)
+        if model.design_change_features == "edit":
+            from mesh_design_change import change_displacement_rms
+            model.set_change_displacement_scale(change_displacement_rms(design_changes, design_changes))
     model.set_coordinate_scalers(mean, scale, mean[:2], scale[:2])
     model.set_time_scaler(time_mean, time_scale)
+    reference_curve = None
+    if reference is not None:
+        from reference_response import ReferenceResponseTable
+        reference_times, reference_accel = (np.asarray(array, dtype=np.float32) for array in reference)
+        accel = np.asarray(data["accelerations"][0], dtype=np.float32)
+        accel_mean, accel_scale = float(accel.mean()), max(float(accel.std()), 1e-6)
+        model.reference_table = ReferenceResponseTable(
+            np.asarray(data["indentor_positions"][0], dtype=np.float64)[None],
+            (reference_times - time_mean) / time_scale, ((reference_accel - accel_mean) / accel_scale)[None])
+        model.set_reference_delta_scale(0.1)
+        reference_curve = torch.as_tensor(model.reference_table.curves[0], device="cuda")
     if model.neighborhood_blocks and neighbor_cache_dir is not None:
         model.neighbor_cache.directory = Path(neighbor_cache_dir)
         start = model.impactor_nodes
@@ -309,12 +330,21 @@ def validate_cuda_model(data, decoder=MODEL_DEFAULTS["decoder"], neighbor_cache_
         if rollout.shape != time.shape or not torch.isfinite(rollout).all():
             raise ValueError("CUDA model probe produced an invalid rollout history")
         inputs["history"] = torch.sin(3 * time)
+    if reference_curve is not None:
+        with torch.no_grad():
+            start = model(**inputs)
+        if reference_curve.shape != time.shape or not torch.allclose(start, reference_curve, rtol=0, atol=1e-6):
+            raise ValueError("CUDA model probe: the untrained reference-response model does not return the "
+                             "reference curve (the probe's run and reference must share one time grid)")
+        # The zero output layer would block every other gradient on this first pass.
+        with torch.no_grad():
+            model.acceleration_head[-1].weight.normal_(std=0.1)
     prediction = model(**inputs)
     if prediction.shape != time.shape or not torch.isfinite(prediction).all():
         raise ValueError("CUDA model probe produced an invalid acceleration history")
     prediction.square().mean().backward()
     gradients = [parameter.grad for parameter in model.parameters() if parameter.grad is not None]
-    if model.local_log_precision.grad is None or not gradients or not all(
+    if (model.local_latents and model.local_log_precision.grad is None) or not gradients or not all(
         torch.isfinite(gradient).all() for gradient in gradients
     ):
         raise ValueError("CUDA model probe produced missing spatial-bias or nonfinite gradients")
@@ -330,6 +360,10 @@ def validate_cuda_model(data, decoder=MODEL_DEFAULTS["decoder"], neighbor_cache_
             readout.output.weight.grad is None or not readout.output.weight.grad.abs().sum() > 0
             for readout in model.change_readouts):
         raise ValueError("CUDA model probe produced no gradient for a design-change readout")
+    if reference_curve is not None:
+        reference_gradient = model.reference_embedding[0].weight.grad
+        if reference_gradient is None or not reference_gradient.abs().sum() > 0:
+            raise ValueError("CUDA model probe produced no gradient for the reference-response embedding")
     history_gradient = model.history_embedding[0].weight.grad if model.teacher_forcing_chunks else None
     if model.teacher_forcing_chunks and (history_gradient is None or not history_gradient.abs().sum() > 0):
         raise ValueError("CUDA model probe produced no gradient for the teacher-forcing history embedding")

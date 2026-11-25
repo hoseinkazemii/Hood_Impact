@@ -87,6 +87,22 @@ def check_decks(geometry, manifest, inp_dir, designs):
         print(f"Mesh check: {name} = design 6 + {moved} moved nodes matches {deck.name} (max error {error:.1e} mm)")
 
 
+def check_reference_locations(manifest):
+    """Every edited run's impact point must match one design-6 run's (the reference lookup key)."""
+    from reference_response import MATCH_TOLERANCE_MM, ReferenceResponseTable
+
+    base = manifest[manifest["design"] == BASE_DESIGN].sort_values("location")
+    table = ReferenceResponseTable(base[["x_mm", "y_mm"]].to_numpy(float), [0.0], np.zeros((len(base), 1)),
+                                   labels=base["location"].to_numpy())
+    edited = manifest[manifest["design"] != BASE_DESIGN]
+    rows = table.lookup(edited[["x_mm", "y_mm"]].to_numpy(float))
+    wrong = edited["location"].to_numpy() != table.labels[rows]
+    if wrong.any():
+        raise ValueError(f"{int(wrong.sum())} edited runs match a design-6 run at another location number")
+    print(f"Reference: all {len(edited)} edited runs match design 6's impact point at their location "
+          f"(within {MATCH_TOLERANCE_MM} mm)")
+
+
 def main(argv=None):
     args = parse_args(argv)
     try:
@@ -94,8 +110,8 @@ def main(argv=None):
             raise ValueError("This preflight is for --data-format localedits")
         if args.mesh_nodes != "inner_panel":
             raise ValueError("localedits builds only inner-panel meshes")
-        if args.design_change_nodes and args.design_change_features != "xyz":
-            raise ValueError("localedits change tables carry no panel gaps; use --design-change-features xyz")
+        if args.design_change_nodes and args.design_change_features not in ("xyz", "edit"):
+            raise ValueError("localedits change tables carry no panel gaps; use --design-change-features xyz or edit")
         inp_dir = args.inp_dir or str(DEFAULT_ROOT / "inp_files")
         manifest_path = args.impact_coords_path or str(DEFAULT_ROOT / "manifest_local_edits.csv")
         acceleration_dir = args.acceleration_dir or str(DEFAULT_ROOT / "output_history_acc")
@@ -123,9 +139,11 @@ def main(argv=None):
         row = manifest[manifest["design_id"] == design].iloc[0]
         base_row = manifest[(manifest["design"] == BASE_DESIGN) & (manifest["location"] == row["location"])].iloc[0]
         times, accel = processor.load_acceleration_history(int(row["run"]))
-        base_times, _ = processor.load_acceleration_history(int(base_row["run"]))
+        base_times, base_accel = processor.load_acceleration_history(int(base_row["run"]))
         if not np.array_equal(times, base_times):
             raise ValueError("Edited and design-6 curves are not on the same sampled time grid")
+        if args.reference_response:
+            check_reference_locations(manifest)
         data = {"run_numbers": [sample_number(design, int(row["location"]))],
                 "mesh_geometries": [geometry.mesh(design)],
                 "indentor_positions": [np.array([row["x_mm"], row["y_mm"]], dtype=np.float32)],
@@ -141,6 +159,7 @@ def main(argv=None):
                 data, decoder=args.decoder, neighbor_cache_dir=cache,
                 design_changes={design: geometry.changes(design)} if args.design_change_nodes else None,
                 design_change_options={key: getattr(args, key) for key in DESIGN_CHANGE_DEFAULTS},
+                reference=(base_times, base_accel) if args.reference_response else None,
                 **{key: getattr(args, key) for key in EXPERIMENT_MODEL_KEYS})
         else:
             print("CUDA probe: skipped (--device is not cuda)")

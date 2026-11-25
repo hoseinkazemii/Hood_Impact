@@ -152,7 +152,8 @@ def saved_model_kwargs(kwargs: dict) -> dict:
     headform rows and kept the query residual, so they replay with both on.
     """
     return {"impact_conditioning": "legacy_additive", "time_encoding": "legacy_five",
-            "pooling_query_residual": True, "pool_impactor_nodes": True, **kwargs}
+            "pooling_query_residual": True, "pool_impactor_nodes": True,
+            "neighborhood_scale_mm": 20.0, "local_latents": None, **kwargs}  # None: half the tokens local
 
 
 class FiLM(nn.Module):
@@ -202,9 +203,10 @@ class GeometryMemoryEncoder(nn.Module):
 class MeshImpactHistoryNet(nn.Module):
     """Impact-conditioned full-mesh attention, then a mesh-reading decoder.
 
-    Half of the learned mesh queries have unrestricted global attention. The
-    remaining queries learn different radial preferences around the impact XY
-    location. Both banks see every node, preserving the original irregular mesh.
+    ``local_latents`` of the learned mesh queries (default half; 0 in new
+    training runs) learn radial preferences around the impact XY location; the
+    rest attend to the whole hood with no spatial bias. Every query sees every
+    node, preserving the original irregular mesh.
     Attention costs O(N * L) for N nodes and L latent tokens; an N-by-N mesh
     attention matrix is never constructed.
 
@@ -297,6 +299,15 @@ class MeshImpactHistoryNet(nn.Module):
     one pass; without it (validation, test, inference) the model rolls out,
     feeding each chunk its own prediction of the earlier ones. Needs the
     ``"temporal"`` decoder. With 0 (the default) the network is unchanged.
+
+    Reference response. With ``reference_response=True`` the output is
+    a_ref(t) + s * head(t), where a_ref is the reference design's simulated
+    curve at the same load case (``reference_table``, see
+    reference_response.py) and s is ``reference_delta_scale``. Every time query
+    also embeds a_ref(t). The head's last layer starts at zero, so a new model
+    returns a_ref exactly and the loss is spent on the edit effect only. Not
+    combinable with teacher forcing. With False (the default) the network is
+    unchanged.
     """
 
     def __init__(
@@ -312,6 +323,7 @@ class MeshImpactHistoryNet(nn.Module):
         neighborhood_k: int = 16,
         neighborhood_scale_mm: float = 20.0,
         neighborhood_chunk_size: int = 1024,
+        local_latents: int | None = None,
         impactor_nodes: int = 0,
         impact_conditioning: str = "film",
         time_encoding: str = "fourier",
@@ -324,6 +336,7 @@ class MeshImpactHistoryNet(nn.Module):
         geometry_fourier_octaves: int = 5,
         node_extra_features: int = 0,
         teacher_forcing_chunks: int = 0,
+        reference_response: bool = False,
     ):
         super().__init__()
         integer_options = {
@@ -360,8 +373,13 @@ class MeshImpactHistoryNet(nn.Module):
             raise ValueError("A single Fourier frequency requires equal minimum and maximum frequencies")
         if isinstance(neighborhood_layers, bool) or not isinstance(neighborhood_layers, int) or neighborhood_layers < 0:
             raise ValueError("neighborhood_layers must be a nonnegative integer")
-        if not math.isfinite(neighborhood_scale_mm) or neighborhood_scale_mm <= 0:
-            raise ValueError("neighborhood_scale_mm must be finite and positive")
+        # 0: offsets in units of the mesh's own median distance to the k-th neighbour.
+        if not math.isfinite(neighborhood_scale_mm) or neighborhood_scale_mm < 0:
+            raise ValueError("neighborhood_scale_mm must be finite and nonnegative (0 = from the mesh)")
+        if local_latents is None:
+            local_latents = num_latents // 2  # every run before 2026-11-22
+        if isinstance(local_latents, bool) or not isinstance(local_latents, int) or not 0 <= local_latents < num_latents:
+            raise ValueError("local_latents must be an integer in [0, num_latents)")
         if isinstance(impactor_nodes, bool) or not isinstance(impactor_nodes, int) or impactor_nodes < 0:
             raise ValueError("impactor_nodes must be a nonnegative integer")
         if (isinstance(node_extra_features, bool) or not isinstance(node_extra_features, int)
@@ -382,6 +400,11 @@ class MeshImpactHistoryNet(nn.Module):
         if teacher_forcing_chunks and decoder != "temporal":
             raise ValueError("teacher forcing passes earlier chunks through the temporal attention; "
                              "use decoder='temporal'")
+        if not isinstance(reference_response, bool):
+            raise ValueError("reference_response must be True or False")
+        if reference_response and teacher_forcing_chunks:
+            raise ValueError("reference_response already gives the model the reference history; "
+                             "use teacher_forcing_chunks=0")
 
         self.decoder = decoder
         self.impact_conditioning = impact_conditioning
@@ -389,7 +412,9 @@ class MeshImpactHistoryNet(nn.Module):
         self.width = width
         self.num_heads = num_heads
         self.num_latents = num_latents
-        self.num_global_latents = num_latents // 2
+        self.local_latents = local_latents
+        self.num_global_latents = num_latents - local_latents
+        self.neighborhood_scale_mm = neighborhood_scale_mm
         self.attention_dropout = dropout
         self.neighborhood_k = neighborhood_k
         self.impactor_nodes = impactor_nodes
@@ -398,6 +423,9 @@ class MeshImpactHistoryNet(nn.Module):
         self.geometry_film = geometry_film
         self.node_extra_features = node_extra_features
         self.teacher_forcing_chunks = teacher_forcing_chunks
+        self.reference_response = reference_response
+        # Plain attribute, never a buffer: built from the reference runs (reference_response.py).
+        self.reference_table = None
 
         # The shared preprocessor fits mesh and impact scalers independently.
         # Store their affine maps in the checkpoint so relative coordinates
@@ -423,9 +451,10 @@ class MeshImpactHistoryNet(nn.Module):
         self.mesh_output = nn.Linear(width, width)
         self.mesh_dropout = nn.Dropout(dropout)
 
-        local_count = num_latents - self.num_global_latents
-        initial_precision = torch.logspace(math.log10(0.5), math.log10(32.0), local_count)
-        self.local_log_precision = nn.Parameter(torch.log(torch.expm1(initial_precision)))
+        self.local_log_precision = None
+        if local_latents:
+            initial_precision = torch.logspace(math.log10(0.5), math.log10(32.0), local_latents)
+            self.local_log_precision = nn.Parameter(torch.log(torch.expm1(initial_precision)))
         self.latent_blocks = nn.ModuleList([
             LatentMixingBlock(width, num_heads, dropout) for _ in range(latent_layers)
         ])
@@ -465,7 +494,8 @@ class MeshImpactHistoryNet(nn.Module):
         if neighborhood_layers:
             from mesh_neighborhood import NeighborGraphCache, NeighborhoodAttentionBlock
             self.neighborhood_blocks.extend([
-                NeighborhoodAttentionBlock(width, num_heads, dropout, neighborhood_scale_mm, neighborhood_chunk_size)
+                NeighborhoodAttentionBlock(width, num_heads, dropout, neighborhood_scale_mm or 1.0,
+                                           neighborhood_chunk_size)
                 for _ in range(neighborhood_layers)
             ])
             # Plain attribute, never a buffer: the graph is derived from the
@@ -489,6 +519,33 @@ class MeshImpactHistoryNet(nn.Module):
             self.history_embedding = nn.Sequential(
                 nn.Linear(1, width), nn.GELU(), nn.Linear(width, width),
             )
+        if reference_response:
+            # Input: the reference design's normalized acceleration at each time.
+            self.reference_embedding = nn.Sequential(
+                nn.Linear(1, width), nn.GELU(), nn.Linear(width, width),
+            )
+            # s in a_ref + s * head; the trainer sets it to the training RMS of a - a_ref.
+            self.register_buffer("reference_delta_scale", torch.ones(()))
+            nn.init.zeros_(self.acceleration_head[-1].weight)
+            nn.init.zeros_(self.acceleration_head[-1].bias)
+
+    @torch.no_grad()
+    def set_reference_delta_scale(self, scale: float) -> None:
+        """Set s in a_ref + s * head (normalized units)."""
+        if not self.reference_response:
+            raise ValueError("This model was built without reference_response")
+        if not math.isfinite(scale) or scale <= 0:
+            raise ValueError("The reference delta scale must be finite and positive")
+        self.reference_delta_scale.fill_(float(scale))
+
+    def reference_curves(self, indentor: Tensor, time: Tensor, valid: Tensor) -> Tensor:
+        """Normalized reference curves (B, T) at the normalized ``time`` (B, T) of each sample's load case."""
+        if self.reference_table is None:
+            raise RuntimeError("This model reads reference responses but has no reference_table; the trainer "
+                               "builds it from the reference runs, and saved runs keep it in reference_responses.npz")
+        impact_mm = (indentor * self.impact_scale + self.impact_mean).detach().double().cpu().numpy()
+        index = torch.as_tensor(self.reference_table.lookup(impact_mm), device=time.device)
+        return self.reference_table.curves_at(index, time, valid)
 
     @torch.no_grad()
     def set_time_scaler(self, mean: float, scale: float) -> None:
@@ -576,6 +633,10 @@ class MeshImpactHistoryNet(nn.Module):
                 f"got {len(coordinates)} after holding out {self.impactor_nodes} impactor nodes"
             )
         neighbors = self.neighbor_cache.neighbors(coordinates, self.neighborhood_k)
+        if not self.neighborhood_scale_mm:
+            # No hand-set length: offsets in units of this mesh's median distance to its k-th neighbour.
+            radius = (coordinates[neighbors[:, -1]] - coordinates).norm(dim=-1).median().detach()
+            coordinates = coordinates / radius.clamp_min(1e-6)
         updated = nodes[self.impactor_nodes:]
         if self.geometry_film == "all" and node_geometry is None:
             node_geometry = self.geometry_encoder(mesh[:, :3])
@@ -607,12 +668,11 @@ class MeshImpactHistoryNet(nn.Module):
         key = key.reshape(-1, self.num_heads, head_width).transpose(0, 1)
         value = value.reshape(-1, self.num_heads, head_width).transpose(0, 1)
 
-        # Global tokens have zero spatial bias. Local tokens have soft learned
-        # radial priors, never a hard node cutoff or arbitrary node sampling.
-        precision = torch.cat((
-            self.local_log_precision.new_zeros(self.num_global_latents),
-            F.softplus(self.local_log_precision),
-        ))
+        # Global tokens have zero spatial bias. Local tokens (if any) have soft
+        # learned radial priors, never a hard node cutoff or node sampling.
+        precision = mesh.new_zeros(self.num_global_latents)
+        if self.local_latents:
+            precision = torch.cat((precision, F.softplus(self.local_log_precision)))
         radius_squared = self.impact_relative_xy(mesh, impact).square().sum(dim=-1)
         spatial_bias = -precision[:, None] * radius_squared.unsqueeze(0)
         if not self.pool_impactor_nodes and self.impactor_nodes:
@@ -782,6 +842,10 @@ class MeshImpactHistoryNet(nn.Module):
         queries = self.time_embedding(time_features)
         if self.impact_conditioning == "legacy_additive":
             queries = queries + condition[:, None, :]
+        reference = None
+        if self.reference_response:
+            reference = self.reference_curves(indentor, padded_time, ~padding_mask)
+            queries = queries + self.reference_embedding(reference.unsqueeze(-1))
         decoder_context = self._decoder_context(mesh, mesh_batch, indentor, batch_size)
         if self.teacher_forcing_chunks:
             if padding_mask.any():
@@ -790,6 +854,8 @@ class MeshImpactHistoryNet(nn.Module):
             padded_acceleration = self._decode_chunks(queries, memory, padding_mask, decoder_context, padded_history)
         else:
             padded_acceleration = self._decode(queries, memory, padding_mask, decoder_context)
+        if reference is not None:
+            padded_acceleration = reference + self.reference_delta_scale * padded_acceleration
 
         # Restore even interleaved input time batches without cross-sample
         # attention or predictions for padded positions.

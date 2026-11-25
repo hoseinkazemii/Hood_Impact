@@ -93,7 +93,7 @@ def test_new_model_is_node_order_invariant_isolates_meshes_and_backpropagates():
 
 @pytest.mark.parametrize("options", [
     {"neighborhood_layers": -1}, {"neighborhood_layers": True}, {"neighborhood_k": 0},
-    {"neighborhood_chunk_size": 0}, {"neighborhood_scale_mm": float("nan")}, {"neighborhood_scale_mm": 0},
+    {"neighborhood_chunk_size": 0}, {"neighborhood_scale_mm": float("nan")}, {"neighborhood_scale_mm": -1.0},
     {"impactor_nodes": -1}, {"impactor_nodes": True}, {"impactor_nodes": 1.5},
 ])
 def test_invalid_neighborhood_configuration_fails(options):

@@ -178,6 +178,25 @@ class LocalEditDataTest(unittest.TestCase):
                 self.assertEqual(sorted(runs["split"].unique()), ["test", "train", "validation"])
 
 
+class GlobalPoolingTest(unittest.TestCase):
+    def test_all_global_tokens_and_mesh_derived_neighborhood_scale(self):
+        import torch
+        from mesh_impact_history import MeshImpactHistoryNet, saved_model_kwargs
+        torch.manual_seed(0)
+        model = MeshImpactHistoryNet(width=16, num_heads=2, num_latents=4, latent_layers=1, temporal_layers=1,
+                                     neighborhood_layers=1, neighborhood_k=4, neighborhood_scale_mm=0.0,
+                                     local_latents=0)
+        self.assertEqual((model.num_global_latents, model.local_log_precision), (4, None))
+        mesh = torch.randn(30, 3)
+        out = model(mesh, torch.zeros(30, dtype=torch.long), torch.zeros(1, 2), torch.linspace(-1, 1, 5),
+                    torch.zeros(5, dtype=torch.long), batch_size=1)
+        out.square().mean().backward()
+        self.assertTrue(torch.isfinite(out).all())
+        old = MeshImpactHistoryNet(**saved_model_kwargs({"impact_conditioning": "film", "time_encoding": "fourier"}),
+                                   num_latents=4, width=16, num_heads=2)
+        self.assertEqual((old.local_latents, old.neighborhood_scale_mm), (2, 20.0))
+
+
 class LocalEditConfigTest(unittest.TestCase):
     def test_localedits_needs_inner_panel_and_xyz_tokens(self):
         with tempfile.TemporaryDirectory() as directory:

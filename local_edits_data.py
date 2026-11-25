@@ -212,13 +212,27 @@ def load_local_edit_data(preprocessor, include_base=False):
 
 def base_reference_curves(preprocessor):
     """{location: acceleration} of design 6, sampled like the training curves, and their times."""
+    locations, _, times, curves = base_reference_runs(preprocessor)
+    return dict(zip(locations.tolist(), curves)), times
+
+
+def base_reference_runs(preprocessor):
+    """Design 6 at every location: (locations (L,), impact XY (L, 2) mm, times (T,), curves (L, T) in g).
+
+    Sampled like the training curves. --reference-response builds the model's
+    reference table from these (reference_response.py).
+    """
     manifest = load_manifest(preprocessor.config.impact_coords_path)
-    curves, times = {}, None
-    for row in manifest[manifest["design"] == BASE_DESIGN].itertuples():
+    base = manifest[manifest["design"] == BASE_DESIGN].sort_values("location")
+    if base.empty:
+        raise ValueError("The manifest has no design-6 runs to use as the reference")
+    curves, times = [], None
+    for row in base.itertuples():
         run_times, accel = preprocessor.load_acceleration_history(int(row.run))
         if times is None:
             times = run_times
         elif not np.array_equal(times, run_times):
             raise ValueError("Design-6 curves do not share one time grid")
-        curves[int(row.location)] = np.asarray(accel, dtype=np.float64)
-    return curves, times
+        curves.append(np.asarray(accel, dtype=np.float64))
+    return (base["location"].to_numpy(np.int64), base[["x_mm", "y_mm"]].to_numpy(np.float64),
+            times, np.stack(curves))

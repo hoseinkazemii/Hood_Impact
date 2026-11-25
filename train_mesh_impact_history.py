@@ -41,6 +41,9 @@ MODEL_DEFAULTS = {
     "width": 128,
     "num_heads": 4,
     "num_latents": 256,
+    # Pooling queries with a radial bias around the impact point. 0 (since
+    # 2026-11-22): every query reads the whole hood. Earlier runs used half.
+    "local_latents": 0,
     "latent_layers": 3,
     "temporal_layers": 2,
     "dropout": 0.1,
@@ -54,7 +57,9 @@ MODEL_DEFAULTS = {
     "fourier_max_frequency_hz": 640.0,
     "neighborhood_layers": 0,
     "neighborhood_k": 256,
-    "neighborhood_scale_mm": 20.0,
+    # 0 = kNN offsets in units of the mesh's median distance to the k-th
+    # neighbour (since 2026-11-22; earlier runs used a fixed 20 mm).
+    "neighborhood_scale_mm": 0.0,
     "neighborhood_chunk_size": 1024,
     # Leading rigid-headform nodes held out of local attention and, unless
     # pool_impactor_nodes is set, of pooling. The 1704 .inp files put the 286
@@ -70,6 +75,10 @@ MODEL_DEFAULTS = {
     # ones: true accelerations in training, its own predictions in validation
     # and test. 0 is the plain network.
     "teacher_forcing_chunks": 0,
+    # Output = reference design's simulated curve at the same impact + s * network
+    # output, with the reference curve also an input (reference_response.py).
+    # Local-edit data only, where design 6 is the reference.
+    "reference_response": False,
 }
 BOOLEAN_MODEL_KEYS = tuple(key for key, value in MODEL_DEFAULTS.items() if isinstance(value, bool))
 # Decoder path over the near-clone change nodes (mesh_design_change.py), used
@@ -77,6 +86,7 @@ BOOLEAN_MODEL_KEYS = tuple(key for key, value in MODEL_DEFAULTS.items() if isins
 # path won the 2026-10-25 sweep (run 3447060; README_design_change_nodes.md).
 # Its tokens are each change node's XYZ (octaves apply to impact_relative only),
 # read by plain attention; runs before 2026-10-30 scaled values by displacement.
+# "edit" tokens (reference position + displacement) are chosen per launcher.
 DESIGN_CHANGE_DEFAULTS = {"design_change_layers": 0, "design_change_fourier_octaves": 2,
                           "design_change_features": "xyz", "design_change_displacement_gate": False}
 # Fresh runs see only the hood inner panel; runs saved without the key used "all".
@@ -331,8 +341,11 @@ def build_config(args):
             raise ValueError("localedits numbers samples as 142 * design + location; keep --samples-per-design 142")
         if config.mesh_nodes != "inner_panel":
             raise ValueError("localedits builds only inner-panel meshes; use --mesh-nodes inner_panel")
-        if args.design_change_nodes and args.design_change_features != "xyz":
-            raise ValueError("localedits change tables carry no panel gaps; use --design-change-features xyz")
+        if args.design_change_nodes and args.design_change_features not in ("xyz", "edit"):
+            raise ValueError("localedits change tables carry no panel gaps; use --design-change-features xyz or edit")
+    if args.reference_response and config.data_format != "localedits":
+        raise ValueError("--reference-response reads design 6's curves as the reference; it needs "
+                         "--data-format localedits")
     return config
 
 
@@ -401,8 +414,10 @@ def resolved_config(config, args, model_kwargs, prediction_grid):
     if config.data_format == "localedits":
         data_config["local_edits"] = {
             "sample_number": "142 * n + location for design Nn (design ID n)",
-            "base_design": "D6, excluded from training, validation, test and scalers; its true curves are only "
-                           "the reference for local_edit_metrics.json",
+            "base_design": "D6, excluded from training, validation, test and scalers; its true curves are "
+                           + ("the model's reference input and output base (reference_response) and "
+                              if getattr(args, "reference_response", False) else "only ")
+                           + "the reference for local_edit_metrics.json",
             "mesh": "inner panel of one design-6 deck plus dz from design_changes/<design>_changed_nodes.csv",
             "samples_file": "local_edit_samples.csv",
         }
@@ -578,6 +593,10 @@ class HistoryPredictor:
             # Only hoods saved with the run are known; DesignChangeTable.register adds others.
             from mesh_design_change import TABLE_FILE, DesignChangeTable
             model.design_changes = DesignChangeTable.load(run_dir / TABLE_FILE)
+        if getattr(model, "reference_response", False):
+            # Predictions exist only at the load cases of the saved reference runs.
+            from reference_response import TABLE_FILE as REFERENCE_FILE, ReferenceResponseTable
+            model.reference_table = ReferenceResponseTable.load(run_dir / REFERENCE_FILE)
         if model.neighborhood_blocks:
             from mesh_neighborhood import default_neighbor_cache_directory
             stored = (saved.get("neighbor_graph_cache") or {}).get("directory")
@@ -621,6 +640,46 @@ class HistoryPredictor:
             batch_size=1,
         )
         return self.preprocessor.inverse_transform_acceleration(prediction.cpu().numpy())
+
+
+def attach_reference_responses(model, preprocessor, train_dataset, output_dir, source_dir, logger):
+    """Give the model design 6's curves and the output scale s; save the table beside the run.
+
+    Both come from fitted training scalers and training runs only: s is the RMS of
+    (a - a_D6) over the training runs, i.e. the training RMSE of copying design 6.
+    """
+    from local_edits_data import base_reference_runs
+    from reference_response import TABLE_FILE as REFERENCE_FILE, ReferenceResponseTable, residual_rms
+
+    locations, loads, times, curves = base_reference_runs(preprocessor)
+    table = ReferenceResponseTable(
+        loads, preprocessor.transform_time(np.asarray(times, dtype=np.float32)),
+        np.stack([preprocessor.transform_acceleration(np.asarray(curve, dtype=np.float32)) for curve in curves]),
+        labels=locations,
+    )
+    if source_dir is not None and not table.same_as(ReferenceResponseTable.load(source_dir / REFERENCE_FILE)):
+        raise ValueError("The reference responses differ from the resume run's; the data or scalers changed")
+    scale = residual_rms(
+        table, train_dataset.indentor_positions,
+        [preprocessor.transform_time(np.asarray(t, dtype=np.float32)) for t in train_dataset.time_arrays],
+        [preprocessor.transform_acceleration(np.asarray(a, dtype=np.float32)) for a in train_dataset.accelerations],
+    )
+    model.reference_table = table
+    model.set_reference_delta_scale(scale)
+    table.save(output_dir / REFERENCE_FILE)
+    scale_g = scale * float(preprocessor.accel_scaler.scale_[0])
+    logger.info("Reference response: design 6 at %s locations | output = a_D6 + s * network, s = %.4f "
+                "(normalized) = %.2f g, the training RMSE of copying design 6", len(locations), scale, scale_g)
+    return {
+        "file": REFERENCE_FILE,
+        "reference": "design 6 (D6): its own simulated curve at the same impact location",
+        "output": "a_D6(t) + s * network(t) in normalized units; every time query also reads a_D6(t)",
+        "load_cases": int(len(locations)),
+        "delta_scale_normalized": scale,
+        "delta_scale_g": scale_g,
+        "delta_scale_definition": "RMS of (a - a_D6) over the training runs = training RMSE of copying design 6",
+        "initialization": "the output head's last layer is zero, so the untrained model returns a_D6",
+    }
 
 
 def main(argv=None):
@@ -781,9 +840,20 @@ def main(argv=None):
             )
             if source_dir is not None and not model.design_changes.same_as(DesignChangeTable.load(source_dir / TABLE_FILE)):
                 raise ValueError("The design-change table differs from the resume run's; the decks or scalers changed")
+            if model.design_change_features == "edit":
+                from mesh_design_change import change_displacement_rms
+                scale = change_displacement_rms(design_changes, splits["train"]["design_ids"])
+                model.set_change_displacement_scale(scale)
+                design_change_report["registration"]["edit_displacement_scale_mm"] = scale
+                logger.info("Edit tokens: reference position + displacement / %.3f mm (RMS displacement length "
+                            "of the training designs' moved nodes)", scale)
             model.design_changes.save(output_dir / TABLE_FILE)
             write_json(output_dir / "design_change_nodes.json", design_change_report)
             logger.info("Design-change table: %s", design_change_report["registration"])
+        reference_report = None
+        if model.reference_response:
+            reference_report = attach_reference_responses(model, preprocessor, train_dataset, output_dir,
+                                                          source_dir, logger)
         first_times =np.asarray(train_dataset.time_arrays[0], dtype=np.float32)
         if source_dir is not None and not np.array_equal(
                 first_times, np.load(source_dir / "prediction_times.npy", allow_pickle=False)):
@@ -823,6 +893,10 @@ def main(argv=None):
             saved_config["design_change"] = {key: design_change_report[key]
                                              for key in ("rule", "static_channels", "clusters", "registration")}
             saved_config["design_change"]["file"] = "design_change_nodes.json"
+            if model.design_change_features == "edit":
+                saved_config["design_change"]["edit_displacement_scale_mm"] = float(model.change_displacement_scale)
+        if reference_report is not None:
+            saved_config["reference_response"] = reference_report
         if source_dir is not None:
             saved_config["training"]["resumed_after_epoch"] = completed
         write_json(output_dir / "config.json", saved_config)
