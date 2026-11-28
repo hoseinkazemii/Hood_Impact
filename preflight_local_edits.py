@@ -27,7 +27,8 @@ import torch
 # before the scheduler starts the full dataset load.
 from train_mesh_impact_history import MODEL_DEFAULTS, Config, DataPreprocessor, parse_args, validate_data
 from local_edits_data import (
-    BASE_DESIGN, LOCATIONS, LocalEditGeometry, base_inner_panel, dataset_rows, design_name, sample_number,
+    BASE_DESIGN, BASE_DESIGN_ID, LOCATIONS, LocalEditGeometry, base_inner_panel, dataset_rows, design_name,
+    sample_number,
 )
 from local_edit_metrics import design_classes
 from mesh_design_change import DesignChangeHistoryNet, DesignChangeTable, change_displacement_rms
@@ -48,12 +49,14 @@ def validate_runtime(require_cuda):
         raise ValueError("CUDA was requested but is unavailable in this Python environment")
 
 
-def validate_cuda_model(data, design, change, neighbor_cache_dir, model_options):
+def validate_cuda_model(data, design, change, neighbor_cache_dir, model_options, base_mesh=None):
     """CUDA forward/backward of a small DesignChangeHistoryNet with the configured options.
 
     The first run is read with its edited design's change nodes, so the change
-    readouts must receive a gradient. Mesh, impact and time are standardized
-    with this one example's statistics; nothing reaches training.
+    readouts must receive a gradient (and, with change locality, the locality
+    rates). With ``base_mesh`` (training on design 6) that hood is also read as
+    a design with no change nodes. Mesh, impact and time are standardized with
+    this one example's statistics; nothing reaches training.
     """
     mesh = np.asarray(data["mesh_geometries"][0], dtype=np.float32)
     mean = mesh.mean(axis=0)
@@ -69,7 +72,10 @@ def validate_cuda_model(data, design, change, neighbor_cache_dir, model_options)
     model = DesignChangeHistoryNet(width=16, num_heads=2, num_latents=4, latent_layers=1, temporal_layers=1,
                                    dropout=0.0, **model_options).to("cuda")
     # Wiring probe only: training registers each design's own meshes instead.
-    model.design_changes = DesignChangeTable.from_changes({design: change})
+    changes = {design: change}
+    if base_mesh is not None:
+        changes[BASE_DESIGN_ID] = {"static": np.zeros((0, 6), np.float32)}
+    model.design_changes = DesignChangeTable.from_changes(changes)
     model.design_changes.register(mesh, design)
     if model.design_change_features == "edit":
         model.set_change_displacement_scale(change_displacement_rms({design: change}, [design]))
@@ -95,10 +101,25 @@ def validate_cuda_model(data, design, change, neighbor_cache_dir, model_options)
     if any(readout.output.weight.grad is None or not readout.output.weight.grad.abs().sum() > 0
            for readout in model.change_readouts):
         raise ValueError("CUDA model probe produced no gradient for a design-change readout")
+    if model.change_locality and model.change_log_rate.grad is None:
+        raise ValueError("CUDA model probe: the change-locality rates are not in the graph")
+    if base_mesh is not None:
+        base = torch.as_tensor((np.asarray(base_mesh, dtype=np.float32) - mean) / scale, device="cuda")
+        model.design_changes.register(base, BASE_DESIGN_ID)
+        if model.neighborhood_blocks:
+            model.neighbor_cache.register_geometry(base_mesh, base * model.mesh_scale, model.neighborhood_k)
+        with torch.no_grad():
+            base_prediction = model(mesh=base, mesh_batch=torch.zeros(len(base), device="cuda", dtype=torch.long),
+                                    indentor=impact, time=time,
+                                    time_batch=torch.zeros(len(time), device="cuda", dtype=torch.long),
+                                    batch_size=1)
+        if not torch.isfinite(base_prediction).all():
+            raise ValueError("CUDA model probe: design 6 (no change nodes) gave an invalid history")
     torch.cuda.synchronize()
     print(f"GPU: {torch.cuda.get_device_name(0)} | {type(model).__name__} "
-          f"(change tokens: {model.design_change_features}) | "
-          f"neighborhood_layers={len(model.neighborhood_blocks)} | forward/backward: passed")
+          f"(change tokens: {model.design_change_features}, change locality: {model.change_locality}) | "
+          f"neighborhood_layers={len(model.neighborhood_blocks)} | forward/backward: passed"
+          + (" | design 6 read with no change nodes: passed" if base_mesh is not None else ""))
     if model.neighborhood_blocks:
         print(f"Neighbor graph cache: built={model.neighbor_cache.builds} | loaded from disk={model.neighbor_cache.disk_hits}")
 
@@ -133,7 +154,9 @@ def check_split(args, designs, classes):
             info = classes.loc[name]
             print(f"Split: {label} {name} | {info['class']} at {info['site']} | {EDITED_LOCATIONS} runs")
     training = [d for d in designs if d not in test | val]
-    print(f"Split: training {len(training)} designs, {len(training) * EDITED_LOCATIONS} runs | design 6 not trained on")
+    base = (f"design 6 trained on too ({LOCATIONS} runs, no change nodes)" if args.train_on_base_design
+            else "design 6 not trained on")
+    print(f"Split: training {len(training)} edited designs, {len(training) * EDITED_LOCATIONS} runs | {base}")
     return training
 
 
@@ -202,7 +225,8 @@ def main(argv=None):
             options = {key: getattr(args, key) for key in MODEL_DEFAULTS
                        if key not in ("width", "num_heads", "num_latents", "latent_layers", "temporal_layers",
                                       "dropout")}
-            validate_cuda_model(data, design, geometry.changes(design), cache, options)
+            validate_cuda_model(data, design, geometry.changes(design), cache, options,
+                                base_mesh=geometry.mesh(BASE_DESIGN_ID) if args.train_on_base_design else None)
         else:
             print("CUDA probe: skipped (--device is not cuda)")
         print("Preflight passed.")

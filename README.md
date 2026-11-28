@@ -38,8 +38,10 @@ two mirror twins give 1,296 runs across the three splits. Design 6 supplies
 reference curves at all 142 locations.
 
 A run of design Nn at location L has sample number `142 * n + L`; `--test-designs 54`
-means N54. Design 6 is never trained on and never an input: its curves are read only
-after training, as the reference the edit effects are measured from.
+means N54. Design 6 is never an input: its curves are the reference the edit effects
+are measured from. By default it is not trained on either; `--train-on-base-design true`
+adds its 142 runs as ordinary training samples (design ID 0, no change nodes). It is
+never held out, and the edit metrics and baselines still score edited designs only.
 
 ## Train
 
@@ -50,7 +52,19 @@ bash -l setup_mesh_impact_history_env_delta.sh       # once
 sbatch run_mesh_change_local_edits_delta.sbatch      # test N54, validation N55
 sbatch --export=ALL,HOOD_LOCAL_EDITS_CHANGE_FEATURES=xyz run_mesh_change_local_edits_delta.sbatch
 sbatch --export=ALL,HOOD_MESH_RESUME_FROM=runs/mesh_impact_history/<run> run_mesh_change_local_edits_delta.sbatch
+# Options of 2026-11-28 (off by default; the default is still run 24537698):
+sbatch --export=ALL,HOOD_LOCAL_EDITS_TRAIN_ON_BASE=true run_mesh_change_local_edits_delta.sbatch
+sbatch --export=ALL,HOOD_LOCAL_EDITS_CHANGE_LOCALITY=true run_mesh_change_local_edits_delta.sbatch
+sbatch --export=ALL,HOOD_LOCAL_EDITS_TRAIN_ON_BASE=true,HOOD_LOCAL_EDITS_CHANGE_LOCALITY=true,HOOD_LOCAL_EDITS_SEED=43 run_mesh_change_local_edits_delta.sbatch
 ```
+
+`HOOD_LOCAL_EDITS_CHANGE_LOCALITY=true` (`--change-locality true`): each change-readout
+head lowers its attention to a moved node by `w * r^2`, `r` = the node's distance from
+the impact point in normalized mesh units, `w` learned per head; an edit far from the
+impact then adds nothing. It needs a load location input, so problems with one fixed
+load (the B1-B4 benchmarks) keep it off, which is the plain readout. Training on the
+base design carries over to B1-B4 unchanged: each family's `base` design is stored
+with zero change nodes (see `tests/test_base_design_and_locality.py`).
 
 Locally (the trainer's defaults are the launcher's model):
 

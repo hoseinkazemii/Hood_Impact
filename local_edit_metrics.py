@@ -1,7 +1,10 @@
 """Edit-effect metrics of a run trained on the local-edit dataset.
 
 Every edited run is scored against design 6's true curve at the same impact
-location. Design 6 is the base the edits were made on; it is never trained on.
+location. Design 6 is the base the edits were made on. When a run also trained
+on it (``--train-on-base-design``), its own runs are not edits: they are left
+out of every edit-effect score and baseline below, and reported on their own
+as ``base_design_fit`` (how well the training fit the unedited hood).
 
     d(t) = a_design(t) - a_D6(t)        true edit effect
     p(t) = a_predicted(t) - a_D6(t)     predicted edit effect
@@ -37,7 +40,7 @@ import numpy as np
 import pandas as pd
 
 from hic15 import batched_hic
-from local_edits_data import BASE_DESIGN, design_name, load_manifest, sample_design, sample_location
+from local_edits_data import BASE_DESIGN, BASE_DESIGN_ID, design_name, load_manifest, sample_design, sample_location
 
 REPORT_FILE = "local_edit_metrics.json"
 RUNS_FILE = "local_edit_runs.csv"
@@ -107,6 +110,16 @@ def _curves(values, dataset, steps):
     return np.asarray(values, dtype=np.float64).reshape(len(dataset.run_numbers), steps)
 
 
+def _base_design_fit(truth, predicted, times):
+    """Fit of design 6's own runs (a training design when --train-on-base-design): acceleration and HIC15."""
+    hic_true, hic_pred = batched_hic(times, truth), batched_hic(times, predicted)
+    error = 100.0 * (hic_pred / hic_true - 1.0)
+    return {"runs": int(len(truth)),
+            "accel_rmse_g": float(np.sqrt(np.mean((predicted - truth) ** 2))),
+            "hic15_sampled_error_mean_abs_pct": float(np.abs(error).mean()),
+            "hic15_sampled_error_max_abs_pct": float(np.abs(error).max())}
+
+
 def local_edit_report(splits, base_curves, base_times, manifest_path):
     """Score ``splits`` = {name: (dataset, predictions, targets)}; "train" must be one of them.
 
@@ -121,19 +134,27 @@ def local_edit_report(splits, base_curves, base_times, manifest_path):
             raise ValueError(f"The {name} curves are not on design 6's sampled time grid")
     masks = _window_masks(base_times)
 
+    # Baselines come from the edited training designs only, with or without design 6 in training.
     train_set, _, train_targets = splits["train"]
-    train_curves = _curves(train_targets, train_set, steps)
     train_design = np.array([sample_design(s) for s in train_set.run_numbers])
-    train_location = np.array([sample_location(s) for s in train_set.run_numbers])
+    edited = train_design != BASE_DESIGN_ID
+    train_curves = _curves(train_targets, train_set, steps)[edited]
+    train_design = train_design[edited]
+    train_location = np.array([sample_location(s) for s in train_set.run_numbers])[edited]
     train_names = [design_name(d) for d in train_design]
     train_site = np.array([classes.loc[n, "site"] for n in train_names])
     train_sign = np.array([classes.loc[n, "sign"] for n in train_names])
 
-    records, plot_curves = [], {}
+    records, plot_curves, base_fits = [], {}, {}
     for split, (dataset, predictions, targets) in splits.items():
         truth, predicted = _curves(targets, dataset, steps), _curves(predictions, dataset, steps)
+        base_rows = [i for i, s in enumerate(dataset.run_numbers) if sample_design(s) == BASE_DESIGN_ID]
+        if base_rows:
+            base_fits[split] = _base_design_fit(truth[base_rows], predicted[base_rows], base_times)
         for index, sample in enumerate(dataset.run_numbers):
             design, location = sample_design(sample), sample_location(sample)
+            if design == BASE_DESIGN_ID:
+                continue
             name, row = design_name(design), manifest.loc[int(sample)]
             if location not in base_curves:
                 raise ValueError(f"No design-6 curve at location {location}")
@@ -220,12 +241,16 @@ def local_edit_report(splits, base_curves, base_times, manifest_path):
         }
 
     report = {"metric": "edit-effect (design - design 6) difference R2", "definition": DEFINITION,
-              "base_design": BASE_DESIGN, "base_use": "reference only; never trained on",
+              "base_design": BASE_DESIGN,
+              "base_use": ("reference; also a training design, left out of the edit scores and baselines"
+                           if base_fits else "reference only; never trained on"),
               "windows_ms": [[a, b] for a, b in WINDOWS_MS],
               "time_points": steps, "splits": {}}
     for split in splits:
         rows = frame[frame["split"] == split]
         entry = summarize(rows)
+        if split in base_fits:
+            entry["base_design_fit"] = base_fits[split]
         entry["by_class"] = {cls: summarize(group) for cls, group in rows.groupby("class")}
         if split != "train":
             entry["by_design"] = {name: summarize(group) for name, group in rows.groupby("design")}
@@ -254,6 +279,10 @@ def local_edit_log_values(report, prefix="local_edits"):
         values[f"{key}/copy_d6_hic_change_mae_pct"] = mae["copy_d6"]
         values[f"{key}/sibling_hic_change_mae_pct"] = mae["sibling_copy_same_runs"]
         values[f"{key}/hic_change_r2"] = entry["hic15_sampled"]["change_r2"]
+        if "base_design_fit" in entry:
+            values[f"{key}/base_design_accel_rmse_g"] = entry["base_design_fit"]["accel_rmse_g"]
+            values[f"{key}/base_design_hic_error_mean_abs_pct"] = entry["base_design_fit"][
+                "hic15_sampled_error_mean_abs_pct"]
     return {k: v for k, v in values.items() if v is not None and np.isfinite(v)}
 
 
@@ -356,8 +385,10 @@ def time_window_metrics(train, test, num_windows):
         return np.asarray(values, dtype=np.float64).reshape(len(dataset.run_numbers), steps)
 
     truth = curves(targets, test_set)
-    training = curves(train_targets, train_set)
-    train_locations = np.array([sample_location(run) for run in train_set.run_numbers])
+    # The location mean is a baseline of the edited training designs, as in local_edit_report.
+    edited = np.array([sample_design(run) != BASE_DESIGN_ID for run in train_set.run_numbers])
+    training = curves(train_targets, train_set)[edited]
+    train_locations = np.array([sample_location(run) for run in train_set.run_numbers])[edited]
     test_locations = np.array([sample_location(run) for run in test_set.run_numbers])
     means = {place: training[train_locations == place].mean(axis=0) for place in set(train_locations.tolist())}
     covered = np.array([place in means for place in test_locations.tolist()])

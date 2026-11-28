@@ -6,7 +6,8 @@ local_edit_runs.csv, plus the dataset (manifest, design_changes/, design-6 histo
 the design-6 deck for the inner-panel outline).
 
 Terms
-  effect          a_design(t) - a_D6(t) at the same impact location (D6 = base hood, never trained on)
+  effect          a_design(t) - a_D6(t) at the same impact location (D6 = base hood; a training design
+                  only in runs with --train-on-base-design, and never among the scored runs)
   difference R2   1 - sum((p - d)^2) / sum(d^2) over runs and times; 0 = copy design 6
   sibling copy    D6 + mean effect of the training designs with the same site and sign there
   twin copy       the effect at the mirror-image location of the same design (solver repeatability)

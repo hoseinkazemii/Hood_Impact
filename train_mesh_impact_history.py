@@ -2,8 +2,14 @@
 
 Inputs are the hood geometry (the design-6 inner panel with each design's
 edited nodes) and the impact location; the target is the acceleration history.
-Design 6 is never trained on: its true curves are read only after training, as
-the reference the edit effects are measured from (local_edit_metrics.json).
+No simulated response is ever a network input.
+
+Design 6, the unedited base hood, is by default not trained on: its true curves
+are read only after training, as the reference the edit effects are measured
+from (local_edit_metrics.json). With ``--train-on-base-design true`` its 142 runs
+are also ordinary training samples (its geometry in, its curve as the target,
+no change nodes); it is never held out, and the edit-effect metrics and their
+baselines still score the edited designs only.
 
     python train_mesh_impact_history.py --test-designs 54 --val-designs 55 --device cuda
 
@@ -32,8 +38,8 @@ import wandb
 
 from local_edit_metrics import local_edit_log_values, local_edit_report, time_window_metrics, write_local_edit_report
 from local_edits_data import (
-    BASE_DESIGN, base_reference_curves, design_name, load_design_changes, load_manifest, sample_design,
-    sample_location,
+    BASE_DESIGN, BASE_DESIGN_ID, base_reference_curves, design_name, load_design_changes, load_manifest,
+    sample_design, sample_location,
 )
 from mesh_design_change import (
     CHANGE_FEATURES, TABLE_FILE, DesignChangeHistoryNet, DesignChangeTable, change_displacement_rms,
@@ -72,6 +78,9 @@ MODEL_DEFAULTS = {
     # Change tokens: reference position + displacement ("edit", since
     # 2026-11-24) or the position after the edit ("xyz").
     "design_change_features": "edit",
+    # Learned per-head fall-off of the change readouts' attention with a change
+    # node's distance from the impact point (mesh_design_change.py, 2026-11-28).
+    "change_locality": False,
 }
 # Test N54 and validation N55: the strongest, most repeatable edit effects.
 DEFAULT_TEST_DESIGNS = (54,)
@@ -83,6 +92,16 @@ TIME_WINDOWS = 5
 WANDB_INIT_ATTEMPTS = 3
 WANDB_INIT_TIMEOUT_SECONDS = 300
 WANDB_RETRY_DELAY_SECONDS = 60
+
+
+def parse_bool(text):
+    """'true'/'false' (also 1/0, yes/no) for switches given as values, as the launcher passes them."""
+    value = str(text).strip().lower()
+    if value in ("true", "1", "yes"):
+        return True
+    if value in ("false", "0", "no"):
+        return False
+    raise argparse.ArgumentTypeError(f"expected true or false; got {text!r}")
 
 
 def parse_args(argv=None):
@@ -103,10 +122,15 @@ def parse_args(argv=None):
     parser.add_argument("--time-subsample-stride", type=int,
                         help="Keep every Nth source time/target sample (16 by default: 63 of 1000 points).")
     parser.add_argument("--device", help="PyTorch device, e.g. cpu, cuda, or cuda:0.")
+    parser.add_argument("--train-on-base-design", type=parse_bool, default=False, metavar="{true,false}",
+                        help="Also train on design 6, the unedited base hood (its 142 runs, no change nodes). "
+                             "It is never held out or scored as an edit.")
     for key, default in MODEL_DEFAULTS.items():
         option = f"--{key.replace('_', '-')}"
         if key == "design_change_features":
             parser.add_argument(option, choices=CHANGE_FEATURES, default=default)
+        elif isinstance(default, bool):
+            parser.add_argument(option, type=parse_bool, default=default, metavar="{true,false}")
         else:
             parser.add_argument(option, type=type(default), default=default)
     parser.add_argument("--output-dir", help="New run directory; defaults to runs/mesh_impact_history/<timestamp>.")
@@ -166,6 +190,8 @@ def restore_resume_arguments(args, parser, argv):
                 "lr": saved["training"]["learning_rate"],
                 "max_train_time": saved["preprocessing"]["max_train_time"],
                 "time_subsample_stride": saved["preprocessing"]["time_subsample_stride"],
+                # Runs saved before 2026-11-28 never trained on design 6.
+                "train_on_base_design": bool(saved["data"].get("local_edits", {}).get("train_on_base_design", False)),
                 "test_designs": splits["test"]["design_ids"],
                 "val_designs": splits["validation"]["design_ids"]}
     explicit = {token.split("=", 1)[0] for token in argv if token.startswith("--")}
@@ -244,6 +270,8 @@ def resolve_splits(data, test_designs, val_designs):
         raise ValueError("Validation and test design lists must both be nonempty")
     if test_ids & val_ids:
         raise ValueError(f"Validation and test design IDs overlap: {sorted(test_ids & val_ids)}")
+    if BASE_DESIGN_ID in test_ids | val_ids:
+        raise ValueError("Design 6 (design ID 0) is the base hood the edits are measured from; it cannot be held out")
     design_ids = {sample_design(run) for run in data["run_numbers"]}
     missing = (test_ids | val_ids) - design_ids
     if missing:
@@ -267,12 +295,18 @@ def resolved_config(config, args, model_kwargs, prediction_grid):
     data_config = {"data_format": "localedits",
                    **{key: str(Path(getattr(config, key)).resolve())
                       for key in ("inp_dir", "impact_coords_path", "acceleration_dir")}}
+    base_use = (
+        "D6 is also a training design: its runs (no change nodes) are ordinary training samples and enter "
+        "the scalers; it is never held out, and local_edit_metrics.json scores only the edited designs, "
+        "against D6's true curves (never a network input)" if args.train_on_base_design else
+        "D6, excluded from training, validation, test and scalers; its geometry is the mesh every design "
+        "is built on, and its true curves are read only after training, as the reference for "
+        "local_edit_metrics.json (never a network input)")
     data_config["local_edits"] = {
         "excluded_impact_roles": ["far"],
         "sample_number": "142 * n + location for design Nn (design ID n)",
-        "base_design": "D6, excluded from training, validation, test and scalers; its geometry is the "
-                       "mesh every design is built on, and its true curves are read only after training, "
-                       "as the reference for local_edit_metrics.json (never a network input)",
+        "train_on_base_design": bool(args.train_on_base_design),
+        "base_design": base_use,
         "mesh": "inner panel of one design-6 deck plus dz from design_changes/<design>_changed_nodes.csv",
         "samples_file": "local_edit_samples.csv",
     }
@@ -543,15 +577,17 @@ def main(argv=None):
         )
         # Every edited design's moved nodes, listed exactly by the generator.
         manifest = load_manifest(config.impact_coords_path)
+        edited = sorted(manifest.loc[manifest["design"] != BASE_DESIGN, "design_id"].unique())
+        # Design 6 itself, when trained on, is a design with no change nodes.
         design_changes, design_change_report = load_design_changes(
             config.impact_coords_path, config.inp_dir,
-            sorted(manifest.loc[manifest["design"] != BASE_DESIGN, "design_id"].unique()),
+            [BASE_DESIGN_ID, *edited] if args.train_on_base_design else edited,
         )
-        counts = [len(change["rows"]) for change in design_changes.values()]
+        counts = [len(design_changes[design]["rows"]) for design in edited]
         logger.info("Design-change nodes: %s edited designs | %s-%s moved nodes each | base %s",
                     len(counts), min(counts), max(counts), design_change_report["base_deck"])
         preprocessor = DataPreprocessor(config)
-        data = preprocessor.load_all_data()
+        data = preprocessor.load_all_data(include_base=args.train_on_base_design)
         validate_data(data)
         logger.info("Mesh: inner panel, %s nodes | %s runs loaded", len(data["mesh_geometries"][0]),
                     len(data["run_numbers"]))
@@ -565,12 +601,17 @@ def main(argv=None):
             "location": [sample_location(s) for s in data["run_numbers"]],
             "split": [split_of[s] for s in data["run_numbers"]],
         }).to_csv(output_dir / "local_edit_samples.csv", index=False)
+        base_runs = sum(sample_design(run) == BASE_DESIGN_ID for run in splits["train"]["run_numbers"])
         logger.info("Local edits: test %s (%s runs) | validation %s (%s runs) | training %s designs (%s runs) "
-                    "| design 6 not trained on", [design_name(d) for d in splits["test"]["design_ids"]],
+                    "| %s", [design_name(d) for d in splits["test"]["design_ids"]],
                     len(splits["test"]["run_numbers"]),
                     [design_name(d) for d in splits["validation"]["design_ids"]],
                     len(splits["validation"]["run_numbers"]), len(splits["train"]["design_ids"]),
-                    len(splits["train"]["run_numbers"]))
+                    len(splits["train"]["run_numbers"]),
+                    f"design 6 trained on ({base_runs} of the training runs)" if base_runs
+                    else "design 6 not trained on")
+        if args.train_on_base_design and not base_runs:
+            raise ValueError("--train-on-base-design is set, but no design-6 run was loaded")
         train_loader, val_loader, test_loader, test_dataset = create_data_loaders(data, preprocessor, config, splits)
         train_dataset = train_loader.dataset
         if source_dir is not None:
@@ -686,7 +727,8 @@ def main(argv=None):
         # The training loader shuffles; export train histories in dataset order.
         train_eval_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=False,
                                        collate_fn=train_loader.collate_fn)
-        # Design 6 enters only here, as the reference the edit effects are measured from.
+        # Design 6's true curves: the reference the edit effects are measured from
+        # (with --train-on-base-design they were also training targets; never an input).
         base_curves, base_times = base_reference_curves(preprocessor)
 
         def evaluate_checkpoint(path, directory, prefix=""):
@@ -723,6 +765,8 @@ def main(argv=None):
                             entry["baselines"]["location_mean"]["difference_r2"],
                             entry["hic15_sampled"]["change_mae_pct_points"]["model"],
                             entry["hic15_sampled"]["change_mae_pct_points"]["copy_d6"])
+                if "base_design_fit" in entry:
+                    logger.info("%s%s design 6 (a training design): %s", prefix, split, entry["base_design_fit"])
             if matching_grid:
                 windows = time_window_metrics((train_dataset, train_predictions, train_targets),
                                               (test_dataset, predictions, targets), TIME_WINDOWS)

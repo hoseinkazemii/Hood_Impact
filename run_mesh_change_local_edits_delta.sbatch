@@ -24,10 +24,11 @@
 #   test        N54  crease cut line at x=30 (diagonal + centre beam 20 mm, +-30 mm)
 #   validation  N55  crease cut line at x=100
 #   training    the other 70 edits (1260 runs)
-#   design 6    not trained on, not in validation/test, not in the scalers. Its
-#               geometry is the mesh every design is built on; its true curves are
-#               read only after training, as the reference the edit effects are
-#               measured from (never a network input).
+#   design 6    by default not trained on, not in validation/test, not in the
+#               scalers (HOOD_LOCAL_EDITS_TRAIN_ON_BASE=true adds its 142 runs to
+#               training). Its geometry is the mesh every design is built on; its
+#               true curves are the reference the edit effects are measured from
+#               (never a network input).
 # N54 and N55 have the strongest, most repeatable edit effect in the data (mirror
 # twins agree with R2 0.94 and 0.90; HIC changes up to 36% and 43%) and no
 # location 114. Their two single-beam creases (N69/N70, N71/N72), half-depth
@@ -54,6 +55,23 @@
 #       from node IDs (design_changes/).
 #   xyz = position after the edit only (runs before 2026-11-24):
 #       sbatch --export=ALL,HOOD_LOCAL_EDITS_CHANGE_FEATURES=xyz run_mesh_change_local_edits_delta.sbatch
+#
+# Options added 2026-11-28 (both off by default, so the default is still run
+# 24537698, the best geometry-only model so far):
+#   HOOD_LOCAL_EDITS_TRAIN_ON_BASE=true    design 6's 142 runs are also training
+#       samples (unedited geometry in, its curve as the target, no change nodes).
+#       Covers the 49 locations no edited design was run at. Never an input,
+#       never held out; edit metrics and baselines still score edited designs only.
+#   HOOD_LOCAL_EDITS_CHANGE_LOCALITY=true  each change-readout head learns how
+#       fast its attention to a moved node falls off with the node's distance
+#       from the impact point (score - w * r^2, w learned), so an edit far from
+#       the impact adds nothing. Needs a load location input (the hood); a
+#       problem with one fixed load (B1-B4) keeps it off.
+#   HOOD_LOCAL_EDITS_SEED=43               another seed (default 42), for ensembles.
+# The output folder records them: _localedits_edit_base_local_s43 and so on.
+#   for seed in 42 43 44; do
+#     sbatch --export=ALL,HOOD_LOCAL_EDITS_TRAIN_ON_BASE=true,HOOD_LOCAL_EDITS_CHANGE_LOCALITY=true,HOOD_LOCAL_EDITS_SEED=$seed run_mesh_change_local_edits_delta.sbatch
+#   done
 #
 # Results in runs/mesh_impact_history/<stamp>_<job>_localedits/:
 #   local_edit_metrics.json         edit-effect difference R2 (design - design 6),
@@ -115,7 +133,23 @@ if [[ "${CHANGE_FEATURES}" != edit && "${CHANGE_FEATURES}" != xyz ]]; then
     echo "ERROR: HOOD_LOCAL_EDITS_CHANGE_FEATURES must be edit or xyz, not ${CHANGE_FEATURES}" >&2
     exit 2
 fi
+TRAIN_ON_BASE=${HOOD_LOCAL_EDITS_TRAIN_ON_BASE:-false}
+CHANGE_LOCALITY=${HOOD_LOCAL_EDITS_CHANGE_LOCALITY:-false}
+SEED=${HOOD_LOCAL_EDITS_SEED:-42}
+for SWITCH in TRAIN_ON_BASE CHANGE_LOCALITY; do
+    if [[ "${!SWITCH}" != true && "${!SWITCH}" != false ]]; then
+        echo "ERROR: HOOD_LOCAL_EDITS_${SWITCH} must be true or false, not ${!SWITCH}" >&2
+        exit 2
+    fi
+done
+if [[ ! "${SEED}" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: HOOD_LOCAL_EDITS_SEED must be a nonnegative integer, not ${SEED}" >&2
+    exit 2
+fi
 VARIANT=${CHANGE_FEATURES}
+if [[ "${TRAIN_ON_BASE}" == true ]]; then VARIANT+=_base; fi
+if [[ "${CHANGE_LOCALITY}" == true ]]; then VARIANT+=_local; fi
+if [[ "${SEED}" != 42 ]]; then VARIANT+=_s${SEED}; fi
 if [[ -n "${HOOD_MESH_RESUME_FROM:-}" ]]; then
     VARIANT=resumed  # a resume keeps the saved run's settings, whatever these variables say
 fi
@@ -138,11 +172,12 @@ else
         --acceleration-dir "${DATA_ROOT}/output_history_acc"
         --test-designs "${TEST_DESIGN}" --val-designs "${VAL_DESIGN}"
         --design-change-features "${CHANGE_FEATURES}"
+        --train-on-base-design "${TRAIN_ON_BASE}" --change-locality "${CHANGE_LOCALITY}"
         --fourier-num-frequencies 6 --fourier-min-frequency-hz 20 --fourier-max-frequency-hz 640
         --neighborhood-layers 2 --neighborhood-k 256 --neighborhood-scale-mm 0 --neighborhood-chunk-size 1024
         --local-latents 0 --time-subsample-stride 16
         --width 128 --num-heads 4 --num-latents 256 --latent-layers 3 --temporal-layers 2 --dropout 0.1
-        --epochs 100 --batch-size 8 --lr 0.0003 --weight-decay 0.00001 --seed 42
+        --epochs 100 --batch-size 8 --lr 0.0003 --weight-decay 0.00001 --seed "${SEED}"
         "${COMMON[@]}"
     )
 fi

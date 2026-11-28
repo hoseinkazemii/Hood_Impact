@@ -19,9 +19,11 @@ sample number 142 * n + L, with design 6 as design 0. A slot then means the same
 location in every design, and ``--test-designs 54`` means N54. The manifest run
 number (the Abaqus job and curve file number) is kept alongside it.
 
-Design 6 is left out of training, validation, test and the scalers. Its true
-curves are read only as the reference the edit effects are measured from
-(local_edit_metrics.py).
+Design 6 is the reference the edit effects are measured from
+(local_edit_metrics.py). By default it is left out of training, validation,
+test and the scalers; with the trainer's ``--train-on-base-design true`` its
+142 runs are also training samples (design ID 0, no change nodes). It is never
+a network input and never held out.
 """
 from __future__ import annotations
 
@@ -31,6 +33,7 @@ import numpy as np
 import pandas as pd
 
 BASE_DESIGN = "D6"
+BASE_DESIGN_ID = 0  # design ID (and sample-number block) of design 6
 LOCATIONS = 142
 MANIFEST_FILE = "manifest_local_edits.csv"
 CHANGES_DIR = "design_changes"
@@ -41,14 +44,14 @@ BASE_MATCH_TOLERANCE_MM = 1e-3
 def design_number(name: str) -> int:
     """'N54' -> 54; the base 'D6' -> 0."""
     if name == BASE_DESIGN:
-        return 0
+        return BASE_DESIGN_ID
     if not (isinstance(name, str) and name.startswith("N") and name[1:].isdigit() and int(name[1:]) > 0):
         raise ValueError(f"Unknown local-edit design name {name!r}")
     return int(name[1:])
 
 
 def design_name(number: int) -> str:
-    return BASE_DESIGN if int(number) == 0 else f"N{int(number)}"
+    return BASE_DESIGN if int(number) == BASE_DESIGN_ID else f"N{int(number)}"
 
 
 def sample_number(design: int, location: int) -> int:
@@ -126,7 +129,7 @@ class LocalEditGeometry:
         base_z (design 6), dx, dy, dz (mm). The edits move z only.
         """
         if design not in self._changes:
-            if design == 0:
+            if design == BASE_DESIGN_ID:
                 rows, dz = np.zeros(0, np.int64), np.zeros(0, np.float32)
             else:
                 table = read_changes(self.changes_dir, design_name(design))

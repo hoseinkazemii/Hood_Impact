@@ -112,10 +112,10 @@ class DataPreprocessor:
             time, acceleration = time[::stride], acceleration[::stride]
         return time, acceleration
 
-    def load_all_data(self) -> Dict:
-        """Every edited run of the local-edit dataset (design 6 is left out)."""
+    def load_all_data(self, include_base: bool = False) -> Dict:
+        """Every retained edited run of the local-edit dataset; design 6's runs too if ``include_base``."""
         from local_edits_data import load_local_edit_data
-        return load_local_edit_data(self)
+        return load_local_edit_data(self, include_base=include_base)
 
     def fit_scalers(self, mesh_geometries, indentor_positions, time_arrays, accelerations):
         self.mesh_scaler.fit(np.concatenate(mesh_geometries, axis=0))

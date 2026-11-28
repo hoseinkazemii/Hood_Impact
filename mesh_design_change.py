@@ -20,6 +20,26 @@ Token inputs (``design_change_features``):
 * ``"xyz"``: the node's coordinates in this design, normalized as the mesh
   (runs before 2026-11-24).
 
+A design without change nodes (the base design itself) has only the null
+token. With "edit" tokens its value is zero, so every readout adds exactly
+nothing and the prediction is the backbone's. Training on the base design
+(``--train-on-base-design``) therefore teaches the backbone the unedited
+response and leaves the readouts to carry the edits.
+
+Change locality (``change_locality=True``, since 2026-11-28): each readout head
+lowers its attention score for a change node by ``w * r**2``, where ``r`` is the
+node's distance from the load point (the impact point) and ``w`` a learned
+per-head rate (stored as log w). The null token is not penalized, so an edit far
+from the impact sends the attention to the null token and adds nothing. Distances
+are taken in the coordinates the load point is given in (x, y for the hood's
+vertical impact), in the backbone's normalized mesh units, so no length is set
+by hand. Starting rates are spread over the heads (0.5 to 32, ranges of about
+1.4 to 0.18 normalized units) and every rate is learned; a head that needs a
+long reach drives its rate to zero. Use it only when the load location is an
+input that varies between samples. A problem with one fixed load (the B1-B4
+benchmarks) has nothing to measure distances from; leave it off there, which
+is exactly the readout without locality.
+
 The model recognizes a hood by its normalized coordinates, as the
 neighbor-graph cache does. ``design_changes`` (a :class:`DesignChangeTable`)
 maps the digest of each known hood to its change nodes. The trainer fills it
@@ -51,6 +71,9 @@ CHANGE_INPUTS = {"xyz": 3, "edit": 6}
 # Keyword arguments of earlier saved runs that now have only one supported value.
 RETIRED_KWARGS = {"design_change_layers": 0, "design_change_displacement_gate": False}
 IGNORED_KWARGS = ("design_change_fourier_octaves",)
+# Starting locality rates w of the readout heads (normalized mesh units^-2),
+# log-spaced over the heads, like the radial pooling priors of earlier runs.
+CHANGE_LOCALITY_INITIAL_RATES = (0.5, 32.0)
 
 
 def saved_design_change_kwargs(kwargs: dict, *, format_version: int) -> dict:
@@ -173,8 +196,10 @@ class ChangeReadout(nn.Module):
         nn.init.zeros_(self.output.weight)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, queries: Tensor, tokens: Tensor, gate: Tensor | None, valid: Tensor) -> Tensor:
-        """queries (B, T, W); tokens (B, M, W); gate (B, M) or None; valid (B, M)."""
+    def forward(self, queries: Tensor, tokens: Tensor, gate: Tensor | None, valid: Tensor,
+                bias: Tensor | None = None) -> Tensor:
+        """queries (B, T, W); tokens (B, M, W); gate (B, M) or None; valid (B, M);
+        bias (B, heads, M) or None, added to every query's attention scores."""
         batch, steps, width = queries.shape
 
         def heads(values):
@@ -183,9 +208,13 @@ class ChangeReadout(nn.Module):
         key, value = self.key_value(tokens).chunk(2, dim=-1)
         if gate is not None:
             value = value * gate.unsqueeze(-1)
+        if bias is None:
+            mask = valid[:, None, None, :]
+        else:
+            mask = bias.masked_fill(~valid[:, None, :], float("-inf"))[:, :, None, :].to(queries.dtype)
         update = F.scaled_dot_product_attention(
             heads(self.query(self.query_norm(queries))), heads(key), heads(value),
-            attn_mask=valid[:, None, None, :],
+            attn_mask=mask,
             dropout_p=self.dropout_p if self.training else 0.0,
         )
         return queries + self.dropout(self.output(update.transpose(1, 2).reshape(batch, steps, width)))
@@ -194,11 +223,14 @@ class ChangeReadout(nn.Module):
 class DesignChangeHistoryNet(MeshImpactHistoryNet):
     """MeshImpactHistoryNet whose decoder also reads the design-change nodes directly."""
 
-    def __init__(self, design_change_features: str = "edit", **kwargs):
+    def __init__(self, design_change_features: str = "edit", change_locality: bool = False, **kwargs):
         if design_change_features not in CHANGE_FEATURES:
             raise ValueError(f"design_change_features must be one of {CHANGE_FEATURES}; got {design_change_features!r}")
+        if not isinstance(change_locality, bool):
+            raise ValueError(f"change_locality must be True or False; got {change_locality!r}")
         super().__init__(**kwargs)
         self.design_change_features = design_change_features
+        self.change_locality = change_locality
         # Added after every backbone module, so one seed gives the backbone the
         # same initial weights as MeshImpactHistoryNet.
         width = self.width
@@ -217,6 +249,13 @@ class DesignChangeHistoryNet(MeshImpactHistoryNet):
         if design_change_features == "edit":
             # Set from the training designs before use; NaN until then.
             self.register_buffer("change_displacement_scale", torch.full((), float("nan")))
+        self.change_log_rate = None
+        if change_locality:
+            # (readouts, heads) log of the rate w in the score penalty w * r^2. Drawn
+            # from no random generator, so seeded weights are unchanged.
+            low, high = CHANGE_LOCALITY_INITIAL_RATES
+            rates = torch.logspace(math.log10(low), math.log10(high), self.num_heads)
+            self.change_log_rate = nn.Parameter(rates.log().repeat(len(self.change_readouts), 1))
 
     @torch.no_grad()
     def set_change_displacement_scale(self, scale_mm: float) -> None:
@@ -257,10 +296,31 @@ class DesignChangeHistoryNet(MeshImpactHistoryNet):
         if self.design_change_features == "edit":
             # Zero value for the null token only: no edit, no update.
             gate = torch.cat((static.new_zeros(batch_size, 1), static.new_ones(batch_size, static.shape[1])), dim=1)
-        return self.change_norm(tokens), gate, valid
+        distance_squared = self.change_distance_squared(static, indentor) if self.change_locality else None
+        return self.change_norm(tokens), gate, valid, distance_squared
+
+    def change_distance_squared(self, static: Tensor, indentor: Tensor) -> Tensor:
+        """(B, M) squared distance of each change node from the load point, in normalized mesh units.
+
+        The load point (``indentor``, normalized by the impact scaler) has D
+        coordinates; they are the first D mesh axes (x, y for the hood), and the
+        distance uses those axes. Both points are mapped to the mesh scaler's
+        units, the coordinates the backbone itself reads.
+        """
+        dims = indentor.shape[1]
+        load = (indentor * self.impact_scale + self.impact_mean - self.mesh_mean[:dims]) / self.mesh_scale[:dims]
+        position = (static[..., :dims] - self.mesh_mean[:dims]) / self.mesh_scale[:dims]
+        return (position - load[:, None, :]).square().sum(dim=-1)
 
     def _read_decoder_context(self, index: int, queries: Tensor, context) -> Tensor:
-        return self.change_readouts[index](queries, *context)
+        tokens, gate, valid, distance_squared = context
+        bias = None
+        if distance_squared is not None:
+            # The null token (column 0) is never penalized.
+            rate = self.change_log_rate[index].exp()
+            penalty = -rate[None, :, None] * distance_squared[:, None, :]
+            bias = torch.cat((penalty.new_zeros(penalty.shape[0], penalty.shape[1], 1), penalty), dim=2)
+        return self.change_readouts[index](queries, tokens, gate, valid, bias)
 
 
 def change_displacement_rms(changes, designs) -> float:
