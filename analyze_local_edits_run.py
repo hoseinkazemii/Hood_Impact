@@ -1033,6 +1033,8 @@ def fig_summary(ctx, pairs, path, design="N54", location=141):
                edgecolor=INK, lw=1.0, zorder=5)
     r2m, r2s = r2_zero(p, t), r2_zero(s[has_sib], t[has_sib])
     slope = float(np.sum(p * t) / np.sum(t * t))
+    big = np.abs(t) >= 3.0
+    sign_pct = 100.0 * float(np.mean(np.sign(p[big]) == np.sign(t[big]))) if big.any() else float("nan")
     handles = [Line2D([], [], color=MODEL, marker="o", ls="", label=f"model   R² {r2m:.2f}, slope {slope:.2f}"),
                Line2D([], [], color=SIBLING, marker="o", mfc="none", ls="", label=f"sibling copy   R² {r2s:.2f}"),
                Line2D([], [], color=MUTED, marker="o", ls="", label="circle N54 (test), square N55 (validation)")]
@@ -1041,7 +1043,8 @@ def fig_summary(ctx, pairs, path, design="N54", location=141):
     ax.set_xlabel("simulated HIC change vs design 6 (%)")
     ax.set_ylabel("predicted HIC change (%)")
     ax.set_title(f"(c) All {len(held)} held-out runs: HIC change caused by the edit\n"
-                 "right sign almost always; large drops come out ~0.7x too small", loc="left")
+                 f"right sign on {sign_pct:.0f}% of runs with |change| ≥ 3%; "
+                 f"predicted/true size (slope) {slope:.2f}", loc="left")
     _style(ax)
 
     # (d) telling two designs apart at the same impact location
@@ -1072,9 +1075,18 @@ def fig_summary(ctx, pairs, path, design="N54", location=141):
     ax.legend(frameon=False, fontsize=7.8, loc="upper left")
     _style(ax)
 
-    fig.suptitle("Local-edit run 3654261 (70 training designs, 1,400 runs): the model learns where an edit acts "
-                 "and its sign,\nbut shrinks how much it changes the response, most of all between designs "
-                 "that edit the same spot", x=0.06, ha="left", fontsize=11.5, color=INK)
+    train = ctx.runs["split"] == "train"
+    parts = ctx.run_dir.name.split("_")
+    run_name = "_".join(parts[2:]) if len(parts) > 2 else ctx.run_dir.name
+    held_r2 = ", ".join(
+        f"{d} {r2_zero(ctx.Pe[(ctx.runs['design'] == d).to_numpy()], ctx.D[(ctx.runs['design'] == d).to_numpy()]):.2f}"
+        for d in sorted(held["design"].unique()))
+    sib_in = ins.get("sibling (same site & sign)", {}).get("pair_r2", np.nan)
+    sib_out = out.get("sibling (same site & sign)", {}).get("pair_r2", np.nan)
+    fig.suptitle(f"Local-edit run {run_name} ({ctx.runs.loc[train, 'design'].nunique()} training designs, "
+                 f"{int(train.sum()):,} runs)\nheld-out edit-effect R² {held_r2}  |  HIC-change slope {slope:.2f}  |  "
+                 f"sibling pair R² {sib_in:.2f} in-sample, {sib_out:.2f} held-out",
+                 x=0.06, ha="left", fontsize=11.5, color=INK)
     fig.savefig(path, dpi=170)
     plt.close(fig)
 

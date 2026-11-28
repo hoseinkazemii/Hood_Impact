@@ -90,49 +90,31 @@ def test_disk_reload_after_memory_eviction_does_not_repeat_search(tmp_path):
 
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA unavailable"))])
-def test_raw_geometry_reuses_graph_across_scalers_and_headform_positions(tmp_path, device):
+def test_raw_geometry_reuses_graph_across_scalers(tmp_path, device):
     torch.manual_seed(8)
     structure = (torch.randn(19, 3) * torch.tensor([100., 20., 5.]) + torch.tensor([1000., -50., 800.])).numpy()
     first = NeighborGraphCache(directory=tmp_path)
     expected = first.neighbors(torch.from_numpy(structure), 6)
-    meshes = [np.concatenate((np.full((2, 3), impact, dtype=np.float32), structure)) for impact in (0., 100.)]
+    # Every impact location on a design shares one mesh, hence one graph.
+    meshes = [structure, structure.copy()]
     for statistics in ([structure], [structure, structure + [100., 15., 2.]]):
         scaler = StandardScaler().fit(np.concatenate(statistics))
         model = MeshImpactHistoryNet(width=16, num_heads=2, num_latents=4, latent_layers=1,
-            temporal_layers=1, dropout=0, neighborhood_layers=2, neighborhood_k=6, impactor_nodes=2).to(device)
+            temporal_layers=1, dropout=0, neighborhood_layers=2, neighborhood_k=6).to(device)
         model.set_coordinate_scalers(scaler.mean_, scaler.scale_, scaler.mean_[:2], scaler.scale_[:2])
         preprocessor = SimpleNamespace(transform_mesh=scaler.transform)
         with mock.patch("mesh_neighborhood.geometric_neighbors", side_effect=AssertionError("Unexpected kNN search")):
             report = prepare_model_neighbor_graphs(model, preprocessor, meshes, tmp_path)
             for mesh in meshes:
                 normalized = torch.as_tensor(scaler.transform(mesh), dtype=torch.float32, device=device)
-                coordinates = normalized[2:] * model.mesh_scale
+                coordinates = normalized * model.mesh_scale
                 torch.testing.assert_close(model.neighbor_cache.neighbors(coordinates, 6).cpu(), expected, atol=0, rtol=0)
                 nodes = torch.randn(len(mesh), 16, device=device, requires_grad=True)
                 output = model._encode_neighborhoods(normalized, nodes)
                 output.square().mean().backward()
                 assert nodes.grad is not None and torch.isfinite(nodes.grad).all()
                 assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.neighborhood_blocks.parameters())
-        assert report["unique_structural_geometries"] == report["loaded_from_disk"] == 1
+        assert report["unique_geometries"] == report["loaded_from_disk"] == 1
         assert report["built"] == 0
         assert not any("neighbor_cache" in key for key in model.state_dict())
     assert len(list(tmp_path.glob("*.npz"))) == 1
-
-
-def test_precompute_checks_first_and_last_impact_and_reuses_graph(tmp_path):
-    from precompute_mesh_neighbors_1704 import main
-    structure = np.arange(27, dtype=np.float32).reshape(9, 3)
-    def load_mesh(run):
-        return np.concatenate((np.full((2, 3), run, dtype=np.float32), structure))
-    args = ["--data-root", str(tmp_path), "--impactor-nodes", "2", "--k", "4", "--designs", "0", "1"]
-    with mock.patch("precompute_mesh_neighbors_1704.DataPreprocessor.load_mesh_geometry", side_effect=load_mesh):
-        result = main(args)
-        assert result["unique_files"] == 1 and len(result["designs"]) == 2
-        assert (tmp_path / "neighbor_graphs" / "manifest_k4.json").is_file()
-        with mock.patch("mesh_neighborhood.geometric_neighbors", side_effect=AssertionError("Unexpected kNN search")):
-            second = main(args)
-            assert second["built"] == 0 and second["loaded_from_disk"] == 1
-    with mock.patch("precompute_mesh_neighbors_1704.DataPreprocessor.load_mesh_geometry",
-                    side_effect=lambda run: np.full((11, 3), run, dtype=np.float32)):
-        with pytest.raises(ValueError, match="differs between runs"):
-            main(args)

@@ -5,7 +5,7 @@ inner-panel nodes moved in z. design_changes/<design>_changed_nodes.csv lists
 them: label, x, y, z_design6, dz (mm). Each edit N1..N72 was solved at 20
 impact locations (16 near the edit, 2 mirror twins, 2 far), design 6 ("D6") at
 all 142. Every run used the same Abaqus time step, a 1.0 mm headform start gap
-and 8 cores.
+and 8 cores. The model dataset uses the 16 near and 2 twin locations per edit.
 
 Meshes. Training reads one design-6 deck only: the mesh of design Nn is the
 inner panel of that deck with dz added at the listed nodes, which equals the
@@ -13,9 +13,9 @@ design's own decks (preflight_local_edits.py checks this). Only the inner panel
 is supported, as the full node block holds the headform at a location-dependent
 position.
 
-Sample numbers. The trainer identifies a run's design as (number - 1) // 142,
-as on the 1704 set, so a run of design Nn at location L gets the sample number
-142 * n + L, with design 6 as design 0. A slot then means the same impact
+Sample numbers. The trainer identifies a run's design as (number - 1) // 142
+(the 142 Euro-NCAP grid locations), so a run of design Nn at location L gets the
+sample number 142 * n + L, with design 6 as design 0. A slot then means the same impact
 location in every design, and ``--test-designs 54`` means N54. The manifest run
 number (the Abaqus job and curve file number) is kept alongside it.
 
@@ -120,7 +120,11 @@ class LocalEditGeometry:
         return cls(*base_inner_panel(deck), Path(manifest_path).parent / CHANGES_DIR), manifest, deck
 
     def changes(self, design: int) -> dict:
-        """Rows, node IDs and STATIC_CHANNELS rows of design ``design`` (an int)."""
+        """Mesh rows, node IDs and "static" rows of design ``design`` (an int).
+
+        Static columns (mesh_design_change.STATIC_CHANNELS): base_x, base_y,
+        base_z (design 6), dx, dy, dz (mm). The edits move z only.
+        """
         if design not in self._changes:
             if design == 0:
                 rows, dz = np.zeros(0, np.int64), np.zeros(0, np.float32)
@@ -138,15 +142,9 @@ class LocalEditGeometry:
                 dz = table["dz"].to_numpy(np.float32)
                 if np.abs(dz).min(initial=1.0) <= 0:
                     raise ValueError(f"{design_name(design)}: a listed node has dz = 0")
-            base = self.base_xyz[rows]
-            # base_x, base_y, base_z, dx, dy, dz, base_gap, gap_change, outer
-            # (design_change_nodes.STATIC_CHANNELS). The edits move z only and lie on
-            # the inner panel; gap channels are not computed, so only the "xyz"
-            # change-token features are valid on this dataset.
-            static = np.zeros((len(rows), 9), np.float32)
-            static[:, :3], static[:, 5] = base, dz
-            self._changes[design] = {"cluster": [0, design], "base": 0, "node_ids": self.base_ids[rows],
-                                     "static": static, "rows": rows}
+            static = np.zeros((len(rows), 6), np.float32)
+            static[:, :3], static[:, 5] = self.base_xyz[rows], dz
+            self._changes[design] = {"node_ids": self.base_ids[rows], "static": static, "rows": rows}
         return self._changes[design]
 
     def mesh(self, design: int) -> np.ndarray:
@@ -160,42 +158,39 @@ class LocalEditGeometry:
         return self._meshes[design]
 
 
-def load_design_changes(manifest_path, inp_dir, designs, mesh_nodes="inner_panel"):
-    """Change nodes of ``designs`` (ints) as design_change_nodes.find_design_changes returns them."""
-    if mesh_nodes != "inner_panel":
-        raise ValueError("The local-edit dataset supports only --mesh-nodes inner_panel")
+def load_design_changes(manifest_path, inp_dir, designs):
+    """({design: change}, report): the change nodes of ``designs`` (ints), see LocalEditGeometry.changes."""
     geometry, _, deck = LocalEditGeometry.from_manifest(manifest_path, inp_dir)
     changes = {int(design): geometry.changes(int(design)) for design in designs}
     report = {
         "rule": {"change_nodes": "the inner-panel nodes listed in design_changes/<design>_changed_nodes.csv "
                                  "(every node the edit moved, z only)",
                  "displacement_from": f"design 6 ({BASE_DESIGN}), from {deck.name}"},
-        "static_channels": ["base_x", "base_y", "base_z", "dx", "dy", "dz", "base_gap", "gap_change", "outer"],
-        "clusters": [{"designs": [design_name(d)], "base": BASE_DESIGN, "change_nodes": len(c["rows"]),
-                      "change_nodes_in_mesh": len(c["rows"])} for d, c in sorted(changes.items())],
+        "static_channels": ["base_x", "base_y", "base_z", "dx", "dy", "dz"],
         "designs": {design_name(d): {"change_nodes": len(c["rows"]),
                                      "max_displacement_mm": float(np.abs(c["static"][:, 5]).max(initial=0.0))}
                     for d, c in sorted(changes.items())},
-        "mesh_nodes": mesh_nodes,
         "base_deck": str(deck),
     }
     return changes, report
 
 
+def dataset_rows(manifest, include_base=False):
+    """Select modeled impacts by their role in each design, optionally including D6 references."""
+    rows = manifest[manifest["role"] != "far"]
+    return rows if include_base else rows[rows["design"] != BASE_DESIGN]
+
+
 def load_local_edit_data(preprocessor, include_base=False):
-    """Training records of every edited run, numbered by sample; design 6 only if ``include_base``.
+    """Training records of the retained edited runs, numbered by sample; design 6 only if ``include_base``.
 
     Reads ``config.impact_coords_path`` (the manifest), one design-6 deck in
     ``config.inp_dir`` and the curves in ``config.acceleration_dir`` with the
     configured time cutoff and stride. A missing curve is an error.
     """
     config = preprocessor.config
-    if getattr(config, "mesh_nodes", "inner_panel") != "inner_panel":
-        raise ValueError("The local-edit dataset supports only --mesh-nodes inner_panel")
-    if config.prediction_target != "acceleration":
-        raise ValueError("The local-edit dataset is set up for acceleration histories only")
     geometry, manifest, _ = LocalEditGeometry.from_manifest(config.impact_coords_path, config.inp_dir)
-    rows = manifest if include_base else manifest[manifest["design"] != BASE_DESIGN]
+    rows = dataset_rows(manifest, include_base)
     data = {"mesh_geometries": [], "indentor_positions": [], "time_arrays": [], "accelerations": [],
             "run_numbers": [], "source_runs": []}
     for row in rows.itertuples():
@@ -219,8 +214,8 @@ def base_reference_curves(preprocessor):
 def base_reference_runs(preprocessor):
     """Design 6 at every location: (locations (L,), impact XY (L, 2) mm, times (T,), curves (L, T) in g).
 
-    Sampled like the training curves. --reference-response builds the model's
-    reference table from these (reference_response.py).
+    Sampled like the training curves. Read only after training, as the reference
+    the edit effects in local_edit_metrics.json are measured from; never a network input.
     """
     manifest = load_manifest(preprocessor.config.impact_coords_path)
     base = manifest[manifest["design"] == BASE_DESIGN].sort_values("location")

@@ -19,7 +19,7 @@ Conventions were reverse-engineered from the delivered data:
     * output length          = 1000 points (1000 rows, no resampling to 0.025 s;
                                the grid spans [0, raw final time])
     * g                      = 9800 mm/s^2     (verified: A(mm/s2)/A(in g)==9800)
-    * HIC                    = HIC15, dt*(a_avg**2.5), a in g  (see analyze_inp_designs.py)
+    * HIC                    = HIC15, dt*(a_avg**2.5), a in g  (as hic15.py)
 
 Plain-Python script (numpy / scipy / pandas / matplotlib) -- run with the same
 interpreter you use for the ML code, NOT inside Abaqus.
@@ -46,7 +46,7 @@ import pandas as pd
 G_MM_S2 = 9800.0        # partner's gravitational constant (mm/s^2)
 N_OUT = 1000            # delivered files have exactly 1000 rows
 CFC = 1000.0           # SAE / ISO channel frequency class -> "SAE1000"
-HIC_WINDOW = 0.015     # HIC15 (15 ms), see analyze_inp_designs.py
+HIC_WINDOW = 0.015     # HIC15 (15 ms), as hic15.py
 
 # Filtering grid. The raw Abaqus/Explicit history is ~sub-microsecond and
 # slightly NON-uniform, so we must resample to a uniform grid before the SAE

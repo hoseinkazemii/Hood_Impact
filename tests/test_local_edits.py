@@ -76,7 +76,6 @@ def write_dataset(root):
 
 def preprocessor_for(root, stride=1):
     config = SimpleNamespace(
-        data_format="localedits", prediction_target="acceleration", mesh_nodes="inner_panel",
         inp_dir=str(root / "inp_files"), impact_coords_path=str(root / "manifest_local_edits.csv"),
         acceleration_dir=str(root / "output_history_acc"), time_subsample_stride=stride, max_train_time=None)
     return DataPreprocessor(config)
@@ -113,6 +112,17 @@ class LocalEditDataTest(unittest.TestCase):
         np.testing.assert_allclose(data["indentor_positions"][1], [2.5, 0.5])
         np.testing.assert_allclose(data["accelerations"][3], curve(7), rtol=1e-6)
 
+    def test_far_role_excluded_before_loading_curves(self):
+        path = self.root / "manifest_local_edits.csv"
+        manifest = pd.read_csv(path)
+        manifest.loc[manifest.run == 4, "role"] = "far"
+        manifest.loc[manifest.run == 6, "role"] = "twin"  # same location on another design
+        manifest.to_csv(path, index=False)
+        (self.root / "output_history_acc" / "HoodImpact_4_SAE1000_interp1000.csv").unlink()
+        processor = preprocessor_for(self.root)
+        self.assertEqual(processor.load_all_data()["source_runs"], [5, 6, 7])
+        self.assertEqual(load_local_edit_data(processor, include_base=True)["source_runs"], [1, 2, 3, 5, 6, 7])
+
     def test_base_reference_and_include_base(self):
         processor = preprocessor_for(self.root, stride=2)
         curves, times = base_reference_curves(processor)
@@ -130,7 +140,7 @@ class LocalEditDataTest(unittest.TestCase):
         np.testing.assert_allclose(changes[2]["static"][:, 5], [3.0, 1.0])
         self.assertEqual(report["designs"]["N2"]["change_nodes"], 2)
         data = load_local_edit_data(preprocessor_for(self.root))
-        model = SimpleNamespace(impactor_nodes=0, design_changes=None)
+        model = SimpleNamespace(design_changes=None)
         summary = register_design_changes(model, changes, data["mesh_geometries"],
                                           [sample_design(s) for s in data["run_numbers"]], lambda mesh: mesh)
         self.assertEqual(summary["registered_hoods"], 2)
@@ -192,24 +202,29 @@ class GlobalPoolingTest(unittest.TestCase):
                     torch.zeros(5, dtype=torch.long), batch_size=1)
         out.square().mean().backward()
         self.assertTrue(torch.isfinite(out).all())
-        old = MeshImpactHistoryNet(**saved_model_kwargs({"impact_conditioning": "film", "time_encoding": "fourier"}),
+        # Configs saved before 2026-11-22 have neither key: half the tokens local, 20 mm offsets.
+        old = MeshImpactHistoryNet(**saved_model_kwargs({"impact_conditioning": "film", "time_encoding": "fourier",
+                                                         "pooling_query_residual": False,
+                                                         "pool_impactor_nodes": False}, format_version=1),
                                    num_latents=4, width=16, num_heads=2)
         self.assertEqual((old.local_latents, old.neighborhood_scale_mm), (2, 20.0))
 
 
 class LocalEditConfigTest(unittest.TestCase):
-    def test_localedits_needs_inner_panel_and_xyz_tokens(self):
+    def test_defaults_are_the_local_edit_dataset_and_launcher_model(self):
+        from train_mesh_impact_history import MODEL_DEFAULTS
         with tempfile.TemporaryDirectory() as directory:
-            base = ["--data-format", "localedits", "--device", "cpu", "--output-dir", directory,
-                    "--wandb-mode", "disabled"]
-            config = build_config(parse_args(base + ["--design-change-nodes", "true"]))
-            self.assertEqual((config.samples_per_design, config.num_samples, config.mesh_nodes),
-                             (142, 1440, "inner_panel"))
-            with self.assertRaisesRegex(ValueError, "inner_panel"):
-                build_config(parse_args(base + ["--mesh-nodes", "all"]))
-            with self.assertRaisesRegex(ValueError, "xyz"):
-                build_config(parse_args(base + ["--design-change-nodes", "true",
-                                                "--design-change-features", "impact_relative"]))
+            base = ["--device", "cpu", "--output-dir", directory, "--wandb-mode", "disabled"]
+            args = parse_args(base)
+            config = build_config(args)
+            self.assertTrue(config.impact_coords_path.endswith("HoodImpact_LocalEdits/manifest_local_edits.csv"))
+            self.assertEqual((args.test_designs, args.val_designs), ([54], [55]))
+            self.assertEqual({key: getattr(args, key) for key in MODEL_DEFAULTS}, MODEL_DEFAULTS)
+            self.assertEqual(args.design_change_features, "edit")
+            with self.assertRaises(SystemExit):
+                parse_args(base + ["--design-change-features", "impact_relative"])
+            with self.assertRaises(SystemExit):
+                parse_args(base + ["--data-format", "euroncap1704"])
 
 
 if __name__ == "__main__":

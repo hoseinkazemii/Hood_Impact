@@ -94,8 +94,7 @@ python abaqus_scripts/make_local_edit_decks.py --runs 1-11 --verify 1   # writes
 ```
 
 If home is short of space, the old `inp_files` folders of `HoodImpact_600_EuroNCAP` and
-`HoodImpact_1104_EuroNCAP_Remaining` can be deleted: they can be regenerated with
-`generate_impact_decks.py`.
+`HoodImpact_1104_EuroNCAP_Remaining` can be deleted: the local-edit campaign does not use them.
 
 ## 2. Submit once
 
@@ -208,44 +207,18 @@ The campaign therefore runs 5 x 8 by default (`hood_local_edits.sbatch`).
   `sbatch -c 12 --mem=24g --export=ALL,LOCAL_EDITS_CPUS=1,LOCAL_EDITS_LANES=12 --array=1-8%1 abaqus_scripts/delta/hood_local_edits.sbatch`.
   The runs finished on 8 cores are then solved again on 1 core.
 - **Never mix core counts** in the dataset.
-- **Testing another core count:** a new core count needs its own noise test first, e.g.
-  `sbatch --export=ALL,CPUS_TEST_PHASES=noise,CPUS_TEST_NOISE_CPUS=4 abaqus_scripts/delta/hood_cpus_test.sbatch`
-  for 8 x 4.
+- **Testing another core count:** a new core count needs its own noise test first, with
+  `hood_cpus_test.sbatch` and `cpus_scaling_test.py` (removed on 2026-11-27; restore them from git,
+  commit 65a938f).
 
-**How the test works** (to repeat it):
-
-How much faster that is depends on how well Abaqus/Explicit scales on this ~40k-element model. Using
-N cores also splits the hood into N domains, which changes the floating-point order; contact,
-plasticity and beam buckling can grow that roundoff. Results are not less accurate, but the dataset
-is about small design differences, so the noise this adds to (design - D6) must stay far below them.
-`hood_cpus_test.sbatch` measures both in one job (~1.5 h, 2h15 limit, 64 cores):
-
-| phase | what it does |
-|---|---|
-| solo | the start of run 1's step on 1, 4, 8, 16, 32 cores, one at a time; the speed of each, and the tokens it holds according to the license server (`lmstat -a`) |
-| layout | the 3 best layouts predicted from solo, all their lanes solving together (contention on the node) |
-| noise | the 11 pilot runs (D6, N1, N2 at locations 9, 40, 105, 132; all finished on 1 core) in full on the chosen layout, run 5 twice. Per run: 1 vs N cores (RMS g, peak, HIC15). Per pair (N1/N2 - D6 at the same location): R2 of the N-core difference curve against the 1-core one, and the HIC change on both |
-
-**Noise verdict.** PASS only if run 5 repeats bit for bit on N cores and every near/twin pair keeps
-R2 >= 0.95 and its HIC change within 0.5 percentage points. The far pair (379 mm) is reported, not
-gated: the report says whether its 3 g difference stands above solver noise. Plot:
-`cpus_test/noise/noise_pairs.png` (1-core vs N-core difference curves); tables `noise_runs.csv`,
-`noise_pairs.csv`; the N-core curves themselves are next to them for any further check on Windows.
-
-Steps:
-
-```bash
-squeue -u hkazemi -n hood_local_edits        # the test needs every token: no campaign job may run
-scontrol hold <pending job or array id>      # keep the next campaign task from starting
-# let the running task end, or scancel it (its unfinished runs are solved again later)
-sbatch abaqus_scripts/delta/hood_cpus_test.sbatch
-cat Data/HoodImpact_LocalEdits/cpus_test/report.txt
-```
-
-`report.txt` ends with the chosen layout, the campaign time it implies, the noise verdict and the
-exact submit line; `cpus_test/layout.env` holds the same layout with the verdict on its second line,
-ready to be copied to `campaign_layout.env`. `CPUS_TEST_PHASES=noise` repeats only the noise test;
-`CPUS_TEST_NOISE_RUNS=1-16` adds more finished runs.
+**How the test worked.** One job (`hood_cpus_test.sbatch`, ~1.5 h on 64 cores; job 23905334,
+report in `Data/HoodImpact_LocalEdits/cpus_test/`) timed the start of run 1's step on 1-32 cores and
+read the tokens each held from the license server, ran the 3 best predicted layouts together, then
+solved the 11 pilot runs in full on the chosen layout. Using N cores splits the hood into N domains,
+which changes the floating-point order, so the noise this adds to (design - D6) had to stay far
+below the edit effects: PASS required run 5 to repeat bit for bit and every near/twin pair to keep
+R2 >= 0.95 and its HIC change within 0.5 percentage points. The scripts were removed with the other
+finished campaigns on 2026-11-27 and are in git history (commit 65a938f).
 
 ## 3. The pilot gate
 

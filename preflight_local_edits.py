@@ -14,25 +14,93 @@ reuses; nothing else is written.
 """
 from __future__ import annotations
 
+import platform
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import torch
 
-from train_mesh_impact_history import (
-    DESIGN_CHANGE_DEFAULTS, Config, DataPreprocessor, parse_args, validate_data, validate_location_shortcuts,
-)
-from preflight_mesh_impact_history_1704 import EXPERIMENT_MODEL_KEYS, validate_cuda_model, validate_runtime
+# Import the training entry point so missing training dependencies fail here,
+# before the scheduler starts the full dataset load.
+from train_mesh_impact_history import MODEL_DEFAULTS, Config, DataPreprocessor, parse_args, validate_data
 from local_edits_data import (
-    BASE_DESIGN, LOCATIONS, LocalEditGeometry, base_inner_panel, design_name, sample_number,
+    BASE_DESIGN, LOCATIONS, LocalEditGeometry, base_inner_panel, dataset_rows, design_name, sample_number,
 )
 from local_edit_metrics import design_classes
+from mesh_design_change import DesignChangeHistoryNet, DesignChangeTable, change_displacement_rms
 
-EDITED_LOCATIONS = 20
+EDITED_LOCATIONS = 18
 DECK_CHECK_TOLERANCE_MM = 1e-3
 # The trainer's localedits defaults (utils.utils.Config), relative to the repository.
 DEFAULT_ROOT = Path("Data/HoodImpact_LocalEdits")
+
+
+def validate_runtime(require_cuda):
+    version = re.match(r"^(\d+)\.(\d+)", torch.__version__)
+    if not version or tuple(map(int, version.groups())) < (2, 8):
+        raise ValueError(f"PyTorch >= 2.8 is required; found {torch.__version__}")
+    print(f"Python: {sys.executable} | architecture: {platform.machine()}")
+    print(f"PyTorch: {torch.__version__} | CUDA build: {torch.version.cuda}")
+    if require_cuda and not torch.cuda.is_available():
+        raise ValueError("CUDA was requested but is unavailable in this Python environment")
+
+
+def validate_cuda_model(data, design, change, neighbor_cache_dir, model_options):
+    """CUDA forward/backward of a small DesignChangeHistoryNet with the configured options.
+
+    The first run is read with its edited design's change nodes, so the change
+    readouts must receive a gradient. Mesh, impact and time are standardized
+    with this one example's statistics; nothing reaches training.
+    """
+    mesh = np.asarray(data["mesh_geometries"][0], dtype=np.float32)
+    mean = mesh.mean(axis=0)
+    scale = np.maximum(mesh.std(axis=0), 1e-6)
+    mesh = torch.as_tensor((mesh - mean) / scale, device="cuda")
+    impact = torch.as_tensor(
+        (np.asarray(data["indentor_positions"][0]) - mean[:2]) / scale[:2],
+        device="cuda", dtype=torch.float32,
+    ).unsqueeze(0)
+    time = np.asarray(data["time_arrays"][0], dtype=np.float32)
+    time_mean, time_scale = float(time.mean()), max(float(time.std()), 1e-6)
+    time = torch.as_tensor((time - time_mean) / time_scale, device="cuda")
+    model = DesignChangeHistoryNet(width=16, num_heads=2, num_latents=4, latent_layers=1, temporal_layers=1,
+                                   dropout=0.0, **model_options).to("cuda")
+    # Wiring probe only: training registers each design's own meshes instead.
+    model.design_changes = DesignChangeTable.from_changes({design: change})
+    model.design_changes.register(mesh, design)
+    if model.design_change_features == "edit":
+        model.set_change_displacement_scale(change_displacement_rms({design: change}, [design]))
+    model.set_coordinate_scalers(mean, scale, mean[:2], scale[:2])
+    model.set_time_scaler(time_mean, time_scale)
+    if model.neighborhood_blocks:
+        model.neighbor_cache.directory = Path(neighbor_cache_dir)
+        model.neighbor_cache.register_geometry(data["mesh_geometries"][0], mesh * model.mesh_scale,
+                                               model.neighborhood_k)
+    prediction = model(mesh=mesh, mesh_batch=torch.zeros(len(mesh), device="cuda", dtype=torch.long),
+                       indentor=impact, time=time,
+                       time_batch=torch.zeros(len(time), device="cuda", dtype=torch.long), batch_size=1)
+    if prediction.shape != time.shape or not torch.isfinite(prediction).all():
+        raise ValueError("CUDA model probe produced an invalid acceleration history")
+    prediction.square().mean().backward()
+    gradients = [parameter.grad for parameter in model.parameters() if parameter.grad is not None]
+    if (model.local_latents and model.local_log_precision.grad is None) or not gradients or not all(
+        torch.isfinite(gradient).all() for gradient in gradients
+    ):
+        raise ValueError("CUDA model probe produced missing spatial-bias or nonfinite gradients")
+    if any(parameter.grad is None for parameter in model.neighborhood_blocks.parameters()):
+        raise ValueError("CUDA model probe produced missing neighborhood gradients")
+    if any(readout.output.weight.grad is None or not readout.output.weight.grad.abs().sum() > 0
+           for readout in model.change_readouts):
+        raise ValueError("CUDA model probe produced no gradient for a design-change readout")
+    torch.cuda.synchronize()
+    print(f"GPU: {torch.cuda.get_device_name(0)} | {type(model).__name__} "
+          f"(change tokens: {model.design_change_features}) | "
+          f"neighborhood_layers={len(model.neighborhood_blocks)} | forward/backward: passed")
+    if model.neighborhood_blocks:
+        print(f"Neighbor graph cache: built={model.neighbor_cache.builds} | loaded from disk={model.neighbor_cache.disk_hits}")
 
 
 def check_files(manifest, acceleration_dir):
@@ -87,39 +155,17 @@ def check_decks(geometry, manifest, inp_dir, designs):
         print(f"Mesh check: {name} = design 6 + {moved} moved nodes matches {deck.name} (max error {error:.1e} mm)")
 
 
-def check_reference_locations(manifest):
-    """Every edited run's impact point must match one design-6 run's (the reference lookup key)."""
-    from reference_response import MATCH_TOLERANCE_MM, ReferenceResponseTable
-
-    base = manifest[manifest["design"] == BASE_DESIGN].sort_values("location")
-    table = ReferenceResponseTable(base[["x_mm", "y_mm"]].to_numpy(float), [0.0], np.zeros((len(base), 1)),
-                                   labels=base["location"].to_numpy())
-    edited = manifest[manifest["design"] != BASE_DESIGN]
-    rows = table.lookup(edited[["x_mm", "y_mm"]].to_numpy(float))
-    wrong = edited["location"].to_numpy() != table.labels[rows]
-    if wrong.any():
-        raise ValueError(f"{int(wrong.sum())} edited runs match a design-6 run at another location number")
-    print(f"Reference: all {len(edited)} edited runs match design 6's impact point at their location "
-          f"(within {MATCH_TOLERANCE_MM} mm)")
-
-
 def main(argv=None):
     args = parse_args(argv)
     try:
-        if args.data_format != "localedits":
-            raise ValueError("This preflight is for --data-format localedits")
-        if args.mesh_nodes != "inner_panel":
-            raise ValueError("localedits builds only inner-panel meshes")
-        if args.design_change_nodes and args.design_change_features not in ("xyz", "edit"):
-            raise ValueError("localedits change tables carry no panel gaps; use --design-change-features xyz or edit")
         inp_dir = args.inp_dir or str(DEFAULT_ROOT / "inp_files")
         manifest_path = args.impact_coords_path or str(DEFAULT_ROOT / "manifest_local_edits.csv")
         acceleration_dir = args.acceleration_dir or str(DEFAULT_ROOT / "output_history_acc")
         cuda = (args.device or "").startswith("cuda")
         validate_runtime(cuda)
-        validate_location_shortcuts(args.impactor_nodes, args.pool_impactor_nodes, args.mesh_nodes)
 
         geometry, manifest, base_deck = LocalEditGeometry.from_manifest(manifest_path, inp_dir)
+        manifest = dataset_rows(manifest, include_base=True)
         print(f"Base hood: inner panel of {base_deck} ({len(geometry.base_ids)} nodes)")
         designs = check_files(manifest, acceleration_dir)
         for design in designs:
@@ -133,8 +179,7 @@ def main(argv=None):
 
         stride = args.time_subsample_stride or Config.time_subsample_stride
         processor = DataPreprocessor(SimpleNamespace(
-            data_format="localedits", acceleration_dir=acceleration_dir, time_subsample_stride=stride,
-            max_train_time=args.max_train_time, prediction_target="acceleration", mesh_nodes="inner_panel"))
+            acceleration_dir=acceleration_dir, time_subsample_stride=stride, max_train_time=args.max_train_time))
         design = sorted(args.test_designs)[0]
         row = manifest[manifest["design_id"] == design].iloc[0]
         base_row = manifest[(manifest["design"] == BASE_DESIGN) & (manifest["location"] == row["location"])].iloc[0]
@@ -142,8 +187,6 @@ def main(argv=None):
         base_times, base_accel = processor.load_acceleration_history(int(base_row["run"]))
         if not np.array_equal(times, base_times):
             raise ValueError("Edited and design-6 curves are not on the same sampled time grid")
-        if args.reference_response:
-            check_reference_locations(manifest)
         data = {"run_numbers": [sample_number(design, int(row["location"]))],
                 "mesh_geometries": [geometry.mesh(design)],
                 "indentor_positions": [np.array([row["x_mm"], row["y_mm"]], dtype=np.float32)],
@@ -154,13 +197,12 @@ def main(argv=None):
 
         if cuda:
             from mesh_neighborhood import default_neighbor_cache_directory
-            cache = args.neighbor_cache_dir or default_neighbor_cache_directory("localedits", inp_dir)
-            validate_cuda_model(
-                data, decoder=args.decoder, neighbor_cache_dir=cache,
-                design_changes={design: geometry.changes(design)} if args.design_change_nodes else None,
-                design_change_options={key: getattr(args, key) for key in DESIGN_CHANGE_DEFAULTS},
-                reference=(base_times, base_accel) if args.reference_response else None,
-                **{key: getattr(args, key) for key in EXPERIMENT_MODEL_KEYS})
+            cache = args.neighbor_cache_dir or default_neighbor_cache_directory(inp_dir)
+            # The probe's own small width, heads, latents and depth; every other option as configured.
+            options = {key: getattr(args, key) for key in MODEL_DEFAULTS
+                       if key not in ("width", "num_heads", "num_latents", "latent_layers", "temporal_layers",
+                                      "dropout")}
+            validate_cuda_model(data, design, geometry.changes(design), cache, options)
         else:
             print("CUDA probe: skipped (--device is not cuda)")
         print("Preflight passed.")

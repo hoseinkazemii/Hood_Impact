@@ -2,8 +2,9 @@
 inp_geom.py
 ===========
 Shared parsing + geometry utilities for the HoodImpact decks, used by
-    * euroncap_grid.py          (define the 50 Euro-NCAP-style impact locations)
-    * generate_impact_decks.py  (write the 600 repositioned-headform decks)
+    * local_edit_doe.py / make_local_edit_decks.py / apply_node_edits.py
+      (design and write the local-edit decks)
+    * utils/utils.py            (training: the inner panel's node IDs)
 
 Deck facts these utilities rely on (verified on HoodImpact_1.inp / _31.inp):
     * flat .inp (no parts/instances), units mm / tonne / s
@@ -139,6 +140,13 @@ class Deck(object):
         return ids, np.array([self.nodes[i] for i in ids], float)
 
 
+def format_node_line(nid, x, y, z, terminator):
+    """One "id, x, y, z" *NODE data line ending in ``terminator``."""
+    # repr() gives the shortest exact round-trip float, matching the deck style;
+    # cast defensively -- repr(np.float64) would corrupt the deck.
+    return "%d, %r, %r, %r%s" % (nid, float(x), float(y), float(z), terminator)
+
+
 # ---------------------------------------------------------------------------
 # hood outer surface: z(x, y) interpolation + boundary outline
 # ---------------------------------------------------------------------------
@@ -169,7 +177,6 @@ class OuterSurface(object):
 
 def _boundary_polygon(deck, outer_node_ids):
     """Ordered XY polygon (closed, (M,2)) of the outer panel's free boundary."""
-    outer_ids = set(outer_node_ids)
     edge_count = defaultdict(int)
     for eid in deck.elsets[HOOD_OUTER_ELSET]:
         conn = deck.elems[eid]

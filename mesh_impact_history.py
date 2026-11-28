@@ -1,10 +1,17 @@
-"""A new attention network for unstructured hood geometry -> acceleration history.
+"""Backbone attention network: unstructured hood mesh + impact location -> acceleration history.
 
 The mesh is an unordered set of XYZ nodes; no grid or element connectivity is
-required. Every node participates in impact-conditioned attention. A compact
-latent mesh representation drives a decoder with optional temporal attention.
+required. Nodes are embedded, optionally refined by sparse kNN attention
+(mesh_neighborhood.py), and pooled into a fixed set of latent tokens by
+impact-conditioned (FiLM) cross-attention. Latent self-attention mixes the
+tokens, and a decoder of time queries (Fourier features of physical time)
+reads them with cross-attention and couples the requested times with temporal
+self-attention.
 
-``forward`` accepts the flattened batches used by the shared training utilities.
+The model used for training is :class:`mesh_design_change.DesignChangeHistoryNet`,
+which adds a readout of the edited nodes after every decoder block.
+
+``forward`` accepts the flattened batches built by ``utils.utils.collate_fn``.
 Time contains output-grid coordinates, never measured acceleration. For the
 two-input physical-units API, use ``HistoryPredictor`` in
 ``train_mesh_impact_history.py``.
@@ -19,6 +26,58 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.nn.utils.rnn import pad_sequence
+
+from mesh_neighborhood import NeighborGraphCache, NeighborhoodAttentionBlock
+
+# What configs saved before these keys existed were trained with.
+HISTORICAL_DEFAULTS = {
+    "impact_conditioning": "legacy_additive",
+    "time_encoding": "legacy_five",
+    "pooling_query_residual": True,
+    "pool_impactor_nodes": True,
+    "neighborhood_scale_mm": 20.0,
+    "local_latents": None,  # half the pooling tokens local, every run before 2026-11-22
+}
+# Keyword arguments of earlier saved runs that now have only one supported value.
+# saved_model_kwargs accepts a saved config only when each holds that value.
+RETIRED_KWARGS = {
+    "decoder": "temporal",
+    "impact_conditioning": "film",
+    "time_encoding": "fourier",
+    "pooling_query_residual": False,
+    "pool_impactor_nodes": False,
+    "impactor_nodes": 0,
+    "geometry_film": "none",
+    "teacher_forcing_chunks": 0,
+    "node_extra_features": 0,
+}
+# Saved but no longer meaningful once the options above are fixed.
+IGNORED_KWARGS = ("geometry_fourier_octaves",)
+
+
+def saved_model_kwargs(kwargs: dict, *, format_version: int) -> dict:
+    """Constructor kwargs of a saved run (config.json), rejecting runs that used a retired option.
+
+    Configs of ``format_version`` 1 (before 2026-11-27) list every option of
+    their time; keys a version-1 config lacks take the value runs were trained
+    with before the key existed (HISTORICAL_DEFAULTS), so runs before
+    2026-11-22, with half the pooling tokens local and 20 mm kNN offsets,
+    still load. Version 2 lists exactly the current constructor options.
+    """
+    if format_version not in (1, 2):
+        raise ValueError(f"Unknown config format_version {format_version!r}")
+    kwargs = {**HISTORICAL_DEFAULTS, **kwargs} if format_version == 1 else dict(kwargs)
+    if kwargs.pop("reference_response", False):
+        raise ValueError("This run fed the base design's simulated response to the network "
+                         "(reference_response, removed on 2026-11-26); it cannot be rebuilt")
+    for key, supported in RETIRED_KWARGS.items():
+        value = kwargs.pop(key, supported)
+        if value != supported:
+            raise ValueError(f"This run used {key}={value!r}, an option removed from the code; "
+                             f"only {supported!r} is supported")
+    for key in IGNORED_KWARGS:
+        kwargs.pop(key, None)
+    return kwargs
 
 
 class LatentMixingBlock(nn.Module):
@@ -39,11 +98,9 @@ class LatentMixingBlock(nn.Module):
         )
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, tokens: Tensor, padding_mask: Tensor | None = None) -> Tensor:
-        """``padding_mask`` (B, L), True for padded tokens, keeps them out of the keys."""
+    def forward(self, tokens: Tensor) -> Tensor:
         normalized = self.attention_norm(tokens)
-        update = self.attention(normalized, normalized, normalized,
-                                key_padding_mask=padding_mask, need_weights=False)[0]
+        update = self.attention(normalized, normalized, normalized, need_weights=False)[0]
         tokens = tokens + self.dropout(update)
         return tokens + self.dropout(self.feedforward(self.feedforward_norm(tokens)))
 
@@ -71,9 +128,7 @@ class HistoryDecoderBlock(nn.Module):
         )
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, queries: Tensor, memory: Tensor, padding_mask: Tensor,
-                time_mask: Tensor | None = None) -> Tensor:
-        """``time_mask`` (T, T), True where a time may not read another (teacher forcing)."""
+    def forward(self, queries: Tensor, memory: Tensor, padding_mask: Tensor) -> Tensor:
         normalized_memory = self.memory_norm(memory)
         update = self.cross_attention(
             self.query_norm(queries), normalized_memory, normalized_memory,
@@ -83,85 +138,14 @@ class HistoryDecoderBlock(nn.Module):
         normalized_time = self.time_norm(queries)
         update = self.time_attention(
             normalized_time, normalized_time, normalized_time,
-            key_padding_mask=padding_mask, attn_mask=time_mask, need_weights=False,
+            key_padding_mask=padding_mask, need_weights=False,
         )[0]
         queries = queries + self.dropout(update)
         return queries + self.dropout(self.feedforward(self.feedforward_norm(queries)))
-
-
-class MeshOnlyDecoderBlock(nn.Module):
-    """Read mesh memory without letting the requested times talk to each other.
-
-    The ablation of :class:`HistoryDecoderBlock`: identical except that the
-    temporal self-attention stage is gone. Every output uses the mesh memory,
-    impact location and its own time, without mixing across requested times.
-    It isolates what the impact-conditioned global+local mesh attention carries
-    on its own.
-
-    Retained submodules keep their original names, so the ablated state-dict
-    keys are a strict subset of the full model's keys.
-    """
-
-    def __init__(self, width: int, num_heads: int, dropout: float):
-        super().__init__()
-        self.query_norm = nn.LayerNorm(width)
-        self.memory_norm = nn.LayerNorm(width)
-        self.cross_attention = nn.MultiheadAttention(
-            width, num_heads, dropout=dropout, batch_first=True
-        )
-        self.feedforward_norm = nn.LayerNorm(width)
-        self.feedforward = nn.Sequential(
-            nn.Linear(width, 4 * width),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(4 * width, width),
-        )
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, queries: Tensor, memory: Tensor, padding_mask: Tensor,
-                time_mask: Tensor | None = None) -> Tensor:
-        # Keep the common decoder interface. All operations are independent
-        # across queries, so padded times cannot affect real predictions.
-        del padding_mask, time_mask
-        normalized_memory = self.memory_norm(memory)
-        update = self.cross_attention(
-            self.query_norm(queries), normalized_memory, normalized_memory,
-            need_weights=False,
-        )[0]
-        queries = queries + self.dropout(update)
-        return queries + self.dropout(self.feedforward(self.feedforward_norm(queries)))
-
-
-# The decoder arms, selected by the ``decoder`` keyword. "temporal" is the
-# original network; "mesh_only" is the temporal-attention ablation.
-DECODER_BLOCKS = {"temporal": HistoryDecoderBlock, "mesh_only": MeshOnlyDecoderBlock}
-
-
-IMPACT_CONDITIONING = ("film", "legacy_additive")
-TIME_ENCODINGS = ("fourier", "legacy_five")
-# Geometry memory injection sites (Xia & Aviles-Rivero, ICML 2026). "latent"
-# re-injects after every latent mixing block; "all" also after every
-# neighborhood block. The decoder is never injected; see MeshImpactHistoryNet.
-GEOMETRY_FILM = ("none", "latent", "all")
-
-
-def saved_model_kwargs(kwargs: dict) -> dict:
-    """Reconstruct the original conditioning/time features of older configs.
-
-    Configs written before the location-shortcut switches existed pooled the
-    headform rows and kept the query residual, so they replay with both on.
-    """
-    return {"impact_conditioning": "legacy_additive", "time_encoding": "legacy_five",
-            "pooling_query_residual": True, "pool_impactor_nodes": True,
-            "neighborhood_scale_mm": 20.0, "local_latents": None, **kwargs}  # None: half the tokens local
 
 
 class FiLM(nn.Module):
-    """Condition-dependent scale and shift of every feature, starting at identity.
-
-    ``condition`` broadcasts against ``tokens``: one impact vector modulates all
-    pooling tokens, while a geometry memory supplies one row per token or node.
-    """
+    """Condition-dependent scale and shift of every feature, starting at identity."""
 
     def __init__(self, width: int):
         super().__init__()
@@ -175,139 +159,25 @@ class FiLM(nn.Module):
         return tokens * (1 + scale_delta) + shift
 
 
-class GeometryMemoryEncoder(nn.Module):
-    """Pointwise geometry memory m(x) for every mesh row, outside the backbone.
-
-    As in the paper's code, the input is ``[x, sin(2^k pi x), cos(2^k pi x)]``
-    for k = 0..octaves-1, here of the normalized XYZ. The default of 5 octaves
-    resolves wavelengths down to 1/8 of a standard deviation: 48-60 mm in X/Y
-    and 11 mm in Z with the 1704 training scaler. Pooled with attention
-    weights, these features summarize the shape of the nodes a token reads.
-    """
-
-    def __init__(self, width: int, octaves: int):
-        super().__init__()
-        # Derived from ``octaves``; kept out of the state dict.
-        self.register_buffer("frequencies", math.pi * 2.0 ** torch.arange(octaves, dtype=torch.float32),
-                             persistent=False)
-        self.network = nn.Sequential(
-            nn.Linear(3 * (1 + 2 * octaves), width), nn.GELU(),
-            nn.Linear(width, width), nn.LayerNorm(width),
-        )
-
-    def forward(self, mesh: Tensor) -> Tensor:
-        phases = (mesh.unsqueeze(-1) * self.frequencies).flatten(1)
-        return self.network(torch.cat((mesh, phases.sin(), phases.cos()), dim=-1))
-
-
 class MeshImpactHistoryNet(nn.Module):
     """Impact-conditioned full-mesh attention, then a mesh-reading decoder.
 
-    ``local_latents`` of the learned mesh queries (default half; 0 in new
-    training runs) learn radial preferences around the impact XY location; the
-    rest attend to the whole hood with no spatial bias. Every query sees every
-    node, preserving the original irregular mesh.
-    Attention costs O(N * L) for N nodes and L latent tokens; an N-by-N mesh
-    attention matrix is never constructed.
+    Every node is embedded from its normalized XYZ. ``neighborhood_layers > 0``
+    inserts sparse kNN attention in physical XYZ between the node embedding and
+    pooling. ``num_latents`` learned queries, FiLM-modulated by the impact
+    location, pool all nodes into memory tokens. ``local_latents`` of them carry
+    a learned radial prior around the impact point (0 since 2026-11-22: every
+    query reads the whole hood without spatial bias). Attention costs O(N * L)
+    for N nodes and L latents; no N-by-N matrix is built.
 
-    ``decoder`` selects the arm:
+    The impact location only chooses *where* the queries read: each memory
+    token is an attention-weighted sum of hood-node values, with no
+    location-only residual.
 
-    * ``"temporal"`` (default) -- the original network. Each decoder block
-      cross-attends to the mesh memory and then runs self-attention across the
-      requested times, at O(T * T).
-    * ``"mesh_only"`` -- the temporal-attention ablation. The blocks keep the
-      cross-attention to mesh memory but never mix along time, so each time
-      point is decoded from the geometry, impact location and its own time.
-      Use it to ask what the global+local mesh attention carries without
-      temporal coupling.
-
-    All trainable weights are new. Only linear layers, attention, normalization,
-    activations and dropout are used; there are no convolution layers.
-
-    ``neighborhood_layers > 0`` inserts sparse, physical-XYZ kNN attention
-    between the node embedding and global/local pooling. See
-    README_mesh_local_sensitivity.md for the
-    two-layer experiment with ordinary acceleration MSE.
-
-    New models embed XYZ only and FiLM-condition normalized pooling tokens.
-    Time queries use sine/cosine pairs in physical seconds by default.
-    ``legacy_five`` reconstructs older time embeddings without adding buffers.
-    ``legacy_additive`` reconstructs historical
-    checkpoints with six node features and additive impact conditioning.
-
-    ``impactor_nodes`` holds the leading rigid-headform nodes out of that local
-    attention. See ``_encode_neighborhoods``.
-
-    Location shortcuts. The impact location should choose *where* the model
-    reads the hood, never supply content of its own. Two switches, both off for
-    new models, control the paths that bypass geometry:
-
-    * ``pooling_query_residual`` adds the FiLM-conditioned learned queries back
-      to the pooled update. At a fixed impact those tokens are identical for
-      every design, so the memory carries a geometry-free location code.
-    * ``pool_impactor_nodes`` lets the leading ``impactor_nodes`` headform rows
-      enter pooling as keys/values. The rigid headform is placed at the impact
-      point, so its rows encode location rather than hood structure. Excluding
-      them needs ``impactor_nodes > 0``; with 0 no row is known to be headform.
-
-    With both off, every memory token is an attention-weighted sum of hood-node
-    values. ``legacy_additive`` still adds the impact embedding to the time
-    queries; that mode exists to replay historical checkpoints.
-
-    Geometry memory injection (Xia & Aviles-Rivero, "Do Neural Operators Forget
-    Geometry?", ICML 2026). ``geometry_film`` re-injects geometry after
-    backbone layers, ``V <- V * (1 + gamma_l(m)) + beta_l(m)``, so later layers
-    need not rely on what survives the global mixing:
-
-    * ``"none"`` (default) -- the network above, with no added parameters.
-    * ``"latent"`` -- after every latent mixing block, the global
-      self-attention the paper finds forgets geometry. Each token's memory is
-      the pooling-attention-weighted mean of the node memory, so it describes
-      the hood region that token reads. This matches the paper's spatially
-      varying gamma(x)/beta(x), and it also keeps location out of the content:
-      the impact decides only which hood nodes are averaged.
-    * ``"all"`` -- also after every neighborhood block, per structural node.
-
-    The memory comes from a separate pointwise encoder of XYZ
-    (:class:`GeometryMemoryEncoder`). It is computed once per mesh and shared
-    by all sites, and each site has its own zero-initialized FiLM head. A new
-    model therefore starts as exactly the uninjected network. The decoder is
-    deliberately never injected: it already re-reads the refreshed memory by
-    cross-attention in every block. Final-layer injection is what the paper
-    shows can make an attention model bypass its backbone (the "geometric
-    shortcut").
-
-    Memory: node sites are elementwise on N x width, never pairwise, and token
-    sites act on num_latents x width. Measured for a training step on 38,977-node
-    meshes (width 128, k 256): 0.71 GiB per mesh uninjected, 0.83 with
-    "latent", 0.90 with "all"; step time rises 2-4%.
-
-    ``node_extra_features`` appends that many per-node channels after XYZ, so
-    ``mesh`` has shape (N, 3 + node_extra_features). They enter the node
-    embedding only; neighborhoods, radial priors and the geometry memory keep
-    using the first three columns as coordinates. The common/residual model
-    (common_residual.py) uses them for the explicit deviation of a design from
-    its reference hood. With 0 (the default) the network is unchanged.
-
-    Teacher forcing. ``teacher_forcing_chunks`` > 0 splits each history into
-    that many contiguous chunks of ceil(T / chunks) times and predicts them in
-    order. Every time query also embeds the acceleration one chunk earlier
-    (0 in the first chunk), and the temporal attention is block-causal: a
-    time reads only the times of its own and earlier chunks. A chunk's output
-    therefore depends on the accelerations of earlier chunks only. ``forward``
-    with ``history`` (training) feeds the true accelerations, all chunks in
-    one pass; without it (validation, test, inference) the model rolls out,
-    feeding each chunk its own prediction of the earlier ones. Needs the
-    ``"temporal"`` decoder. With 0 (the default) the network is unchanged.
-
-    Reference response. With ``reference_response=True`` the output is
-    a_ref(t) + s * head(t), where a_ref is the reference design's simulated
-    curve at the same load case (``reference_table``, see
-    reference_response.py) and s is ``reference_delta_scale``. Every time query
-    also embeds a_ref(t). The head's last layer starts at zero, so a new model
-    returns a_ref exactly and the loss is spent on the edit effect only. Not
-    combinable with teacher forcing. With False (the default) the network is
-    unchanged.
+    Time queries embed sine/cosine pairs of physical time (seconds, recovered
+    with the training time scaler) at ``fourier_num_frequencies`` log-spaced
+    frequencies. ``temporal_layers`` decoder blocks each cross-attend to the
+    memory and run self-attention across the requested times.
     """
 
     def __init__(
@@ -318,25 +188,14 @@ class MeshImpactHistoryNet(nn.Module):
         latent_layers: int = 3,
         temporal_layers: int = 2,
         dropout: float = 0.1,
-        decoder: str = "temporal",
-        neighborhood_layers: int = 0,
-        neighborhood_k: int = 16,
-        neighborhood_scale_mm: float = 20.0,
+        neighborhood_layers: int = 2,
+        neighborhood_k: int = 256,
+        neighborhood_scale_mm: float = 0.0,
         neighborhood_chunk_size: int = 1024,
-        local_latents: int | None = None,
-        impactor_nodes: int = 0,
-        impact_conditioning: str = "film",
-        time_encoding: str = "fourier",
+        local_latents: int | None = 0,
         fourier_num_frequencies: int = 6,
         fourier_min_frequency_hz: float = 20.0,
         fourier_max_frequency_hz: float = 640.0,
-        pooling_query_residual: bool = False,
-        pool_impactor_nodes: bool = False,
-        geometry_film: str = "none",
-        geometry_fourier_octaves: int = 5,
-        node_extra_features: int = 0,
-        teacher_forcing_chunks: int = 0,
-        reference_response: bool = False,
     ):
         super().__init__()
         integer_options = {
@@ -344,7 +203,6 @@ class MeshImpactHistoryNet(nn.Module):
             "latent_layers": latent_layers, "temporal_layers": temporal_layers,
             "neighborhood_k": neighborhood_k, "neighborhood_chunk_size": neighborhood_chunk_size,
             "fourier_num_frequencies": fourier_num_frequencies,
-            "geometry_fourier_octaves": geometry_fourier_octaves,
         }
         for name, value in integer_options.items():
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -352,17 +210,9 @@ class MeshImpactHistoryNet(nn.Module):
         if width % num_heads:
             raise ValueError("width must be divisible by num_heads")
         if num_latents < 2:
-            raise ValueError("num_latents must be at least 2 for global and local queries")
+            raise ValueError("num_latents must be at least 2")
         if not math.isfinite(dropout) or not 0 <= dropout < 1:
             raise ValueError("dropout must be in [0, 1)")
-        # isinstance first: a bare membership test on an unhashable value would
-        # raise TypeError instead of the intended ValueError.
-        if not isinstance(decoder, str) or decoder not in DECODER_BLOCKS:
-            raise ValueError(f"decoder must be one of {sorted(DECODER_BLOCKS)}")
-        if not isinstance(impact_conditioning, str) or impact_conditioning not in IMPACT_CONDITIONING:
-            raise ValueError(f"impact_conditioning must be one of {IMPACT_CONDITIONING}")
-        if not isinstance(time_encoding, str) or time_encoding not in TIME_ENCODINGS:
-            raise ValueError(f"time_encoding must be one of {TIME_ENCODINGS}")
         for name, frequency in (("fourier_min_frequency_hz", fourier_min_frequency_hz),
                                 ("fourier_max_frequency_hz", fourier_max_frequency_hz)):
             if isinstance(frequency, bool) or not math.isfinite(frequency) or frequency <= 0:
@@ -380,35 +230,7 @@ class MeshImpactHistoryNet(nn.Module):
             local_latents = num_latents // 2  # every run before 2026-11-22
         if isinstance(local_latents, bool) or not isinstance(local_latents, int) or not 0 <= local_latents < num_latents:
             raise ValueError("local_latents must be an integer in [0, num_latents)")
-        if isinstance(impactor_nodes, bool) or not isinstance(impactor_nodes, int) or impactor_nodes < 0:
-            raise ValueError("impactor_nodes must be a nonnegative integer")
-        if (isinstance(node_extra_features, bool) or not isinstance(node_extra_features, int)
-                or node_extra_features < 0):
-            raise ValueError("node_extra_features must be a nonnegative integer")
-        for name, value in (("pooling_query_residual", pooling_query_residual),
-                            ("pool_impactor_nodes", pool_impactor_nodes)):
-            if not isinstance(value, bool):
-                raise ValueError(f"{name} must be True or False")
-        if not isinstance(geometry_film, str) or geometry_film not in GEOMETRY_FILM:
-            raise ValueError(f"geometry_film must be one of {GEOMETRY_FILM}")
-        if geometry_film == "all" and not neighborhood_layers:
-            raise ValueError("geometry_film='all' injects after neighborhood blocks; "
-                             "set neighborhood_layers > 0 or use geometry_film='latent'")
-        if (isinstance(teacher_forcing_chunks, bool) or not isinstance(teacher_forcing_chunks, int)
-                or teacher_forcing_chunks < 0 or teacher_forcing_chunks == 1):
-            raise ValueError("teacher_forcing_chunks must be 0 (off) or an integer of at least 2")
-        if teacher_forcing_chunks and decoder != "temporal":
-            raise ValueError("teacher forcing passes earlier chunks through the temporal attention; "
-                             "use decoder='temporal'")
-        if not isinstance(reference_response, bool):
-            raise ValueError("reference_response must be True or False")
-        if reference_response and teacher_forcing_chunks:
-            raise ValueError("reference_response already gives the model the reference history; "
-                             "use teacher_forcing_chunks=0")
 
-        self.decoder = decoder
-        self.impact_conditioning = impact_conditioning
-        self.time_encoding = time_encoding
         self.width = width
         self.num_heads = num_heads
         self.num_latents = num_latents
@@ -417,28 +239,18 @@ class MeshImpactHistoryNet(nn.Module):
         self.neighborhood_scale_mm = neighborhood_scale_mm
         self.attention_dropout = dropout
         self.neighborhood_k = neighborhood_k
-        self.impactor_nodes = impactor_nodes
-        self.pooling_query_residual = pooling_query_residual
-        self.pool_impactor_nodes = pool_impactor_nodes
-        self.geometry_film = geometry_film
-        self.node_extra_features = node_extra_features
-        self.teacher_forcing_chunks = teacher_forcing_chunks
-        self.reference_response = reference_response
-        # Plain attribute, never a buffer: built from the reference runs (reference_response.py).
-        self.reference_table = None
 
-        # The shared preprocessor fits mesh and impact scalers independently.
-        # Store their affine maps in the checkpoint so relative coordinates
-        # always use one common coordinate system, including after reload.
+        # The preprocessor fits mesh and impact scalers independently. Store
+        # their affine maps in the checkpoint so relative coordinates always
+        # use one common coordinate system, including after reload.
         self.register_buffer("mesh_mean", torch.zeros(3))
         self.register_buffer("mesh_scale", torch.ones(3))
         self.register_buffer("impact_mean", torch.zeros(2))
         self.register_buffer("impact_scale", torch.ones(2))
 
+        # Module creation order fixes the seeded initial weights; keep it.
         self.node_embedding = nn.Sequential(
-            nn.Linear((3 if impact_conditioning == "film" else 6) + node_extra_features, width),
-            nn.GELU(), nn.Linear(width, width),
-            nn.LayerNorm(width),
+            nn.Linear(3, width), nn.GELU(), nn.Linear(width, width), nn.LayerNorm(width),
         )
         self.impact_embedding = nn.Sequential(
             nn.Linear(2, width), nn.GELU(), nn.Linear(width, width),
@@ -460,112 +272,46 @@ class MeshImpactHistoryNet(nn.Module):
         ])
         self.memory_norm = nn.LayerNorm(width)
 
-        # Fourier phases use physical seconds, reconstructed from the same
-        # training-only scaler used by the dataset. No old features are appended.
-        # Old modes retain exactly their parameter/buffer keys for strict replay.
-        self.time_feature_count = 2 * fourier_num_frequencies if time_encoding == "fourier" else 5
-        if time_encoding == "fourier":
-            frequencies = [fourier_min_frequency_hz * (fourier_max_frequency_hz / fourier_min_frequency_hz)
-                           ** (i / max(fourier_num_frequencies - 1, 1)) for i in range(fourier_num_frequencies)]
-            frequency_tensor = torch.tensor(frequencies, dtype=torch.float32)
-            if not torch.isfinite(frequency_tensor).all() or not (frequency_tensor > 0).all():
-                raise ValueError("Fourier frequencies must be finite and positive in float32")
-            self.register_buffer("time_frequencies_hz", frequency_tensor)
-            self.register_buffer("time_mean", torch.zeros(()))
-            self.register_buffer("time_scale", torch.ones(()))
+        # Fourier phases use physical seconds, reconstructed from the training time scaler.
+        self.time_feature_count = 2 * fourier_num_frequencies
+        frequencies = [fourier_min_frequency_hz * (fourier_max_frequency_hz / fourier_min_frequency_hz)
+                       ** (i / max(fourier_num_frequencies - 1, 1)) for i in range(fourier_num_frequencies)]
+        frequency_tensor = torch.tensor(frequencies, dtype=torch.float32)
+        if not torch.isfinite(frequency_tensor).all() or not (frequency_tensor > 0).all():
+            raise ValueError("Fourier frequencies must be finite and positive in float32")
+        self.register_buffer("time_frequencies_hz", frequency_tensor)
+        self.register_buffer("time_mean", torch.zeros(()))
+        self.register_buffer("time_scale", torch.ones(()))
         self.time_embedding = nn.Sequential(
             nn.Linear(self.time_feature_count, width), nn.GELU(), nn.Linear(width, width),
         )
-        # temporal_layers is the decoder depth: how many times the time queries
-        # re-read the mesh memory. Under decoder="mesh_only" that is all it is,
-        # since those blocks carry no temporal attention. The name is kept so
-        # saved configs and existing checkpoints keep replaying by keyword.
+        # temporal_layers is the decoder depth: how many times the time queries re-read the memory.
         self.decoder_blocks = nn.ModuleList([
-            DECODER_BLOCKS[decoder](width, num_heads, dropout)
-            for _ in range(temporal_layers)
+            HistoryDecoderBlock(width, num_heads, dropout) for _ in range(temporal_layers)
         ])
         self.acceleration_head = nn.Sequential(
             nn.LayerNorm(width), nn.Linear(width, width), nn.GELU(), nn.Linear(width, 1),
         )
-        # Add after the original modules: baseline initialization and old
-        # checkpoint keys stay identical when neighborhood_layers=0.
-        self.neighborhood_blocks = nn.ModuleList()
-        self.neighbor_cache = None
-        if neighborhood_layers:
-            from mesh_neighborhood import NeighborGraphCache, NeighborhoodAttentionBlock
-            self.neighborhood_blocks.extend([
-                NeighborhoodAttentionBlock(width, num_heads, dropout, neighborhood_scale_mm or 1.0,
-                                           neighborhood_chunk_size)
-                for _ in range(neighborhood_layers)
-            ])
-            # Plain attribute, never a buffer: the graph is derived from the
-            # inputs, so it must not enter the checkpoint or a state dict.
-            self.neighbor_cache = NeighborGraphCache()
-
-        # Append so legacy construction keeps the original parameter order/RNG.
-        if impact_conditioning == "film":
-            self.impact_film = FiLM(width)
-        # Last again: with one seed, every other weight equals the uninjected
-        # model's, and the zero-initialized heads make the two start identical.
-        if geometry_film != "none":
-            self.geometry_encoder = GeometryMemoryEncoder(width, geometry_fourier_octaves)
-            self.geometry_memory_norm = nn.LayerNorm(width)
-            self.latent_geometry_film = nn.ModuleList([FiLM(width) for _ in range(latent_layers)])
-        if geometry_film == "all":
-            self.node_geometry_film = nn.ModuleList([FiLM(width) for _ in range(neighborhood_layers)])
-        if teacher_forcing_chunks:
-            # Input: the normalized acceleration one chunk earlier (0 in the
-            # first chunk). Added to the time queries.
-            self.history_embedding = nn.Sequential(
-                nn.Linear(1, width), nn.GELU(), nn.Linear(width, width),
-            )
-        if reference_response:
-            # Input: the reference design's normalized acceleration at each time.
-            self.reference_embedding = nn.Sequential(
-                nn.Linear(1, width), nn.GELU(), nn.Linear(width, width),
-            )
-            # s in a_ref + s * head; the trainer sets it to the training RMS of a - a_ref.
-            self.register_buffer("reference_delta_scale", torch.ones(()))
-            nn.init.zeros_(self.acceleration_head[-1].weight)
-            nn.init.zeros_(self.acceleration_head[-1].bias)
-
-    @torch.no_grad()
-    def set_reference_delta_scale(self, scale: float) -> None:
-        """Set s in a_ref + s * head (normalized units)."""
-        if not self.reference_response:
-            raise ValueError("This model was built without reference_response")
-        if not math.isfinite(scale) or scale <= 0:
-            raise ValueError("The reference delta scale must be finite and positive")
-        self.reference_delta_scale.fill_(float(scale))
-
-    def reference_curves(self, indentor: Tensor, time: Tensor, valid: Tensor) -> Tensor:
-        """Normalized reference curves (B, T) at the normalized ``time`` (B, T) of each sample's load case."""
-        if self.reference_table is None:
-            raise RuntimeError("This model reads reference responses but has no reference_table; the trainer "
-                               "builds it from the reference runs, and saved runs keep it in reference_responses.npz")
-        impact_mm = (indentor * self.impact_scale + self.impact_mean).detach().double().cpu().numpy()
-        index = torch.as_tensor(self.reference_table.lookup(impact_mm), device=time.device)
-        return self.reference_table.curves_at(index, time, valid)
+        self.neighborhood_blocks = nn.ModuleList([
+            NeighborhoodAttentionBlock(width, num_heads, dropout, neighborhood_scale_mm or 1.0,
+                                       neighborhood_chunk_size)
+            for _ in range(neighborhood_layers)
+        ])
+        # Plain attribute, never a buffer: the graph is derived from the inputs,
+        # so it must not enter the checkpoint or a state dict.
+        self.neighbor_cache = NeighborGraphCache() if neighborhood_layers else None
+        self.impact_film = FiLM(width)
 
     @torch.no_grad()
     def set_time_scaler(self, mean: float, scale: float) -> None:
         """Save the training time scaler so Fourier frequencies remain in Hz."""
         if not math.isfinite(mean) or not math.isfinite(scale) or scale <= 0:
             raise ValueError("Time scaler must have a finite mean and finite positive scale")
-        if self.time_encoding == "fourier":
-            self.time_mean.fill_(float(mean))
-            self.time_scale.fill_(float(scale))
+        self.time_mean.fill_(float(mean))
+        self.time_scale.fill_(float(scale))
 
     def time_features(self, normalized_time: Tensor) -> Tensor:
-        """Map normalized output coordinates (...,) to features (..., C).
-
-        use [sin(2*pi*f*t_seconds), cos(2*pi*f*t_seconds)] for each
-        fixed frequency f, interleaved in ascending frequency order. The
-        historical mapping is used only for explicitly selected/saved old runs.
-        """
-        if self.time_encoding == "legacy_five":
-            return torch.stack((normalized_time, normalized_time.square(), normalized_time.pow(3),
-                                normalized_time.tanh(), torch.exp(-normalized_time.square())), dim=-1)
+        """Map normalized times (...,) to [sin, cos](2*pi*f*t_seconds) per frequency, (..., C)."""
         physical_time = normalized_time * self.time_scale + self.time_mean
         phases = 2 * math.pi * physical_time.unsqueeze(-1) * self.time_frequencies_hz
         return torch.stack((phases.sin(), phases.cos()), dim=-1).flatten(-2)
@@ -601,67 +347,34 @@ class MeshImpactHistoryNet(nn.Module):
         ) / self.mesh_scale[:2]
         return mesh[:, :2] - impact_mesh_xy
 
-    def node_features(self, mesh: Tensor, impact: Tensor) -> Tensor:
-        """Use XYZ (+ extra channels) for FiLM; retain six features for historical runs."""
-        if self.impact_conditioning == "film":
-            return mesh
-        coordinates = mesh[:, :3]
-        relative_xy = self.impact_relative_xy(coordinates, impact)
-        radius_squared = relative_xy.square().sum(dim=-1, keepdim=True)
-        return torch.cat((coordinates, relative_xy, radius_squared, mesh[:, 3:]), dim=-1)
+    def _encode_neighborhoods(self, mesh: Tensor, nodes: Tensor) -> Tensor:
+        """Local kNN attention over all nodes, in input order.
 
-    def _encode_neighborhoods(self, mesh: Tensor, nodes: Tensor, node_geometry: Tensor | None = None) -> Tensor:
-        """Run local attention over the structural nodes, in input order.
-
-        The leading ``impactor_nodes`` rows are the rigid headform. It travels
-        with the impact location, which ``indentor`` already states exactly, and
-        it is not hood structure, so it takes no part in the local graph. Every
-        remaining node still attends, and the held-out rows reach pooling with
-        their embedding intact. Excluding them also makes the graph identical
-        for every impact on a design, so it is built once and reused. Training
-        registers raw XYZ graphs for persistent reuse across scalers and runs.
-
-        With ``geometry_film="all"`` each block's output is modulated by the
-        node's own geometry memory; it is encoded here when not supplied.
+        The graph depends only on the hood, so it is built once per design and
+        reused for every impact. Training registers raw-XYZ graphs for
+        persistent reuse across scalers and runs (prepare_model_neighbor_graphs).
         """
         # Undo anisotropic standardization; the omitted mean is a common
         # translation and cannot change distances or relative positions.
-        coordinates = mesh[self.impactor_nodes:, :3] * self.mesh_scale
+        coordinates = mesh * self.mesh_scale
         if len(coordinates) < 2:
-            raise ValueError(
-                f"Neighborhood attention needs at least two structural nodes; "
-                f"got {len(coordinates)} after holding out {self.impactor_nodes} impactor nodes"
-            )
+            raise ValueError(f"Neighborhood attention needs at least two nodes; got {len(coordinates)}")
         neighbors = self.neighbor_cache.neighbors(coordinates, self.neighborhood_k)
         if not self.neighborhood_scale_mm:
             # No hand-set length: offsets in units of this mesh's median distance to its k-th neighbour.
             radius = (coordinates[neighbors[:, -1]] - coordinates).norm(dim=-1).median().detach()
             coordinates = coordinates / radius.clamp_min(1e-6)
-        updated = nodes[self.impactor_nodes:]
-        if self.geometry_film == "all" and node_geometry is None:
-            node_geometry = self.geometry_encoder(mesh[:, :3])
-        for index, block in enumerate(self.neighborhood_blocks):
-            updated = block(updated, coordinates, neighbors)
-            if self.geometry_film == "all":
-                updated = self.node_geometry_film[index](updated, node_geometry[self.impactor_nodes:])
-        if not self.impactor_nodes:
-            return updated
-        return torch.cat((nodes[:self.impactor_nodes], updated))
+        for block in self.neighborhood_blocks:
+            nodes = block(nodes, coordinates, neighbors)
+        return nodes
 
-    def _mesh_pooling_inputs(self, mesh: Tensor, impact: Tensor, condition: Tensor,
-                             node_geometry: Tensor | None = None):
-        features = self.node_features(mesh, impact)
-        nodes = self.node_embedding(features)
+    def _encode_mesh(self, mesh: Tensor, impact: Tensor, condition: Tensor) -> Tensor:
+        """(num_latents, width) memory tokens of one mesh at one impact location."""
+        nodes = self.node_embedding(mesh)
         if self.neighborhood_blocks:
-            nodes = self._encode_neighborhoods(mesh, nodes, node_geometry)
-        if self.impact_conditioning == "film":
-            # Normalize before modulation so no immediate LayerNorm removes
-            # the FiLM scale/shift. Both query and residual use these tokens.
-            tokens = self.impact_film(self.query_norm(self.latent_queries), condition)
-            query = self.mesh_query(tokens)
-        else:
-            tokens = self.latent_queries + condition.unsqueeze(0)
-            query = self.mesh_query(self.query_norm(tokens))
+            nodes = self._encode_neighborhoods(mesh, nodes)
+        # Normalize before modulation so no immediate LayerNorm removes the FiLM scale/shift.
+        query = self.mesh_query(self.impact_film(self.query_norm(self.latent_queries), condition))
         head_width = self.width // self.num_heads
         query = query.reshape(self.num_latents, self.num_heads, head_width).transpose(0, 1)
         key, value = self.mesh_key_value(nodes).chunk(2, dim=-1)
@@ -675,67 +388,16 @@ class MeshImpactHistoryNet(nn.Module):
             precision = torch.cat((precision, F.softplus(self.local_log_precision)))
         radius_squared = self.impact_relative_xy(mesh, impact).square().sum(dim=-1)
         spatial_bias = -precision[:, None] * radius_squared.unsqueeze(0)
-        if not self.pool_impactor_nodes and self.impactor_nodes:
-            # A -inf bias gives the headform rows exactly zero attention, so
-            # memory is built from hood nodes only while weights keep one
-            # column per mesh row for attention export.
-            headform = torch.arange(len(mesh), device=mesh.device) < self.impactor_nodes
-            spatial_bias = spatial_bias.masked_fill(headform, float("-inf"))
-        return tokens, query, key, value, spatial_bias
-
-    @torch.no_grad()
-    def iter_pooling_attention(self, mesh: Tensor, impact: Tensor, token_chunk_size: int = 16):
-        """Yield (first_token, weights[heads, chunk_tokens, nodes]) in eval mode.
-
-        Inputs use the saved training scalers, as in forward(). The weights
-        include the learned local radial bias and softmax over ALL mesh nodes;
-        excluded headform rows get exactly zero weight.
-        No dropout is applied. No weights are retained in the model/checkpoint.
-        """
-        if self.training:
-            raise ValueError("Attention export requires model.eval()")
-        if token_chunk_size < 1:
-            raise ValueError("token_chunk_size must be positive")
-        # Generator execution must itself be inside no_grad.
-        with torch.no_grad():
-            condition = self.impact_embedding(impact)
-            _, query, key, _, spatial_bias = self._mesh_pooling_inputs(mesh, impact, condition)
-            for start in range(0, self.num_latents, token_chunk_size):
-                stop = min(start + token_chunk_size, self.num_latents)
-                scores = query[:, start:stop].float() @ key.float().transpose(-1, -2)
-                scores = scores / math.sqrt(self.width // self.num_heads)
-                yield start, torch.softmax(scores + spatial_bias[None, start:stop].float(), dim=-1)
-
-    def _encode_mesh(self, mesh: Tensor, impact: Tensor, condition: Tensor) -> Tensor:
-        return self._encode_mesh_and_geometry(mesh, impact, condition)[0]
-
-    def _encode_mesh_and_geometry(self, mesh: Tensor, impact: Tensor, condition: Tensor):
-        """Return (memory tokens, per-token geometry memory or None) for one mesh."""
-        node_geometry = self.geometry_encoder(mesh[:, :3]) if self.geometry_film != "none" else None
-        tokens, query, key, value, spatial_bias = self._mesh_pooling_inputs(mesh, impact, condition, node_geometry)
-        attention_mask = spatial_bias.to(query.dtype)[None, None, :, :]
         update = F.scaled_dot_product_attention(
             query.unsqueeze(0), key.unsqueeze(0), value.unsqueeze(0),
-            attn_mask=attention_mask,
+            attn_mask=spatial_bias.to(query.dtype)[None, None, :, :],
             dropout_p=self.attention_dropout if self.training else 0.0,
         )
         update = update.squeeze(0).transpose(0, 1).reshape(self.num_latents, self.width)
-        update = self.mesh_dropout(self.mesh_output(update))
-        # The query tokens depend only on the impact location; adding them
-        # back gives the decoder a location code that bypasses the geometry.
-        memory = tokens + update if self.pooling_query_residual else update
-        if node_geometry is None:
-            return memory, None
-        # Same queries, keys and bias, so each head averages the node memory
-        # over the region it reads. Without dropout: the exact footprint.
-        geometry_value = node_geometry.reshape(-1, self.num_heads, self.width // self.num_heads).transpose(0, 1)
-        geometry = F.scaled_dot_product_attention(
-            query.unsqueeze(0), key.unsqueeze(0), geometry_value.unsqueeze(0), attn_mask=attention_mask,
-        )
-        return memory, geometry.squeeze(0).transpose(0, 1).reshape(self.num_latents, self.width)
+        return self.mesh_dropout(self.mesh_output(update))
 
     def _decoder_context(self, mesh: Tensor, mesh_batch: Tensor, indentor: Tensor, batch_size: int):
-        """A second memory the decoder reads after each block; none in this network.
+        """A second memory the decoder reads after each block; none in the backbone.
 
         DesignChangeHistoryNet (mesh_design_change.py) returns its change-node
         tokens here and reads them in ``_read_decoder_context``.
@@ -751,9 +413,8 @@ class MeshImpactHistoryNet(nn.Module):
     ) -> None:
         if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
             raise ValueError("batch_size must be a positive integer")
-        columns = 3 + self.node_extra_features
-        if mesh.ndim != 2 or mesh.shape[1] != columns or mesh.shape[0] == 0:
-            raise ValueError(f"mesh must have shape (N, {columns}) with at least one node")
+        if mesh.ndim != 2 or mesh.shape[1] != 3 or mesh.shape[0] == 0:
+            raise ValueError("mesh must have shape (N, 3) with at least one node")
         if indentor.shape != (batch_size, 2):
             raise ValueError("indentor must have shape (batch_size, 2)")
         if time.ndim != 1 or time.numel() == 0:
@@ -784,53 +445,32 @@ class MeshImpactHistoryNet(nn.Module):
         time: Tensor,
         time_batch: Tensor,
         batch_size: int | None = None,
-        history: Tensor | None = None,
     ) -> Tensor:
         """Return one normalized acceleration per input time, in the same order.
 
         Args:
-            mesh: Normalized XYZ nodes, shape (sum_nodes, 3), followed by
-                ``node_extra_features`` extra channels when that is nonzero.
+            mesh: Normalized XYZ nodes, shape (sum_nodes, 3).
             mesh_batch: Mesh sample membership, shape (sum_nodes,).
             indentor: Normalized impact XY for each sample, shape (B, 2).
             time: Normalized, already-subsampled times, shape (sum_times,).
             time_batch: Time sample membership, shape (sum_times,).
             batch_size: Optional B; inferred from indentor when omitted.
-            history: Teacher forcing only: the true normalized accelerations
-                at ``time``, shape (sum_times,). Each chunk then reads the true
-                earlier chunks. Without it a teacher-forcing model feeds each
-                chunk its own predictions of the earlier ones.
         """
         if batch_size is None:
             if indentor.ndim != 2:
                 raise ValueError("indentor must have shape (batch_size, 2)")
             batch_size = indentor.shape[0]
         self._validate_inputs(mesh, mesh_batch, indentor, time, time_batch, batch_size)
-        if history is not None:
-            if not self.teacher_forcing_chunks:
-                raise ValueError("history is read only by a model with teacher_forcing_chunks > 0")
-            if (history.shape != time.shape or history.dtype != time.dtype or history.device != time.device
-                    or not torch.isfinite(history).all()):
-                raise ValueError("history must be finite and match time in shape, dtype and device")
         condition = self.impact_embedding(indentor)
 
         # Encoding each mesh separately avoids padding tens of thousands of
         # nodes. Only the compact memory and short time sequences are batched.
-        geometry = None
-        if self.geometry_film == "none":
-            memory = torch.stack([
-                self._encode_mesh(mesh[mesh_batch == b], indentor[b], condition[b])
-                for b in range(batch_size)
-            ])
-        else:
-            encoded = [self._encode_mesh_and_geometry(mesh[mesh_batch == b], indentor[b], condition[b])
-                       for b in range(batch_size)]
-            memory = torch.stack([tokens for tokens, _ in encoded])
-            geometry = self.geometry_memory_norm(torch.stack([shape for _, shape in encoded]))
-        for index, block in enumerate(self.latent_blocks):
+        memory = torch.stack([
+            self._encode_mesh(mesh[mesh_batch == b], indentor[b], condition[b])
+            for b in range(batch_size)
+        ])
+        for block in self.latent_blocks:
             memory = block(memory)
-            if geometry is not None:
-                memory = self.latent_geometry_film[index](memory, geometry)
         memory = self.memory_norm(memory)
 
         time_indices = [torch.where(time_batch == b)[0] for b in range(batch_size)]
@@ -838,24 +478,13 @@ class MeshImpactHistoryNet(nn.Module):
         padded_time = pad_sequence(sequences, batch_first=True)
         lengths = torch.tensor([seq.numel() for seq in sequences], device=time.device)
         padding_mask = torch.arange(padded_time.shape[1], device=time.device)[None, :] >= lengths[:, None]
-        time_features = self.time_features(padded_time)
-        queries = self.time_embedding(time_features)
-        if self.impact_conditioning == "legacy_additive":
-            queries = queries + condition[:, None, :]
-        reference = None
-        if self.reference_response:
-            reference = self.reference_curves(indentor, padded_time, ~padding_mask)
-            queries = queries + self.reference_embedding(reference.unsqueeze(-1))
+        queries = self.time_embedding(self.time_features(padded_time))
         decoder_context = self._decoder_context(mesh, mesh_batch, indentor, batch_size)
-        if self.teacher_forcing_chunks:
-            if padding_mask.any():
-                raise ValueError("Teacher forcing chunks the time grid; every sample needs the same number of times")
-            padded_history = None if history is None else torch.stack([history[index] for index in time_indices])
-            padded_acceleration = self._decode_chunks(queries, memory, padding_mask, decoder_context, padded_history)
-        else:
-            padded_acceleration = self._decode(queries, memory, padding_mask, decoder_context)
-        if reference is not None:
-            padded_acceleration = reference + self.reference_delta_scale * padded_acceleration
+        for index, block in enumerate(self.decoder_blocks):
+            queries = block(queries, memory, padding_mask)
+            if decoder_context is not None:
+                queries = self._read_decoder_context(index, queries, decoder_context)
+        padded_acceleration = self.acceleration_head(queries).squeeze(-1)
 
         # Restore even interleaved input time batches without cross-sample
         # attention or predictions for padded positions.
@@ -863,36 +492,3 @@ class MeshImpactHistoryNet(nn.Module):
         for b, index in enumerate(time_indices):
             output = output.index_copy(0, index, padded_acceleration[b, :index.numel()])
         return output
-
-    def _decode(self, queries: Tensor, memory: Tensor, padding_mask: Tensor, decoder_context,
-                time_mask: Tensor | None = None) -> Tensor:
-        """(B, T, W) time queries -> (B, T) normalized accelerations."""
-        for index, block in enumerate(self.decoder_blocks):
-            queries = block(queries, memory, padding_mask, time_mask)
-            if decoder_context is not None:
-                queries = self._read_decoder_context(index, queries, decoder_context)
-        return self.acceleration_head(queries).squeeze(-1)
-
-    def _decode_chunks(self, queries: Tensor, memory: Tensor, padding_mask: Tensor, decoder_context,
-                       history: Tensor | None) -> Tensor:
-        """Teacher forcing with ``history`` (B, T); rollout chunk by chunk without it."""
-        steps = queries.shape[1]
-        size = math.ceil(steps / self.teacher_forcing_chunks)
-        position = torch.arange(steps, device=queries.device)
-        chunk = position // size
-        # Block-causal: True where a time may not read another, i.e. a later chunk.
-        time_mask = chunk[None, :] > chunk[:, None]
-
-        def decode(accelerations):
-            # Time i reads the acceleration at i - size: the same place one chunk earlier.
-            previous = F.pad(accelerations[:, :steps - size], (size, 0))
-            history_queries = self.history_embedding(previous.unsqueeze(-1))
-            return self._decode(queries + history_queries, memory, padding_mask, decoder_context, time_mask)
-
-        if history is not None:
-            return decode(history)
-        # Chunk k's outputs depend only on chunks before k, which hold predictions by then.
-        prediction = queries.new_zeros(queries.shape[:2])
-        for index in range(int(chunk[-1]) + 1):
-            prediction = torch.where(chunk == index, decode(prediction), prediction)
-        return prediction

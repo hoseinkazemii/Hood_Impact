@@ -5,7 +5,7 @@ moved (morphing), never a new mesh, so node IDs match across the family as in
 the hood decks, and a design's change nodes are exactly the nodes its edit
 moved: ``change_node_ids``, ``change_base_xyz`` and ``change_displacement`` in
 <design>_mesh.npz, the same base-position + displacement rows that
-design_change_nodes.py builds for the hood.
+local_edits_data.py builds for the hood (mesh_design_change.STATIC_CHANNELS).
 
 Units: mm, N, MPa, tonne, s (thermal: mJ, so W/(m K) = mJ/(s mm K)).
 """

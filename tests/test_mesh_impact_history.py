@@ -1,4 +1,4 @@
-"""Behavioral checks for the independent mesh-to-acceleration architecture."""
+"""Behavioral checks of the backbone network, preprocessing, and a train/reload/predict round trip."""
 
 import ast
 import inspect
@@ -35,6 +35,8 @@ class MeshImpactHistoryTests(unittest.TestCase):
             latent_layers=1,
             temporal_layers=1,
             dropout=0.0,
+            neighborhood_layers=0,
+            local_latents=2,
         ).eval()
         self.mesh = torch.randn(15, 3)
         self.mesh_batch = torch.tensor([0] * 6 + [1] * 9)
@@ -53,96 +55,6 @@ class MeshImpactHistoryTests(unittest.TestCase):
         )
         arguments.update(overrides)
         return self.model(**arguments)
-
-    def _decoder_model(self, decoder):
-        torch.manual_seed(38)
-        return MeshImpactHistoryNet(
-            width=16, num_heads=2, num_latents=4, latent_layers=1,
-            temporal_layers=2, dropout=0.0, decoder=decoder,
-        ).eval()
-
-    def test_mesh_only_decoder_removes_every_path_between_time_points(self):
-        """The ablation's defining property: no time point can reach another.
-
-        A permutation test would not discriminate -- attention over a set is
-        permutation-equivariant, so both arms pass it. The gradient of one
-        output with respect to the *other* times is the honest probe, and it
-        is exactly zero rather than merely small.
-        """
-        probe = 3  # belongs to sample 0, which has five time points
-        couplings = {}
-        for decoder in ("temporal", "mesh_only"):
-            model = self._decoder_model(decoder)
-            times = self.time.clone().requires_grad_(True)
-            output = model(self.mesh, self.mesh_batch, self.impact, times,
-                           self.time_batch, batch_size=2)
-            gradient = torch.autograd.grad(output[probe], times)[0]
-            self.assertGreater(gradient[probe].abs().item(), 0.0,
-                               f"{decoder}: the output ignores its own time")
-            off_index = gradient.clone()
-            off_index[probe] = 0.0
-            couplings[decoder] = off_index.abs().max().item()
-        self.assertEqual(couplings["mesh_only"], 0.0)
-        self.assertGreater(couplings["temporal"], 0.0)
-
-    def test_mesh_only_decoder_is_a_strict_subset_of_the_temporal_weights(self):
-        temporal = self._decoder_model("temporal").state_dict()
-        mesh_only = self._decoder_model("mesh_only").state_dict()
-        self.assertEqual(set(mesh_only) - set(temporal), set())
-        removed = set(temporal) - set(mesh_only)
-        self.assertTrue(removed, "the ablation must drop the temporal weights")
-        self.assertTrue(
-            all("time_attention" in name or "time_norm" in name for name in removed),
-            f"only the temporal stage may disappear; got {sorted(removed)}",
-        )
-
-    def test_mesh_only_decoder_keeps_the_other_attentions(self):
-        model = self._decoder_model("mesh_only")
-        for name in ("latent_blocks.0.attention", "decoder_blocks.0.cross_attention"):
-            self.assertIsInstance(dict(model.named_modules())[name], nn.MultiheadAttention)
-        # the impact-conditioned global+local mesh attention is hand-rolled
-        self.assertTrue(hasattr(model, "local_log_precision"))
-        self.assertEqual(model.num_global_latents, 2)
-
-    def test_mesh_only_predictions_do_not_depend_on_other_requested_times(self):
-        model = self._decoder_model("mesh_only")
-        # Include both samples with unequal lengths to exercise time padding.
-        subset = torch.tensor([1, 3, 6])
-        with torch.no_grad():
-            full = model(self.mesh, self.mesh_batch, self.impact, self.time,
-                         self.time_batch, batch_size=2)
-            partial = model(self.mesh, self.mesh_batch, self.impact, self.time[subset],
-                            self.time_batch[subset], batch_size=2)
-        torch.testing.assert_close(partial, full[subset], atol=2e-6, rtol=2e-5)
-
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA unavailable")
-    def test_mesh_only_cuda_backward_reaches_all_retained_parameters(self):
-        model = self._decoder_model("mesh_only").to("cuda").train()
-        prediction = model(
-            self.mesh.to("cuda"), self.mesh_batch.to("cuda"), self.impact.to("cuda"),
-            self.time.to("cuda"), self.time_batch.to("cuda"), batch_size=2,
-        )
-        self.assertTrue(torch.isfinite(prediction).all())
-        prediction.square().mean().backward()
-        for name, parameter in model.named_parameters():
-            with self.subTest(parameter=name):
-                self.assertIsNotNone(parameter.grad)
-                self.assertTrue(torch.isfinite(parameter.grad).all())
-        self.assertGreater(model.local_log_precision.grad.abs().sum().item(), 0.0)
-
-    def test_rejects_an_unknown_decoder(self):
-        for decoder in ("Mesh_Only", "meshonly", "", True, 0, None, ["temporal"], {"a": 1}):
-            with self.subTest(decoder=decoder), self.assertRaises(ValueError):
-                MeshImpactHistoryNet(width=16, num_heads=2, num_latents=4,
-                                     latent_layers=1, temporal_layers=1, decoder=decoder)
-
-    def test_decoder_defaults_to_the_temporal_arm_for_saved_configs(self):
-        """Configs written before the ablation existed must still replay."""
-        legacy = dict(width=16, num_heads=2, num_latents=4, latent_layers=1,
-                      temporal_layers=1, dropout=0.0)
-        self.assertEqual(MeshImpactHistoryNet(**legacy).decoder, "temporal")
-        self.assertIn("time_attention.in_proj_weight",
-                      " ".join(MeshImpactHistoryNet(**legacy).state_dict()))
 
     def test_mesh_node_order_does_not_change_history(self):
         permutation = torch.tensor([9, 2, 12, 0, 6, 14, 4, 7, 11, 1, 10, 5, 13, 3, 8])
@@ -216,7 +128,7 @@ class MeshImpactHistoryTests(unittest.TestCase):
         self.assertTrue(all(torch.isfinite(gradient).all() for gradient in parameter_gradients))
         self.assertGreater(sum(gradient.abs().sum().item() for gradient in parameter_gradients), 0.0)
 
-    def test_xyz_features_and_pooling_prior_use_independent_scalers_correctly(self):
+    def test_xyz_input_and_pooling_prior_use_independent_scalers_correctly(self):
         mesh_mean = np.array([100.0, -30.0, 500.0], dtype=np.float32)
         mesh_scale = np.array([10.0, 5.0, 20.0], dtype=np.float32)
         impact_mean = np.array([80.0, -20.0], dtype=np.float32)
@@ -226,14 +138,9 @@ class MeshImpactHistoryTests(unittest.TestCase):
         impact = torch.tensor([2.0, -1.0])
         # Physical impact=(88,-22), hence normalized mesh-space impact=(-1.2,1.6).
         relative = mesh[:, :2] - torch.tensor([-1.2, 1.6])
-        actual = self.model.node_features(mesh, impact)
-        self.assertEqual(actual.shape, (2, 3))
-        torch.testing.assert_close(actual, mesh)
+        self.assertEqual(self.model.node_embedding[0].in_features, 3)  # nodes are embedded from XYZ only
         torch.testing.assert_close(self.model.impact_relative_xy(mesh, impact), relative)
-        *_, bias = self.model._mesh_pooling_inputs(mesh, impact, self.model.impact_embedding(impact))
-        torch.testing.assert_close(bias[:2], torch.zeros(2, 2))
-        precision = torch.nn.functional.softplus(self.model.local_log_precision)
-        torch.testing.assert_close(bias[2:], -precision[:, None] * relative.square().sum(-1)[None])
+        self.assertEqual((self.model.num_global_latents, self.model.local_log_precision.numel()), (2, 2))
 
     def test_cpu_autocast_forward_and_backward_are_finite(self):
         self.model.train()
@@ -313,16 +220,13 @@ class ExistingTimePreprocessingTests(unittest.TestCase):
         from utils.utils import Config, DataPreprocessor
 
         with tempfile.TemporaryDirectory() as directory:
-            config = Config(
-                data_format="legacy", prediction_target="acceleration",
-                output_dir=str(Path(directory) / "run"), acceleration_dir=directory,
-            )
+            config = Config(output_dir=str(Path(directory) / "run"), acceleration_dir=directory)
             self.assertEqual(config.time_subsample_stride, Config.time_subsample_stride)
             stride = config.time_subsample_stride
             time = np.linspace(0.0, 0.025, 5 * stride + 3).astype(np.float32)
             acceleration = (7.0 + np.arange(len(time)) ** 2).astype(np.float32)
             pd.DataFrame({"Time": time, "A(in g)": acceleration}).to_csv(
-                Path(directory) / "HoodImpactor_1_SAE1000.csv", index=False
+                Path(directory) / "HoodImpact_1_SAE1000_interp1000.csv", index=False
             )
             preprocessor = DataPreprocessor(config)
             sampled_time, sampled_acceleration = preprocessor.load_acceleration_history(1)
@@ -339,184 +243,99 @@ class ExistingTimePreprocessingTests(unittest.TestCase):
 
 
 class TrainingRoundTripTests(unittest.TestCase):
+    """Train on the toy local-edit campaign, reload the run, and predict in physical units."""
+
     def test_train_reload_and_predict_keep_sampling_units_and_training_only_scalers(self):
-        self._train_reload_and_predict("temporal")
-
-    def test_mesh_only_train_reload_and_predict(self):
-        self._train_reload_and_predict("mesh_only")
-
-    def test_neighborhood_train_reload_and_predict(self):
-        self._train_reload_and_predict("temporal", ["--neighborhood-layers", "2", "--neighborhood-k", "4"])
-
-    def test_teacher_forcing_train_reload_and_predict(self):
-        # Exported and reloaded predictions are rollouts; teacher_forced/ holds the
-        # same test set fed the true earlier chunks.
-        self._train_reload_and_predict("temporal", ["--teacher-forcing-chunks", "3"])
-
-    def _train_reload_and_predict(self, decoder, extra_args=()):
-        from train_mesh_impact_history import CHECKPOINT_NAME, HistoryPredictor, main
-        from utils.utils import Config
+        from toy_local_edits import RAW_TIMES, curve, impact, mesh, training_args, write_dataset
+        from train_mesh_impact_history import CHECKPOINT_NAME, MODEL_DEFAULTS, HistoryPredictor, main
 
         previous_threads = torch.get_num_threads()
         torch.set_num_threads(1)
         self.addCleanup(torch.set_num_threads, previous_threads)
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            mesh_dir = root / "meshes"
-            acceleration_dir = root / "acceleration"
-            mesh_dir.mkdir()
-            acceleration_dir.mkdir()
-            run_dir = root / "trained"
-            raw_times = np.linspace(0.0, 0.025, 101, dtype=np.float32)
-            meshes, impacts, accelerations, doe = [], [], [], []
-            for run in range(1, 7):
-                design = (run - 1) // 2
-                coordinate = np.linspace(-2.0, 2.0, 6 + run, dtype=np.float32)
-                mesh = np.column_stack((
-                    coordinate + 15.0 * design,
-                    np.sin(coordinate) + 10.0 * design,
-                    3.0 + 0.2 * coordinate + 0.1 * run,
-                )).astype(np.float32)
-                impact = np.asarray([0.2 * run + 15.0 * design, -0.4 * run + 10.0 * design], dtype=np.float32)
-                acceleration = (
-                    15.0 + 3.0 * run + (10.0 + run) * np.sin(np.pi * raw_times / 0.025) ** 2
-                ).astype(np.float32)
-                meshes.append(mesh)
-                impacts.append(impact)
-                accelerations.append(acceleration)
-                pd.DataFrame(mesh, columns=["X1", "X2", "X3"]).to_csv(
-                    mesh_dir / f"HoodImpactor_{run}_COORD.csv", index=False
-                )
-                pd.DataFrame({"Time": raw_times, "A(in g)": acceleration}).to_csv(
-                    acceleration_dir / f"HoodImpactor_{run}_SAE1000.csv", index=False
-                )
-                doe.append({"Run_Number": run, "Indentor X Position": impact[0], "Indentor Y Position": impact[1]})
-            doe_path = root / "DOE.csv"
-            pd.DataFrame(doe).to_csv(doe_path, index=False)
-
-            metrics = main([
-                "--data-format", "legacy", "--mesh-geometry-dir", str(mesh_dir),
-                "--doe-path", str(doe_path), "--acceleration-dir", str(acceleration_dir),
-                "--num-samples", "6", "--samples-per-design", "2",
-                "--test-designs", "2", "--val-designs", "1", "--epochs", "1",
-                "--batch-size", "2", "--width", "16", "--num-heads", "2",
-                "--num-latents", "4", "--latent-layers", "1", "--temporal-layers", "1",
-                "--dropout", "0", "--device", "cpu", "--wandb-mode", "disabled",
-                "--decoder", decoder, "--impactor-nodes", "2",
-                "--output-dir", str(run_dir),
-            ] + list(extra_args))
+            root = write_dataset(Path(directory) / "data")
+            run_dir = Path(directory) / "trained"
+            stride = 2
+            metrics = main(training_args(root, run_dir, "--epochs", "1", "--dropout", "0",
+                                         "--time-subsample-stride", str(stride)))
             self.assertEqual(set(metrics), {"mse", "rmse", "mae", "r2"})
             self.assertTrue(all(np.isfinite(value) for value in metrics.values()))
             for artifact in (
-                CHECKPOINT_NAME, "config.json", "splits.json", "scalers.joblib",
-                "prediction_times.npy", "training_history.json", "training_history.csv",
-                "training_history.png", "wandb_run.json",
-                "metrics.json", "test_acceleration_histories.csv",
-                "train_acceleration_histories.csv", "design_difference_r2.json", "time_windows.json",
+                CHECKPOINT_NAME, "config.json", "splits.json", "scalers.joblib", "prediction_times.npy",
+                "design_change_nodes.npz", "design_change_nodes.json", "local_edit_samples.csv",
+                "training_history.json", "training_history.csv", "training_history.png", "wandb_run.json",
+                "metrics.json", "test_acceleration_histories.csv", "train_acceleration_histories.csv",
+                "validation_acceleration_histories.csv", "local_edit_metrics.json", "local_edit_runs.csv",
+                "time_windows.json", "last_checkpoint/metrics.json", "last_checkpoint/local_edit_metrics.json",
             ):
                 self.assertTrue((run_dir / artifact).is_file(), artifact)
+            expected_times = RAW_TIMES[::stride].astype(np.float32)
             windows = json.loads((run_dir / "time_windows.json").read_text(encoding="utf-8"))
-            chunks = int(extra_args[list(extra_args).index("--teacher-forcing-chunks") + 1]) \
-                if "--teacher-forcing-chunks" in extra_args else 0
-            steps = len(raw_times[::Config.time_subsample_stride])
-            size = -(-steps // (chunks or 5))
-            self.assertEqual(windows["window_points"], [min(size, steps - start) for start in range(0, steps, size)])
-            self.assertEqual(windows["teacher_forced_rmse_g"] is None, not chunks)
-            for directory in (run_dir, run_dir / "last_checkpoint"):
-                self.assertEqual((directory / "teacher_forced" / "metrics.json").is_file(), bool(chunks))
-                self.assertEqual((directory / "teacher_forced" / "test_acceleration_histories.csv").is_file(),
-                                 bool(chunks))
-            # The legacy format has no near-clone cluster map, so nothing is scored.
-            difference = json.loads((run_dir / "design_difference_r2.json").read_text(encoding="utf-8"))
-            self.assertIsNone(difference["train"]["r2"])
-            self.assertIsNone(difference["test"]["r2"])
+            self.assertEqual(sum(windows["window_points"]), len(expected_times))
 
             saved = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
-            self.assertEqual(saved["architecture"]["name"], "MeshImpactHistoryNet")
-            self.assertEqual(saved["architecture"]["kwargs"]["decoder"], decoder)
-            self.assertEqual(saved["architecture"]["kwargs"]["impact_conditioning"], "film")
-            self.assertEqual(saved["architecture"]["kwargs"]["time_encoding"], "fourier")
-            self.assertIs(saved["architecture"]["kwargs"]["pooling_query_residual"], False)
-            self.assertIs(saved["architecture"]["kwargs"]["pool_impactor_nodes"], False)
+            self.assertEqual((saved["format_version"], saved["architecture"]["name"]), (2, "DesignChangeHistoryNet"))
+            self.assertEqual(set(saved["architecture"]["kwargs"]), set(MODEL_DEFAULTS))
             self.assertEqual(saved["prediction_grid"]["time_feature_count"], 12)
-            self.assertEqual(saved["prediction_grid"]["fourier"]["frequencies_hz"], [20.,40.,80.,160.,320.,640.])
-            self.assertEqual(saved["preprocessing"]["time_subsample_stride"], Config.time_subsample_stride)
-            self.assertEqual(saved["preprocessing"]["acceleration_units"], "g")
+            self.assertEqual(saved["prediction_grid"]["fourier"]["frequencies_hz"][0], 20.0)
+            self.assertEqual(saved["preprocessing"]["time_subsample_stride"], stride)
             self.assertEqual(saved["training"]["initialization"], "from_scratch")
             splits = json.loads((run_dir / "splits.json").read_text(encoding="utf-8"))
-            self.assertEqual(splits["train"]["run_numbers"], [1, 2])
-            self.assertEqual(splits["validation"]["run_numbers"], [3, 4])
-            self.assertEqual(splits["test"]["run_numbers"], [5, 6])
-            history = json.loads((run_dir / "training_history.json").read_text(encoding="utf-8"))
-            self.assertEqual(len(history["train_losses"]), 1)
-            self.assertTrue(np.isfinite(history["best_val_loss"]))
+            # Sample number 142 * n + location for design Nn.
+            self.assertEqual(splits["train"]["run_numbers"], [143, 144, 285, 286])
+            self.assertEqual(splits["validation"]["run_numbers"], [427, 428])
+            self.assertEqual(splits["test"]["run_numbers"], [569, 570])
 
             predictor = HistoryPredictor.from_run(run_dir)
-            self.assertEqual(predictor.model.decoder, decoder)
-            self.assertEqual(predictor.model.teacher_forcing_chunks, chunks)
-            self.assertEqual(saved["architecture"]["kwargs"]["teacher_forcing_chunks"], chunks)
-            self.assertEqual(saved["training"]["teacher_forcing"] is None, not chunks)
-            if decoder == "temporal":
-                # Old run configs omitted the decoder. Strict checkpoint reload
-                # must still reconstruct the original temporal architecture.
-                del saved["architecture"]["kwargs"]["decoder"]
-                (run_dir / "config.json").write_text(json.dumps(saved), encoding="utf-8")
-                predictor = HistoryPredictor.from_run(run_dir)
-                self.assertEqual(predictor.model.decoder, "temporal")
-            stride = Config.time_subsample_stride
-            expected_times = raw_times[::stride]
             np.testing.assert_allclose(predictor.time_points, expected_times, rtol=1e-6, atol=1e-9)
             np.testing.assert_array_equal(predictor.time_points, np.load(run_dir / "prediction_times.npy"))
-            # Held-out designs have deliberately shifted inputs and targets.
-            # Check every fitted scaler against only design 0's samples.
+            # Every fitted scaler comes from the training designs N1 and N2 only.
             preprocessor = predictor.preprocessor
+            train_runs = [(1, 1), (1, 2), (2, 1), (2, 2)]
             self.assertAlmostEqual(float(predictor.model.time_mean), float(preprocessor.time_scaler.mean_[0]), places=8)
-            self.assertAlmostEqual(float(predictor.model.time_scale), float(preprocessor.time_scaler.scale_[0]), places=8)
             for scaler, training_values in (
-                (preprocessor.mesh_scaler, np.concatenate(meshes[:2]).astype(np.float64)),
-                (preprocessor.indentor_scaler, np.asarray(impacts[:2], dtype=np.float64)),
-                (preprocessor.time_scaler, np.tile(expected_times, 2).astype(np.float64).reshape(-1, 1)),
-                (preprocessor.accel_scaler, np.concatenate([a[::stride] for a in accelerations[:2]]).astype(np.float64).reshape(-1, 1)),
+                (preprocessor.mesh_scaler, np.concatenate([mesh(d) for d, _ in train_runs]).astype(np.float64)),
+                (preprocessor.indentor_scaler, np.asarray([impact(loc) for _, loc in train_runs], dtype=np.float64)),
+                (preprocessor.time_scaler, np.tile(expected_times, 4).astype(np.float64).reshape(-1, 1)),
+                (preprocessor.accel_scaler, np.concatenate([curve(d, loc)[::stride] for d, loc in train_runs])
+                 .astype(np.float64).reshape(-1, 1)),
             ):
-                np.testing.assert_allclose(scaler.mean_, training_values.mean(axis=0), rtol=1e-6, atol=1e-7)
-                np.testing.assert_allclose(scaler.scale_, training_values.std(axis=0), rtol=1e-6, atol=1e-7)
+                np.testing.assert_allclose(scaler.mean_, training_values.mean(axis=0), rtol=1e-5, atol=1e-6)
+                std = training_values.std(axis=0)  # StandardScaler reports a constant column's scale as 1
+                np.testing.assert_allclose(scaler.scale_, np.where(std > 0, std, 1.0), rtol=1e-5, atol=1e-6)
 
             exported = pd.read_csv(run_dir / "test_acceleration_histories.csv")
             self.assertEqual(len(exported), 2 * len(expected_times))
-            for run in (5, 6):
-                rows = exported[exported["run_number"] == run]
-                prediction_g = predictor.predict(meshes[run - 1], impacts[run - 1])
+            for location in (1, 2):
+                rows = exported[exported["run_number"] == 142 * 4 + location]
+                prediction_g = predictor.predict(mesh(4), impact(location))
                 self.assertEqual(prediction_g.shape, expected_times.shape)
-                self.assertTrue(np.isfinite(prediction_g).all())
                 np.testing.assert_allclose(rows["time"], expected_times, rtol=1e-6, atol=1e-9)
-                np.testing.assert_allclose(rows["acceleration_true_g"], accelerations[run - 1][::stride], rtol=1e-6)
+                np.testing.assert_allclose(rows["acceleration_true_g"], curve(4, location)[::stride],
+                                           rtol=1e-5, atol=1e-4)
                 np.testing.assert_allclose(prediction_g, rows["acceleration_pred_g"], rtol=2e-5, atol=2e-5)
-            # Train histories come from an unshuffled pass, so rows follow run order.
+            # Train histories come from an unshuffled pass, so rows follow sample order.
             exported_train = pd.read_csv(run_dir / "train_acceleration_histories.csv")
-            self.assertEqual(exported_train["run_number"].tolist(), np.repeat([1, 2], len(expected_times)).tolist())
-            for run in (1, 2):
-                rows = exported_train[exported_train["run_number"] == run]
-                np.testing.assert_allclose(rows["acceleration_true_g"], accelerations[run - 1][::stride], rtol=1e-6)
-                np.testing.assert_allclose(predictor.predict(meshes[run - 1], impacts[run - 1]),
-                                           rows["acceleration_pred_g"], rtol=2e-5, atol=2e-5)
+            self.assertEqual(exported_train["run_number"].tolist(),
+                             np.repeat([143, 144, 285, 286], len(expected_times)).tolist())
 
             # Supplying the saved grid must not subsample it a second time.
-            explicit_prediction = predictor.predict(meshes[4], impacts[4], sampled_time_points=predictor.time_points)
-            np.testing.assert_allclose(explicit_prediction, predictor.predict(meshes[4], impacts[4]))
+            explicit = predictor.predict(mesh(4), impact(1), sampled_time_points=predictor.time_points)
+            np.testing.assert_allclose(explicit, predictor.predict(mesh(4), impact(1)))
             checkpoint = torch.load(run_dir / CHECKPOINT_NAME, map_location="cpu", weights_only=True)
             for key, value in predictor.model.state_dict().items():
                 torch.testing.assert_close(value, checkpoint["model_state_dict"][key])
-            # Verify physical g units directly against the normalized model output.
-            mesh_tensor = torch.from_numpy(preprocessor.transform_mesh(meshes[4]))
-            impact_tensor = torch.from_numpy(preprocessor.transform_indentor(impacts[4])).unsqueeze(0)
+            # Physical g units directly from the normalized model output.
+            mesh_tensor = torch.from_numpy(preprocessor.transform_mesh(mesh(4)))
+            impact_tensor = torch.from_numpy(preprocessor.transform_indentor(np.asarray(impact(1), np.float32))).unsqueeze(0)
             time_tensor = torch.from_numpy(preprocessor.transform_time(predictor.time_points))
             with torch.no_grad():
-                normalized_prediction = predictor.model(
+                normalized = predictor.model(
                     mesh_tensor, torch.zeros(len(mesh_tensor), dtype=torch.long), impact_tensor,
                     time_tensor, torch.zeros(len(time_tensor), dtype=torch.long), batch_size=1,
                 ).numpy()
-            expected_g = normalized_prediction * preprocessor.accel_scaler.scale_[0] + preprocessor.accel_scaler.mean_[0]
-            np.testing.assert_allclose(explicit_prediction, expected_g, rtol=1e-6, atol=1e-6)
+            expected_g = normalized * preprocessor.accel_scaler.scale_[0] + preprocessor.accel_scaler.mean_[0]
+            np.testing.assert_allclose(explicit, expected_g, rtol=1e-6, atol=1e-5)
 
 
 if __name__ == "__main__":

@@ -1,44 +1,28 @@
-"""MeshImpactHistoryNet plus a decoder path that reads the design-change nodes.
+"""DesignChangeHistoryNet: the backbone plus a decoder readout of the edited nodes.
 
-Pooling compresses the ~38k hood nodes into 256 tokens, and near-clone designs
-differ at only 110-333 of them, so the pooled memory hardly changes between
-them (0.5% relative after pooling against 0.8% at the node embedding; probe of
-run 20261016_151923_3394500_1704). Here the change nodes found by
-design_change_nodes.py skip pooling. Each one becomes its own token, built from
-its XYZ in this design, normalized as the backbone's mesh input
-(``design_change_features="xyz"``, the default).
+Pooling compresses the ~18k inner-panel nodes into 256 tokens, and a local edit
+moves only 50-377 of them, so the pooled memory hardly changes between a design
+and its edits. Here the edited ("change") nodes skip pooling: each becomes its
+own token, and after every decoder block the time queries read these tokens
+with a second cross-attention (:class:`ChangeReadout`) whose output projection
+starts at zero, so a new model starts as exactly the backbone.
 
-``design_change_features="edit"`` (since 2026-11-24) encodes the edit itself:
-each token is the node's position in the reference design, normalized as the
-mesh, and its 3D displacement from there divided by one isotropic length,
-``change_displacement_scale`` (the trainer sets it to the RMS displacement
-length of the training designs' change nodes). Nothing in it is tied to an axis
-or to the hood. The null token's value is zero, so a design without change
-nodes gets no update from the readouts; its key still lets attention look away
-from the edit, which sets how strongly the edit acts at each time.
+Token inputs (``design_change_features``):
 
-Runs before 2026-10-26 used ``"impact_relative"`` tokens instead: the XY offset
-from the impact point and its distance (/ 250 mm), sin/cos of the offset at
-wavelengths 800 / 2^k mm, the displacement from the cluster base (/ 10 mm) and
-its length, the base inner-outer panel gap and its change, and an outer-panel flag.
+* ``"edit"`` (default, since 2026-11-24): the node's position in the reference
+  design, normalized as the backbone's mesh input, and its 3D displacement
+  from there divided by one isotropic length, ``change_displacement_scale``
+  (the trainer sets it to the RMS displacement length of the training
+  designs' change nodes). Nothing in it is tied to an axis or to the hood.
+  The null token's value is zero, so a design without change nodes gets no
+  update from the readouts; its key still lets attention look away from the
+  edit, which sets how strongly the edit acts at each time.
+* ``"xyz"``: the node's coordinates in this design, normalized as the mesh
+  (runs before 2026-11-24).
 
-``design_change_layers`` self-attention blocks (default none) run over each
-design's change tokens plus one learned null token. After every decoder block the time queries
-read these tokens with a second cross-attention (:class:`ChangeReadout`) whose
-output projection starts at zero, so a new model starts as exactly the backbone.
-The tokens are already only the nodes that differ between near-clones, so the
-attention alone decides which of them matter (the default since 2026-10-30).
-
-Runs before 2026-10-30 also scaled each value by the node's displacement from
-its cluster base / 10 mm and the null token's by zero
-(``design_change_displacement_gate=True``). There a cluster's base design (0, 4,
-6, 10) always got exactly the backbone prediction.
-
-Training uses the backbone's plain acceleration MSE.
-
-The model recognizes a hood by its normalized coordinates, as the neighbor-graph
-cache does. ``design_changes`` (a :class:`DesignChangeTable`) maps the digest
-of each known hood's structural rows to its change nodes. The trainer fills it
+The model recognizes a hood by its normalized coordinates, as the
+neighbor-graph cache does. ``design_changes`` (a :class:`DesignChangeTable`)
+maps the digest of each known hood to its change nodes. The trainer fills it
 and saves it beside the checkpoint (design_change_nodes.npz); it is never part
 of the state dict.
 """
@@ -52,33 +36,47 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from design_change_nodes import STATIC_CHANNELS
-from mesh_impact_history import LatentMixingBlock, MeshImpactHistoryNet
+from mesh_impact_history import MeshImpactHistoryNet, saved_model_kwargs
 from mesh_neighborhood import NeighborGraphCache
 
-CHANGE_POSITION_SCALE_MM = 250.0
-CHANGE_DISPLACEMENT_SCALE_MM = 10.0
-CHANGE_LONGEST_WAVELENGTH_MM = 800.0
 TABLE_FILE = "design_change_nodes.npz"
-# Change-token inputs: the node's XYZ (default), the impact-relative position,
-# displacement, panel gap and panel flag that runs before 2026-10-26 used, or
-# the edit: reference position and displacement (since 2026-11-24).
-CHANGE_FEATURES = ("xyz", "impact_relative", "edit")
+# Columns of a design change's "static" rows: reference-hood position and the
+# design's displacement from it, in mm.
+STATIC_CHANNELS = ("base_x", "base_y", "base_z", "dx", "dy", "dz")
+# Tables saved before 2026-11-27 also carried three panel-gap channels, zero on
+# the local-edit set; DesignChangeTable.load drops them.
+LEGACY_STATIC_CHANNELS = (*STATIC_CHANNELS, "base_gap", "gap_change", "outer")
+CHANGE_FEATURES = ("edit", "xyz")
 CHANGE_INPUTS = {"xyz": 3, "edit": 6}
+# Keyword arguments of earlier saved runs that now have only one supported value.
+RETIRED_KWARGS = {"design_change_layers": 0, "design_change_displacement_gate": False}
+IGNORED_KWARGS = ("design_change_fourier_octaves",)
 
 
-def saved_design_change_kwargs(kwargs: dict) -> dict:
-    """Model kwargs of a saved DesignChangeHistoryNet; older configs used impact-relative
-    tokens and the displacement gate."""
-    return {"design_change_features": "impact_relative", "design_change_displacement_gate": True, **kwargs}
+def saved_design_change_kwargs(kwargs: dict, *, format_version: int) -> dict:
+    """Constructor kwargs of a saved DesignChangeHistoryNet run (see saved_model_kwargs)."""
+    kwargs = saved_model_kwargs(kwargs, format_version=format_version)
+    if format_version == 1:
+        # Configs saved before these keys existed used impact-relative tokens and the gate.
+        kwargs = {"design_change_features": "impact_relative", "design_change_displacement_gate": True, **kwargs}
+    if kwargs.get("design_change_features") not in CHANGE_FEATURES:
+        raise ValueError("This run used impact-relative change tokens (before 2026-10-26), "
+                         "which were removed from the code")
+    for key, supported in RETIRED_KWARGS.items():
+        value = kwargs.pop(key, supported)
+        if value != supported:
+            raise ValueError(f"This run used {key}={value!r}, an option removed from the code")
+    for key in IGNORED_KWARGS:
+        kwargs.pop(key, None)
+    return kwargs
 
 
 class DesignChangeTable:
-    """Change-node features of every known hood, found from the hood's coordinates.
+    """Change-node rows of every known hood, found from the hood's coordinates.
 
     ``static`` is (designs, max nodes, len(STATIC_CHANNELS)) in mm, zero-padded
-    past ``counts``. ``register`` binds the normalized structural rows (headform
-    removed) of a design's mesh to its row of the table.
+    past ``counts``. ``register`` binds the normalized mesh of a design to its
+    row of the table.
     """
 
     def __init__(self, designs, static, counts, index_of=None):
@@ -94,7 +92,7 @@ class DesignChangeTable:
 
     @classmethod
     def from_changes(cls, changes):
-        """Build from design_change_nodes.find_design_changes output."""
+        """Build from local_edits_data.load_design_changes output."""
         designs = sorted(changes)
         counts = [len(changes[design]["static"]) for design in designs]
         static = np.zeros((len(designs), max(counts + [1]), len(STATIC_CHANNELS)), np.float32)
@@ -103,21 +101,21 @@ class DesignChangeTable:
         return cls(designs, static, counts)
 
     @staticmethod
-    def digest(structural):
-        return NeighborGraphCache.geometry_digest(NeighborGraphCache.points(structural))
+    def digest(mesh):
+        return NeighborGraphCache.geometry_digest(NeighborGraphCache.points(mesh))
 
-    def register(self, structural, design):
+    def register(self, mesh, design):
         matches = np.flatnonzero(self.designs == design)
         if not len(matches):
             raise KeyError(f"Design {design} is not in the design-change table")
-        key, index = self.digest(structural), int(matches[0])
+        key, index = self.digest(mesh), int(matches[0])
         if self.index_of.setdefault(key, index) != index:
             raise ValueError(f"Design {design} has the same hood coordinates as design "
                              f"{self.designs[self.index_of[key]]}")
         return key
 
-    def lookup(self, structural):
-        index = self.index_of.get(self.digest(structural))
+    def lookup(self, mesh):
+        index = self.index_of.get(self.digest(mesh))
         if index is None:
             raise KeyError("This hood is not in the design-change table. The table holds the decks the "
                            "model was trained with; register a new hood with DesignChangeTable.register.")
@@ -142,10 +140,13 @@ class DesignChangeTable:
     @classmethod
     def load(cls, path):
         with np.load(Path(path), allow_pickle=False) as saved:
-            if tuple(saved["channels"].tolist()) != STATIC_CHANNELS:
-                raise ValueError(f"{path} stores channels {saved['channels'].tolist()}, expected {STATIC_CHANNELS}")
+            channels, static = tuple(saved["channels"].tolist()), saved["static"]
+            if channels == LEGACY_STATIC_CHANNELS and not static[..., len(STATIC_CHANNELS):].any():
+                static, channels = static[..., :len(STATIC_CHANNELS)], STATIC_CHANNELS
+            if channels != STATIC_CHANNELS:
+                raise ValueError(f"{path} stores channels {list(channels)}, expected {list(STATIC_CHANNELS)}")
             index_of = dict(zip(saved["digests"].tolist(), saved["digest_index"].tolist()))
-            return cls(saved["designs"], saved["static"], saved["counts"], index_of)
+            return cls(saved["designs"], static, saved["counts"], index_of)
 
     def same_as(self, other):
         return (np.array_equal(self.designs, other.designs) and np.array_equal(self.counts, other.counts)
@@ -155,9 +156,8 @@ class DesignChangeTable:
 class ChangeReadout(nn.Module):
     """Time queries read the change-node tokens. The output projection starts at zero.
 
-    With a ``gate`` each value is multiplied by it. Older runs gated by the
-    displacement length / 10 mm and the null token by zero, so a design with no
-    displacement adds nothing; "edit" tokens gate only the null token, by zero.
+    With a ``gate`` each value is multiplied by it; "edit" tokens gate only the
+    null token, by zero, so a design without an edit gets no update.
     """
 
     def __init__(self, width: int, num_heads: int, dropout: float):
@@ -194,38 +194,20 @@ class ChangeReadout(nn.Module):
 class DesignChangeHistoryNet(MeshImpactHistoryNet):
     """MeshImpactHistoryNet whose decoder also reads the design-change nodes directly."""
 
-    def __init__(self, design_change_layers: int = 0, design_change_fourier_octaves: int = 2,
-                 design_change_features: str = "xyz", design_change_displacement_gate: bool = False, **kwargs):
-        if isinstance(design_change_layers, bool) or not isinstance(design_change_layers, int) or design_change_layers < 0:
-            raise ValueError("design_change_layers must be a nonnegative integer")
+    def __init__(self, design_change_features: str = "edit", **kwargs):
         if design_change_features not in CHANGE_FEATURES:
             raise ValueError(f"design_change_features must be one of {CHANGE_FEATURES}; got {design_change_features!r}")
-        if not isinstance(design_change_displacement_gate, bool):
-            raise ValueError("design_change_displacement_gate must be true or false")
-        if (isinstance(design_change_fourier_octaves, bool) or not isinstance(design_change_fourier_octaves, int)
-                or design_change_fourier_octaves < 1):
-            raise ValueError("design_change_fourier_octaves must be a positive integer")
         super().__init__(**kwargs)
-        if self.node_extra_features:
-            raise ValueError("DesignChangeHistoryNet reads XYZ meshes; node_extra_features must be 0")
-        self.design_change_layers = design_change_layers
         self.design_change_features = design_change_features
-        self.design_change_displacement_gate = design_change_displacement_gate
         # Added after every backbone module, so one seed gives the backbone the
         # same initial weights as MeshImpactHistoryNet.
-        frequencies = 2 * math.pi * 2.0 ** torch.arange(design_change_fourier_octaves) / CHANGE_LONGEST_WAVELENGTH_MM
-        self.register_buffer("change_frequencies", frequencies.float(), persistent=False)
         width = self.width
-        inputs = CHANGE_INPUTS.get(design_change_features, 10 + 4 * design_change_fourier_octaves)
         self.change_embedding = nn.Sequential(
-            nn.Linear(inputs, width), nn.GELU(),
+            nn.Linear(CHANGE_INPUTS[design_change_features], width), nn.GELU(),
             nn.Linear(width, width), nn.LayerNorm(width),
         )
         self.change_null_token = nn.Parameter(torch.empty(1, 1, width))
         nn.init.normal_(self.change_null_token, std=0.02)
-        self.change_blocks = nn.ModuleList([
-            LatentMixingBlock(width, self.num_heads, self.attention_dropout) for _ in range(design_change_layers)
-        ])
         self.change_norm = nn.LayerNorm(width)
         self.change_readouts = nn.ModuleList([
             ChangeReadout(width, self.num_heads, self.attention_dropout) for _ in self.decoder_blocks
@@ -245,53 +227,34 @@ class DesignChangeHistoryNet(MeshImpactHistoryNet):
             raise ValueError("The change displacement scale must be finite and positive")
         self.change_displacement_scale.fill_(float(scale_mm))
 
-    def change_features(self, static: Tensor, impact_mm: Tensor) -> Tensor:
-        """Token inputs from static rows (B, M, S) and impact XY (B, 2) in mm.
+    def change_features(self, static: Tensor) -> Tensor:
+        """Token inputs from static rows (B, M, 6) in mm.
 
-        "xyz": (B, M, 3), the node's coordinates in this design, normalized as the
-        backbone's mesh input. "edit": (B, M, 6), the node's reference position,
-        normalized the same way, then its displacement / change_displacement_scale.
-        "impact_relative": (B, M, 10 + 4 * octaves).
+        "edit": (B, M, 6), the node's reference position normalized as the mesh,
+        then its displacement / change_displacement_scale. "xyz": (B, M, 3), the
+        node's coordinates in this design, normalized as the mesh.
         """
         base, displacement = static[..., :3], static[..., 3:6]
         if self.design_change_features == "xyz":
             return (base + displacement - self.mesh_mean) / self.mesh_scale
-        if self.design_change_features == "edit":
-            if not torch.isfinite(self.change_displacement_scale):
-                raise RuntimeError("Set the edit tokens' displacement scale (set_change_displacement_scale) first")
-            return torch.cat(((base - self.mesh_mean) / self.mesh_scale,
-                              displacement / self.change_displacement_scale), dim=-1)
-        relative = base[..., :2] - impact_mm[:, None, :]
-        phases = (relative.unsqueeze(-1) * self.change_frequencies).flatten(2)
-        return torch.cat((
-            relative / CHANGE_POSITION_SCALE_MM,
-            relative.norm(dim=-1, keepdim=True) / CHANGE_POSITION_SCALE_MM,
-            phases.sin(), phases.cos(),
-            displacement / CHANGE_DISPLACEMENT_SCALE_MM,
-            displacement.norm(dim=-1, keepdim=True) / CHANGE_DISPLACEMENT_SCALE_MM,
-            static[..., 6:8] / CHANGE_DISPLACEMENT_SCALE_MM,
-            static[..., 8:9],
-        ), dim=-1)
+        if not torch.isfinite(self.change_displacement_scale):
+            raise RuntimeError("Set the edit tokens' displacement scale (set_change_displacement_scale) first")
+        return torch.cat(((base - self.mesh_mean) / self.mesh_scale,
+                          displacement / self.change_displacement_scale), dim=-1)
 
     def _decoder_context(self, mesh: Tensor, mesh_batch: Tensor, indentor: Tensor, batch_size: int):
         if self.design_changes is None:
             raise RuntimeError("DesignChangeHistoryNet has no design_changes table; the trainer builds it "
                                f"from the decks, and saved runs keep it in {TABLE_FILE}")
-        index = torch.tensor([self.design_changes.lookup(mesh[mesh_batch == b][self.impactor_nodes:])
-                              for b in range(batch_size)], device=mesh.device)
+        index = torch.tensor([self.design_changes.lookup(mesh[mesh_batch == b]) for b in range(batch_size)],
+                             device=mesh.device)
         static, valid = self.design_changes.tensors(mesh.device)
         static, valid = static[index].to(mesh.dtype), valid[index]
-        impact_mm = indentor * self.impact_scale + self.impact_mean
-        tokens = self.change_embedding(self.change_features(static, impact_mm))
+        tokens = self.change_embedding(self.change_features(static))
         tokens = torch.cat((self.change_null_token.expand(batch_size, -1, -1), tokens), dim=1)
         valid = torch.cat((valid.new_ones(batch_size, 1), valid), dim=1)
-        for block in self.change_blocks:
-            tokens = block(tokens, padding_mask=~valid)
         gate = None
-        if self.design_change_displacement_gate:
-            gate = static[..., 3:6].norm(dim=-1) / CHANGE_DISPLACEMENT_SCALE_MM
-            gate = torch.cat((gate.new_zeros(batch_size, 1), gate), dim=1)
-        elif self.design_change_features == "edit":
+        if self.design_change_features == "edit":
             # Zero value for the null token only: no edit, no update.
             gate = torch.cat((static.new_zeros(batch_size, 1), static.new_ones(batch_size, static.shape[1])), dim=1)
         return self.change_norm(tokens), gate, valid
@@ -319,7 +282,6 @@ def register_design_changes(model, changes, meshes, designs, transform_mesh):
     against its own mesh, so a table built from the wrong decks cannot load.
     """
     table = DesignChangeTable.from_changes(changes)
-    start = model.impactor_nodes
     checked, worst = set(), 0.0
     for mesh, design in zip(meshes, designs):
         change = changes[design]
@@ -329,7 +291,7 @@ def register_design_changes(model, changes, meshes, designs, transform_mesh):
             raise ValueError(f"Design {design}: mesh rows differ from the deck change nodes by {error:.3g} mm")
         worst = max(worst, error)
         normalized = np.asarray(transform_mesh(np.asarray(mesh)), dtype=np.float32)
-        checked.add(table.register(normalized[start:], design))
+        checked.add(table.register(normalized, design))
     model.design_changes = table
     return {"registered_hoods": len(checked), "registered_designs": sorted({int(d) for d in designs}),
             "max_row_check_error_mm": worst, "table_file": TABLE_FILE}

@@ -1,4 +1,4 @@
-"""Export HIC15 results for a local-edit training run (``--data-format localedits``).
+"""Export HIC15 results for a local-edit training run (train_mesh_impact_history.py).
 
 Reads the run's exported histories (train / validation / test, best checkpoint) and
 ``local_edit_runs.csv``, recomputes exact HIC15 for every run, and adds:

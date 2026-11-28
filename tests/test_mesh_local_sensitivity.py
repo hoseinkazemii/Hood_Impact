@@ -1,9 +1,6 @@
 """Behavioral checks for neighborhood learning with ordinary acceleration MSE."""
 
 import json
-from pathlib import Path
-import tempfile
-from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -94,113 +91,47 @@ def test_new_model_is_node_order_invariant_isolates_meshes_and_backpropagates():
 @pytest.mark.parametrize("options", [
     {"neighborhood_layers": -1}, {"neighborhood_layers": True}, {"neighborhood_k": 0},
     {"neighborhood_chunk_size": 0}, {"neighborhood_scale_mm": float("nan")}, {"neighborhood_scale_mm": -1.0},
-    {"impactor_nodes": -1}, {"impactor_nodes": True}, {"impactor_nodes": 1.5},
 ])
 def test_invalid_neighborhood_configuration_fails(options):
     with pytest.raises(ValueError):
         MeshImpactHistoryNet(**options)
 
 
-def test_neighborhood_mse_train_save_and_reload_with_train_only_scalers():
-    from train_mesh_impact_history import DataPreprocessor, HistoryPredictor, main
+def test_trained_run_reloads_its_neighbor_graphs_without_a_new_search(tmp_path):
+    from toy_local_edits import impact, mesh, training_args, write_dataset
+    from train_mesh_impact_history import HistoryPredictor, main
 
-    # Four locations per design; training A/C/D, validation 11, test whole B.
-    # Mock only disk loading so the real split, scalers, sampler, optimizer,
-    # checkpoint selection, exports and inference all execute.
-    rng = np.random.default_rng(14)
-    data = {key: [] for key in ("run_numbers", "mesh_geometries", "indentor_positions", "time_arrays", "accelerations")}
-    times = np.linspace(0, .025, 7, dtype=np.float32)
-    for design in (0, 6, 10, 11, 4, 5):
-        for location in range(4):
-            data["run_numbers"].append(design * 4 + location + 1)
-            data["mesh_geometries"].append((rng.normal(size=(10 + location, 3)) + design).astype(np.float32))
-            data["indentor_positions"].append([location * 10., location * 3.])
-            data["time_arrays"].append(times.copy())
-            data["accelerations"].append((20 + design * 3 + (10 + location) * np.sin(times * 100)).astype(np.float32))
-    data["indentor_positions"] = np.asarray(data["indentor_positions"], dtype=np.float32)
-    with tempfile.TemporaryDirectory() as folder, mock.patch.object(DataPreprocessor, "load_all_data", return_value=data):
-        main(["--data-format", "euroncap1704", "--num-samples", "24", "--samples-per-design", "4",
-              "--epochs", "2", "--batch-size", "4", "--width", "16", "--num-heads", "2", "--num-latents", "4",
-              "--latent-layers", "1", "--temporal-layers", "1", "--neighborhood-layers", "2", "--neighborhood-k", "3",
-              "--mesh-nodes", "all", "--impactor-nodes", "2",
-              "--neighbor-cache-dir", str(Path(folder) / "neighbor_graphs"),
-              "--device", "cpu", "--wandb-mode", "disabled", "--output-dir", folder])
-        root = Path(folder)
-        saved = json.loads((root / "config.json").read_text())
-        history = json.loads((root / "training_history.json").read_text())
-        splits = json.loads((root / "splits.json").read_text())
-        assert splits["train"]["design_ids"] == [0, 6, 10]
-        assert splits["validation"]["design_ids"] == [11]
-        assert splits["test"]["design_ids"] == [4, 5]
-        assert saved["training"]["loss"] == "normalized_acceleration_mse"
-        assert saved["training"]["batch_sampling"] == "shuffle"
-        assert saved["architecture"]["kwargs"]["neighborhood_layers"] == 2
-        assert saved["architecture"]["kwargs"]["impactor_nodes"] == 2
-        assert saved["neighbor_graph_cache"]["unique_structural_geometries"] == 24
-        assert saved["neighbor_graph_cache"]["built"] == 24
-        sensitivity = json.loads((root / "test_design_sensitivity.json").read_text())
-        assert sensitivity["num_matched_locations"] == 4
-        assert sensitivity["impact_xy_checked"] is True
-        assert np.isfinite(sensitivity["design_difference_skill"])
-        assert (root / "test_design_sensitivity_by_location.csv").is_file()
-        assert (root / "test_design_sensitivity.png").is_file()
-        assert np.isfinite(history["train_losses"]).all()
-        predictor = HistoryPredictor.from_run(folder)
-        np.testing.assert_allclose(predictor.preprocessor.mesh_scaler.mean_,
-                                   np.concatenate(data["mesh_geometries"][:12]).astype(np.float64).mean(0))
-        exported = pd.read_csv(root / "test_acceleration_histories.csv")
-        with mock.patch("mesh_neighborhood.geometric_neighbors", side_effect=AssertionError("Unexpected repeated search")):
-            for i in range(16, 24):
-                predicted = predictor.predict(data["mesh_geometries"][i], data["indentor_positions"][i])
-                np.testing.assert_allclose(predicted, exported.loc[exported.run_number == data["run_numbers"][i], "acceleration_pred_g"],
-                                           atol=3e-5, rtol=3e-5)
-        assert predictor.model.neighbor_cache.builds == 0
-        assert predictor.model.neighbor_cache.disk_hits == 8
-        frame = pd.read_csv(root / "training_history.csv")
-        np.testing.assert_allclose(frame.train_mse_normalized, history["train_losses"])
-        assert "train_objective" not in frame
-
-
-# The leading nodes of a 1704 .inp *NODE block are the rigid headform. It moves
-# with the impact location, so holding it out is what makes the structural
-# neighbor graph constant across every impact on one design.
-def headform_mesh(headform_x):
-    """Two headform nodes, then six structural nodes one unit apart."""
-    headform = torch.tensor([[headform_x, .1, 0.], [headform_x, .2, 0.]])
-    structure = torch.tensor([[float(i), 0., 0.] for i in range(6)])
-    return torch.cat((headform, structure))
-
-
-def test_headform_holdout_keeps_local_attention_structural_and_passes_it_through():
-    torch.manual_seed(3)
-    held = small_model(impactor_nodes=2).eval()
-    nodes = torch.randn(8, 16)
-    near, far = headform_mesh(0.), headform_mesh(100.)
-    with torch.no_grad():
-        first, second = held._encode_neighborhoods(near, nodes), held._encode_neighborhoods(far, nodes)
-    # Structural rows never see the headform, so they cannot follow it.
-    torch.testing.assert_close(first[2:], second[2:], atol=0, rtol=0)
-    # Held-out rows reach pooling exactly as embedded, unchanged by the blocks.
-    torch.testing.assert_close(first[:2], nodes[:2], atol=0, rtol=0)
-
-    # Without the holdout the same weights do follow it, so the test above is
-    # measuring the exclusion rather than a headform too far away to matter.
-    plain = small_model(impactor_nodes=0).eval()
-    plain.load_state_dict(held.state_dict())
-    with torch.no_grad():
-        moved = plain._encode_neighborhoods(near, nodes), plain._encode_neighborhoods(far, nodes)
-    assert not torch.allclose(moved[0][2:], moved[1][2:])
+    root = write_dataset(tmp_path / "data")
+    run = tmp_path / "run"
+    main(training_args(root, run, "--epochs", "2", "--neighbor-cache-dir", str(tmp_path / "graphs")))
+    saved = json.loads((run / "config.json").read_text())
+    assert saved["training"]["batch_sampling"] == "shuffle"
+    assert saved["architecture"]["kwargs"]["neighborhood_layers"] == 2
+    # N1-N4: one graph per design, shared by all of its impact locations.
+    assert saved["neighbor_graph_cache"]["unique_geometries"] == saved["neighbor_graph_cache"]["built"] == 4
+    history = json.loads((run / "training_history.json").read_text())
+    np.testing.assert_allclose(pd.read_csv(run / "training_history.csv").train_mse_normalized, history["train_losses"])
+    predictor = HistoryPredictor.from_run(run)
+    exported = pd.read_csv(run / "test_acceleration_histories.csv")
+    with mock.patch("mesh_neighborhood.geometric_neighbors", side_effect=AssertionError("Unexpected repeated search")):
+        for location in (1, 2):
+            predicted = predictor.predict(mesh(4), impact(location))
+            np.testing.assert_allclose(predicted, exported.loc[exported.run_number == 142 * 4 + location,
+                                                               "acceleration_pred_g"], atol=3e-5, rtol=3e-5)
+    assert predictor.model.neighbor_cache.builds == 0
+    assert predictor.model.neighbor_cache.disk_hits == 1
 
 
 def test_neighbor_graph_is_built_once_per_geometry_and_stays_out_of_the_checkpoint():
-    model = small_model(impactor_nodes=2).eval()
-    nodes = torch.randn(8, 16)
+    model = small_model().eval()
+    nodes = torch.randn(6, 16)
+    structure = torch.tensor([[float(i), 0., 0.] for i in range(6)])
     with torch.no_grad():
-        for headform_x in (0., 30., 60.):          # three impacts, one design
-            model._encode_neighborhoods(headform_mesh(headform_x), nodes)
+        for _ in range(3):                          # three impacts, one design
+            model._encode_neighborhoods(structure, nodes)
     assert (model.neighbor_cache.misses, model.neighbor_cache.hits) == (1, 2)
     with torch.no_grad():                           # a second design must miss
-        model._encode_neighborhoods(headform_mesh(0.) * 2.0, nodes)
+        model._encode_neighborhoods(structure * 2.0, nodes)
     assert (model.neighbor_cache.misses, model.neighbor_cache.hits) == (2, 2)
     assert not [key for key in model.state_dict() if "neighbor_cache" in key]
 
@@ -220,7 +151,7 @@ def test_cache_returns_the_true_graph_and_bounds_its_own_size():
         NeighborGraphCache(capacity=0)
 
 
-def test_holdout_leaving_too_little_structure_is_rejected():
-    model = small_model(impactor_nodes=5).eval()
-    with pytest.raises(ValueError, match="structural nodes"):
-        model._encode_neighborhoods(torch.randn(6, 3), torch.randn(6, 16))
+def test_a_single_node_mesh_is_rejected():
+    model = small_model().eval()
+    with pytest.raises(ValueError, match="at least two nodes"):
+        model._encode_neighborhoods(torch.randn(1, 3), torch.randn(1, 16))

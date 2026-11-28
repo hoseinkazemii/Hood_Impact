@@ -20,7 +20,7 @@
 #
 # Layout: 5 lanes x 8 cores per solve (mp_mode=threads), 60 of the 65 FlexNet
 # tokens (a solve on N cores takes floor(5 * N**0.422) tokens: 1 -> 5, 8 -> 12).
-# It is the fastest layout hood_cpus_test.sbatch measured (job 23905334,
+# It is the fastest layout the cpus test measured (job 23905334,
 # 2026-11-13, report in Data/HoodImpact_LocalEdits/cpus_test/): ~1000-1300 s
 # per run and ~15 runs/h, against ~6000 s and ~7 runs/h on 12 single-core
 # lanes. Its noise test passed: on 8 cores the pilot runs keep their HIC to
@@ -230,14 +230,6 @@ if [ -n "${OTHERS// /}" ]; then
     stop_chain
     exit 1
 fi
-# the cpus test (hood_cpus_test.sbatch) needs every token: wait for it (max ~140 min)
-for WAIT_MIN in $(seq 1 140); do
-    TEST=$(squeue -h -u "$USER" -n hood_cpus_test -t RUNNING -o %A 2>/dev/null | tr '\n' ' ')
-    [ -z "${TEST// /}" ] && break
-    [ "$WAIT_MIN" = 1 ] && status "waiting for the cpus test job $TEST to end (it needs the license to itself)"
-    sleep 60
-done
-
 # this job's end (lanes start no run that would not finish by then) and time limit
 DEADLINE="${SLURM_JOB_END_TIME:-}"
 if [ -z "$DEADLINE" ]; then

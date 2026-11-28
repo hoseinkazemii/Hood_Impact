@@ -21,7 +21,7 @@ TORCH_SPEC=${HOOD_MESH_TORCH_SPEC:-torch==2.10.0}
 TORCH_INDEX=${HOOD_MESH_TORCH_INDEX:-https://download.pytorch.org/whl/cu128}
 
 if [[ "$(uname -m)" != "x86_64" ]]; then
-    echo "ERROR: This is the Delta (x86_64) setup; on DeltaAI use setup_mesh_impact_history_env.sh." >&2
+    echo "ERROR: This is the Delta (x86_64) setup; the DeltaAI (aarch64) setup was removed on 2026-11-27 (git commit 65a938f has it)." >&2
     exit 2
 fi
 if ! type module >/dev/null 2>&1; then

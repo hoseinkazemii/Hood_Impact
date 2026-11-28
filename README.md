@@ -1,29 +1,78 @@
-# Hood Impact Code
+# Hood Impact: mesh-change attention model
 
-Code for hood-impact acceleration-history modeling and Abaqus sample generation.
+A surrogate for pedestrian head impact on a car hood. Given the hood geometry
+(the inner panel as an unordered set of mesh nodes) and the impact location, the
+network predicts the headform acceleration history. It is trained to learn how
+**local design edits** change the response: every hood in the dataset is design
+6 with a local edit (notches, deepenings, creases), and the edited nodes are
+given to the network directly.
 
-For the new irregular-mesh attention network mapping hood geometry and impact
-location to acceleration history, see [Mesh impact history](README_mesh_impact_history.md).
+## Layout
 
-The neighborhood experiment now tests **cluster B (designs 4 and 5)**, validates
-on design **11**, and trains on the remaining nine designs. Start a fresh run with
-`bash submit_mesh_impact_history_1704_local_sensitivity.sh`.
+| Path | What |
+|---|---|
+| `mesh_impact_history.py` | Backbone `MeshImpactHistoryNet`: node embedding, kNN neighborhood attention, FiLM impact-conditioned pooling into 256 latent tokens, latent self-attention, and a decoder of Fourier time queries with temporal self-attention. |
+| `mesh_design_change.py` | `DesignChangeHistoryNet` (the model): the backbone plus a cross-attention readout of the edited ("change") nodes after every decoder block, and the change-node table. |
+| `mesh_neighborhood.py` | kNN attention block and the persistent kNN graph cache. |
+| `local_edits_data.py` | The local-edit dataset: manifest, meshes (design-6 inner panel + each edit's dz), sample numbering, change nodes, design-6 reference curves. |
+| `local_edit_metrics.py` | Edit-effect metrics against design 6 (`local_edit_metrics.json`), baselines, plots, time-window RMSE. |
+| `train_mesh_impact_history.py` | Training, evaluation, resume, and `HistoryPredictor` for inference from a saved run. |
+| `preflight_local_edits.py` | Checks a training job (files, change tables, meshes vs. decks, split, CUDA probe) before the long data load. |
+| `utils/utils.py` | Config, preprocessing/scalers, dataset and batching, `Trainer`, `Evaluator`. |
+| `run_mesh_change_local_edits_delta.sbatch` | The training launcher on NCSA Delta (A40). `setup_mesh_impact_history_env_delta.sh` builds its venv. |
+| `evaluate_local_edits_hic.py`, `analyze_local_edits_run.py`, `compare_local_edit_runs.py` | Post-training analysis of a run: HIC15, edit-effect diagnostics and figures, run-vs-run comparison. |
+| `detect_change_nodes.py` (+ `verify_*`, `plot_change_node_detection*`) | Finds the changed nodes of an edited design without node IDs (remeshed designs), and its checks on the hood and B1-B4. |
+| `abaqus_scripts/` | Local-edit dataset generation: DOE (`local_edit_doe.py`), decks (`make_local_edit_decks.py`), batch solve/extract/postprocess on Delta (`delta/hood_local_edits.sbatch`), QA. See `abaqus_scripts/delta/README_local_edits.md`. |
+| `benchmarks/local_edit/` | Benchmark families B1-B4 (plate, elbow, heat sink, cantilever) for testing the method beyond the hood. |
+| `hic15.py` | HIC15 of acceleration histories. |
+| `tests/` | `python -m pytest tests` (the toy local-edit campaign is in `tests/toy_local_edits.py`). |
 
-For attention centered on regions that change across **training designs**, see
-[Change-region attention](README_mesh_change_attention.md). It adds dedicated
-geometry-change tokens and within-cluster response-difference supervision, with
-test loading deferred to a separate frozen-model evaluation command.
+## Data
 
-For the previous best acceleration Temporal DeepONet trained from scratch on
-the same 1704-sample cluster-B split, see
-[Temporal DeepONet baseline](README_temporal_deeponet_1704.md).
-Submit with `bash submit_temporal_deeponet_1704.sh`.
+`Data/HoodImpact_LocalEdits/` (not in git): `manifest_local_edits.csv`,
+`output_history_acc/` (SAE1000 curves), `design_changes/<design>_changed_nodes.csv`,
+`inp_files/` (one design-6 deck is enough for training), `local_edit_designs.csv`,
+`local_edit_doe.csv`. Each of the 72 edits has 20 simulated impacts. The loader
+excludes the two rows labeled `far` for each edit. The 16 near locations and
+two mirror twins give 1,296 runs across the three splits. Design 6 supplies
+reference curves at all 142 locations.
 
-Main areas:
+A run of design Nn at location L has sample number `142 * n + L`; `--test-designs 54`
+means N54. Design 6 is never trained on and never an input: its curves are read only
+after training, as the reference the edit effects are measured from.
 
-- `abaqus_scripts/`: generate Abaqus impact decks, run Abaqus batches, extract and postprocess acceleration histories.
-- `utils/`: visualization, metrics, and analysis helpers.
-- top-level model scripts: DeepONet, temporal, PointNet++, TCN, and related training/inference code.
-- `Data/`: lightweight metadata/scripts only; large generated datasets and solver outputs are ignored.
+## Train
 
-Large artifacts such as Abaqus `.odb` files, generated `.inp` decks, model checkpoints, W&B runs, mesh displacement CSVs, and raw/generated dataset outputs are excluded from Git.
+On Delta, from the repository root:
+
+```bash
+bash -l setup_mesh_impact_history_env_delta.sh       # once
+sbatch run_mesh_change_local_edits_delta.sbatch      # test N54, validation N55
+sbatch --export=ALL,HOOD_LOCAL_EDITS_CHANGE_FEATURES=xyz run_mesh_change_local_edits_delta.sbatch
+sbatch --export=ALL,HOOD_MESH_RESUME_FROM=runs/mesh_impact_history/<run> run_mesh_change_local_edits_delta.sbatch
+```
+
+Locally (the trainer's defaults are the launcher's model):
+
+```bash
+python preflight_local_edits.py --device cuda
+python train_mesh_impact_history.py --device cuda --test-designs 54 --val-designs 55
+```
+
+A run directory holds `config.json`, `splits.json`, `scalers.joblib`,
+`prediction_times.npy`, `design_change_nodes.npz`, the best and last checkpoints,
+train/validation/test histories, `metrics.json`, `local_edit_metrics.json` (+ plots,
+`local_edit_runs.csv`), `time_windows.json`, and the same for the last epoch in
+`last_checkpoint/`.
+
+## Analyze
+
+```bash
+python evaluate_local_edits_hic.py runs/mesh_impact_history/<run>
+python analyze_local_edits_run.py runs/mesh_impact_history/<run>
+python compare_local_edit_runs.py <run_a> <run_b>
+```
+
+Earlier models (Temporal DeepONet, PointNet++, the 1704-run Euro-NCAP set, design
+difference oracles, ...) and their scripts were removed on 2026-11-27; they are in git
+history at commit `65a938f`.

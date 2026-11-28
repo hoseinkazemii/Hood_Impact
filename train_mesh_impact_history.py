@@ -1,7 +1,13 @@
-"""Train a new irregular-mesh attention model and predict acceleration histories.
+"""Train the mesh-change attention model (DesignChangeHistoryNet) on the local-edit dataset.
 
-Only data processing and optimization utilities are shared with previous work.
-The network is defined independently in :mod:`mesh_impact_history`.
+Inputs are the hood geometry (the design-6 inner panel with each design's
+edited nodes) and the impact location; the target is the acceleration history.
+Design 6 is never trained on: its true curves are read only after training, as
+the reference the edit effects are measured from (local_edit_metrics.json).
+
+    python train_mesh_impact_history.py --test-designs 54 --val-designs 55 --device cuda
+
+run_mesh_change_local_edits_delta.sbatch is the launcher on NCSA Delta.
 """
 
 import argparse
@@ -15,28 +21,35 @@ import sys
 import time
 from types import SimpleNamespace
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
+from torch.utils.data import DataLoader
 import wandb
 
-from mesh_impact_history import (
-    DECODER_BLOCKS, GEOMETRY_FILM, IMPACT_CONDITIONING, TIME_ENCODINGS, MeshImpactHistoryNet, saved_model_kwargs,
+from local_edit_metrics import local_edit_log_values, local_edit_report, time_window_metrics, write_local_edit_report
+from local_edits_data import (
+    BASE_DESIGN, base_reference_curves, design_name, load_design_changes, load_manifest, sample_design,
+    sample_location,
 )
-from mesh_impact_history_reporting import export_training_history_plot
+from mesh_design_change import (
+    CHANGE_FEATURES, TABLE_FILE, DesignChangeHistoryNet, DesignChangeTable, change_displacement_rms,
+    register_design_changes, saved_design_change_kwargs,
+)
+from mesh_neighborhood import default_neighbor_cache_directory, prepare_model_neighbor_graphs
 from utils.utils import (
-    INP_MESH_FORMATS,
-    MESH_NODE_SETS,
-    Config,
-    DataPreprocessor,
-    Evaluator,
-    Trainer,
-    create_data_loaders,
-    run_to_design_id,
+    CHECKPOINT_NAME, LAST_CHECKPOINT_NAME, Config, DataPreprocessor, Evaluator, Trainer, create_data_loaders,
     set_seed,
 )
 
-
+ARCHITECTURE = "DesignChangeHistoryNet"
+# config.json format. 2 (since 2026-11-27) lists exactly the current model options;
+# runs of version 1 still resume and reload (mesh_impact_history.saved_model_kwargs).
+CONFIG_FORMAT_VERSION = 2
+# The configuration of run_mesh_change_local_edits_delta.sbatch.
 MODEL_DEFAULTS = {
     "width": 128,
     "num_heads": 4,
@@ -47,174 +60,55 @@ MODEL_DEFAULTS = {
     "latent_layers": 3,
     "temporal_layers": 2,
     "dropout": 0.1,
-    # Restore temporal attention after the cluster-D ablation comparison.
-    # mesh_only remains available to reload and reproduce ablation runs.
-    "decoder": "temporal",
-    "impact_conditioning": "film",
-    "time_encoding": "fourier",
     "fourier_num_frequencies": 6,
     "fourier_min_frequency_hz": 20.0,
     "fourier_max_frequency_hz": 640.0,
-    "neighborhood_layers": 0,
+    "neighborhood_layers": 2,
     "neighborhood_k": 256,
     # 0 = kNN offsets in units of the mesh's median distance to the k-th
     # neighbour (since 2026-11-22; earlier runs used a fixed 20 mm).
     "neighborhood_scale_mm": 0.0,
     "neighborhood_chunk_size": 1024,
-    # Leading rigid-headform nodes held out of local attention and, unless
-    # pool_impactor_nodes is set, of pooling. The 1704 .inp files put the 286
-    # impactor nodes first; 0 disables the holdout.
-    "impactor_nodes": 0,
-    # Location shortcuts that bypass the hood geometry; see MeshImpactHistoryNet.
-    "pooling_query_residual": False,
-    "pool_impactor_nodes": False,
-    # Geometry memory injection (FiLM); "none" adds no parameters.
-    "geometry_film": "none",
-    "geometry_fourier_octaves": 5,
-    # Predict the history in this many time chunks, each reading the earlier
-    # ones: true accelerations in training, its own predictions in validation
-    # and test. 0 is the plain network.
-    "teacher_forcing_chunks": 0,
-    # Output = reference design's simulated curve at the same impact + s * network
-    # output, with the reference curve also an input (reference_response.py).
-    # Local-edit data only, where design 6 is the reference.
-    "reference_response": False,
+    # Change tokens: reference position + displacement ("edit", since
+    # 2026-11-24) or the position after the edit ("xyz").
+    "design_change_features": "edit",
 }
-BOOLEAN_MODEL_KEYS = tuple(key for key, value in MODEL_DEFAULTS.items() if isinstance(value, bool))
-# Decoder path over the near-clone change nodes (mesh_design_change.py), used
-# with --design-change-nodes true; these keys reach only that model. The small
-# path won the 2026-10-25 sweep (run 3447060; README_design_change_nodes.md).
-# Its tokens are each change node's XYZ (octaves apply to impact_relative only),
-# read by plain attention; runs before 2026-10-30 scaled values by displacement.
-# "edit" tokens (reference position + displacement) are chosen per launcher.
-DESIGN_CHANGE_DEFAULTS = {"design_change_layers": 0, "design_change_fourier_octaves": 2,
-                          "design_change_features": "xyz", "design_change_displacement_gate": False}
-# Fresh runs see only the hood inner panel; runs saved without the key used "all".
-DEFAULT_MESH_NODES = "inner_panel"
-ARCHITECTURES = ("MeshImpactHistoryNet", "DesignChangeHistoryNet")
-# time_windows.json splits test errors into the teacher-forcing chunks, or this
-# many windows for other models.
+# Test N54 and validation N55: the strongest, most repeatable edit effects.
+DEFAULT_TEST_DESIGNS = (54,)
+DEFAULT_VAL_DESIGNS = (55,)
+# time_windows.json splits test errors into this many windows of the time grid.
 TIME_WINDOWS = 5
-# Fresh experiments hold out the whole B cluster. Resumes restore saved splits.
-DEFAULT_TEST_DESIGNS = (4, 5)
-DEFAULT_VAL_DESIGNS = (11,)
 # Job 3317059 died when api.wandb.ai answered slower than W&B's 90 s default.
 # Online starts get a longer timeout and retries, then fail before data loading.
 WANDB_INIT_ATTEMPTS = 3
 WANDB_INIT_TIMEOUT_SECONDS = 300
 WANDB_RETRY_DELAY_SECONDS = 60
-CHECKPOINT_NAME = "hood_impact_best_model.pt"  # Filename used by shared Trainer.
-LAST_CHECKPOINT_NAME = "hood_impact_last_model.pt"
-
-
-def parse_boolean(text):
-    """argparse type for explicit true/false values; bool("false") is True."""
-    value = str(text).strip().lower()
-    if value in ("true", "1", "yes"):
-        return True
-    if value in ("false", "0", "no"):
-        return False
-    raise argparse.ArgumentTypeError(f"expected true or false, got {text!r}")
-
-
-def add_model_arguments(parser, keys):
-    """Add one option per model key, with real true/false parsing for flags."""
-    for key in keys:
-        default = MODEL_DEFAULTS[key]
-        option = f"--{key.replace('_', '-')}"
-        if key in BOOLEAN_MODEL_KEYS:
-            parser.add_argument(option, type=parse_boolean, default=default, metavar="{true,false}")
-        else:
-            parser.add_argument(option, type=type(default), default=default)
-
-
-def add_design_change_arguments(parser):
-    """One option per DESIGN_CHANGE_DEFAULTS key, with real true/false parsing for flags."""
-    for key, default in DESIGN_CHANGE_DEFAULTS.items():
-        option = f"--{key.replace('_', '-')}"
-        if isinstance(default, bool):
-            parser.add_argument(option, type=parse_boolean, default=default, metavar="{true,false}")
-        else:
-            parser.add_argument(option, type=type(default), default=default)
-
-
-def apply_mesh_nodes(args):
-    """Default the node set by mesh format; inner-panel meshes have no headform rows to hold out."""
-    if args.mesh_nodes is None:
-        args.mesh_nodes = "all" if getattr(args, "data_format", None) == "legacy" else DEFAULT_MESH_NODES
-    if args.mesh_nodes == "inner_panel":
-        args.impactor_nodes = 0
-
-
-def validate_location_shortcuts(impactor_nodes, pool_impactor_nodes, mesh_nodes="all"):
-    """Refuse a fresh run that cannot keep the headform out of pooling."""
-    if mesh_nodes == "inner_panel":
-        return
-    if not pool_impactor_nodes and not impactor_nodes:
-        raise ValueError(
-            "--impactor-nodes 0 leaves the moving headform rows in pooling, where they act as a "
-            "location shortcut. Set --impactor-nodes 286 for the 1704 decks, or pass "
-            "--pool-impactor-nodes true to keep the headform in pooling deliberately."
-        )
 
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-format", choices=["legacy", "industrylike", "euroncap1704", "localedits"],
-                        help="localedits: the 72 local edits of design 6 (local_edits_data.py); "
-                             "--impact-coords-path is then the run manifest and design N54 is --test-designs 54.")
-    for name in ("inp-dir", "impact-coords-path", "mesh-geometry-dir", "doe-path", "acceleration-dir"):
-        parser.add_argument(f"--{name}")
-    parser.add_argument("--num-samples", type=int)
-    parser.add_argument("--samples-per-design", type=int)
-    parser.add_argument(
-        "--mesh-nodes", choices=MESH_NODE_SETS,
-        help="inner_panel (default for .inp decks) loads only the hood inner panel's nodes: no headform, "
-             "outer skin, hinges or fasteners, so --impactor-nodes becomes 0. all (default for CSV "
-             "meshes) loads every node.",
-    )
-    # Cluster B never participates in optimization or checkpoint selection.
-    parser.add_argument("--test-designs", type=int, nargs="+", default=list(DEFAULT_TEST_DESIGNS), help="Zero-based design IDs.")
-    parser.add_argument("--val-designs", type=int, nargs="+", default=list(DEFAULT_VAL_DESIGNS), help="Zero-based design IDs.")
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--inp-dir", help="Folder with a design-6 deck (default Data/HoodImpact_LocalEdits/inp_files).")
+    parser.add_argument("--impact-coords-path", help="The run manifest (default .../manifest_local_edits.csv).")
+    parser.add_argument("--acceleration-dir", help="The curves (default .../output_history_acc).")
+    parser.add_argument("--test-designs", type=int, nargs="+", default=list(DEFAULT_TEST_DESIGNS),
+                        help="Edited design numbers: 54 is N54.")
+    parser.add_argument("--val-designs", type=int, nargs="+", default=list(DEFAULT_VAL_DESIGNS),
+                        help="Edited design numbers: 55 is N55.")
     parser.add_argument("--epochs", type=int, help="Total epoch target, including completed epochs.")
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--lr", type=float)
     parser.add_argument("--weight-decay", type=float)
     parser.add_argument("--seed", type=int)
-    parser.add_argument("--hic-range-threshold-percent", type=float,
-                        help="Keep locations with 100*(max-min)/mean HIC15 >= this value across all 12 designs.")
-    parser.add_argument("--location-holdout", metavar="SPLIT_JSON",
-                        help="Location split file (see location_holdout.py): checkerboard gives test designs "
-                             "only unseen locations; per_design_random keeps a random subset per design.")
     parser.add_argument("--max-train-time", type=float, help="Optional cutoff before the configured time stride is applied.")
     parser.add_argument("--time-subsample-stride", type=int,
-                        help="Keep every Nth source time/target sample (16 by default; 4 gives 250 of 1000 points).")
+                        help="Keep every Nth source time/target sample (16 by default: 63 of 1000 points).")
     parser.add_argument("--device", help="PyTorch device, e.g. cpu, cuda, or cuda:0.")
-    add_model_arguments(parser, [key for key in MODEL_DEFAULTS
-                                 if key not in ("decoder", "impact_conditioning", "time_encoding", "geometry_film")])
-    parser.add_argument(
-        "--decoder", choices=sorted(DECODER_BLOCKS), default=MODEL_DEFAULTS["decoder"],
-        help="mesh_only removes temporal self-attention; temporal restores the original baseline.",
-    )
-    parser.add_argument(
-        "--impact-conditioning", choices=IMPACT_CONDITIONING, default=MODEL_DEFAULTS["impact_conditioning"],
-        help="film uses XYZ-only nodes and FiLM pooling; legacy_additive reproduces older runs.",
-    )
-    parser.add_argument(
-        "--time-encoding", choices=TIME_ENCODINGS, default=MODEL_DEFAULTS["time_encoding"],
-        help="fourier uses sine/cosine pairs in physical seconds; legacy_five replays historical checkpoints.",
-    )
-    parser.add_argument(
-        "--geometry-film", choices=GEOMETRY_FILM, default=MODEL_DEFAULTS["geometry_film"],
-        help="Geometry memory FiLM: latent re-injects after each latent mixing block; "
-             "all also after each neighborhood block; none is the uninjected network.",
-    )
-    parser.add_argument(
-        "--design-change-nodes", type=parse_boolean, default=False, metavar="{true,false}",
-        help="Give each node that differs between near-clone designs its own token, read by the "
-             "decoder after every block (DesignChangeHistoryNet); false is the plain network.",
-    )
-    add_design_change_arguments(parser)
+    for key, default in MODEL_DEFAULTS.items():
+        option = f"--{key.replace('_', '-')}"
+        if key == "design_change_features":
+            parser.add_argument(option, choices=CHANGE_FEATURES, default=default)
+        else:
+            parser.add_argument(option, type=type(default), default=default)
     parser.add_argument("--output-dir", help="New run directory; defaults to runs/mesh_impact_history/<timestamp>.")
     parser.add_argument("--neighbor-cache-dir", help="Shared persistent kNN directory; defaults to neighbor_graphs beside inp_files.")
     parser.add_argument("--resume-from", help="Prior run directory (latest, else best checkpoint) or checkpoint file; writes a new run.")
@@ -228,11 +122,11 @@ def parse_args(argv=None):
                         help="W&B team/account; defaults to WANDB_ENTITY or your W&B default team.")
     parser.add_argument("--run-name")
     args = parser.parse_args(argv)
+    # argparse does not check a default (here from WANDB_MODE) against choices.
     if args.wandb_mode not in ("disabled", "offline", "online"):
         parser.error("WANDB_MODE must be disabled, offline, or online; override it with --wandb-mode")
     if args.resume_from:
         restore_resume_arguments(args, parser, sys.argv[1:] if argv is None else argv)
-    apply_mesh_nodes(args)
     return args
 
 
@@ -251,31 +145,27 @@ def restore_resume_arguments(args, parser, argv):
                 source = best
     source_dir = source.parent
     for path in (source, *(source_dir / name for name in
-                          ("config.json", "splits.json", "scalers.joblib", "prediction_times.npy"))):
+                          ("config.json", "splits.json", "scalers.joblib", "prediction_times.npy", TABLE_FILE))):
         if not path.is_file():
             parser.error(f"Missing resume artifact: {path}")
     saved = json.loads((source_dir / "config.json").read_text(encoding="utf-8"))
-    architecture = saved.get("architecture", {}).get("name")
-    if saved.get("format_version") != 1 or architecture not in ARCHITECTURES:
-        parser.error(f"Resume requires a supported run of {' or '.join(ARCHITECTURES)}")
+    if (saved.get("format_version") not in (1, 2) or saved.get("architecture", {}).get("name") != ARCHITECTURE
+            or saved["data"].get("data_format") != "localedits"):
+        parser.error(f"Resume requires a local-edit {ARCHITECTURE} run")
     if saved["training"].get("loss", "normalized_acceleration_mse") != "normalized_acceleration_mse":
         parser.error("This checkpoint used a different training objective; start a fresh acceleration-MSE run")
     splits = json.loads((source_dir / "splits.json").read_text(encoding="utf-8"))
-    model_kwargs = saved_model_kwargs(saved["architecture"]["kwargs"])
-    if architecture == "DesignChangeHistoryNet":
-        from mesh_design_change import saved_design_change_kwargs
-        model_kwargs = saved_design_change_kwargs(model_kwargs)
-    settings = {**MODEL_DEFAULTS, **DESIGN_CHANGE_DEFAULTS, **model_kwargs,
-                "design_change_nodes": architecture == "DesignChangeHistoryNet",
-                **{key: saved["data"][key] for key in ("data_format", "num_samples", "samples_per_design")},
-                "mesh_nodes": saved["data"].get("mesh_nodes", "all"),
+    try:
+        model_kwargs = saved_design_change_kwargs(saved["architecture"]["kwargs"],
+                                                  format_version=saved["format_version"])
+    except ValueError as error:
+        parser.error(str(error))
+    settings = {**MODEL_DEFAULTS, **model_kwargs,
                 **{key: saved["training"][key] for key in ("batch_size", "weight_decay", "seed")},
                 "epochs": saved["training"]["num_epochs"],
                 "lr": saved["training"]["learning_rate"],
                 "max_train_time": saved["preprocessing"]["max_train_time"],
                 "time_subsample_stride": saved["preprocessing"]["time_subsample_stride"],
-                "hic_range_threshold_percent": (saved.get("location_filter") or {}).get("threshold_percent"),
-                "location_holdout": (saved.get("location_holdout") or {}).get("file"),
                 "test_designs": splits["test"]["design_ids"],
                 "val_designs": splits["validation"]["design_ids"]}
     explicit = {token.split("=", 1)[0] for token in argv if token.startswith("--")}
@@ -284,25 +174,19 @@ def restore_resume_arguments(args, parser, argv):
         if option in explicit and getattr(args, key) != value:
             parser.error(f"Resume must retain saved {option}={value!r}; omit the conflicting override")
         setattr(args, key, value)
-    for key in ("inp_dir", "impact_coords_path", "mesh_geometry_dir", "doe_path", "acceleration_dir"):
-        if getattr(args, key) is None and key in saved["data"]:
+    for key in ("inp_dir", "impact_coords_path", "acceleration_dir"):
+        if getattr(args, key) is None:
             setattr(args, key, saved["data"][key])
     args.resume_from = str(source)
     args.resume_config, args.resume_splits = saved, splits
 
 
 def build_config(args):
-    """Inherit current preprocessing/training defaults, without model presets."""
-    overrides = {"prediction_target": "acceleration", "save_last_checkpoint": True}
-    if args.resume_from:
-        overrides["time_subsample_stride"] = args.resume_config["preprocessing"]["time_subsample_stride"]
-        overrides["max_train_time"] = args.resume_config["preprocessing"]["max_train_time"]
+    """Config from the command line, over utils.utils.Config defaults."""
+    overrides = {}
     mapping = {"epochs": "num_epochs", "lr": "learning_rate"}
-    for key in (
-        "data_format", "inp_dir", "impact_coords_path", "mesh_geometry_dir", "doe_path",
-        "acceleration_dir", "num_samples", "samples_per_design", "epochs", "batch_size",
-        "lr", "weight_decay", "seed", "max_train_time", "time_subsample_stride", "mesh_nodes",
-    ):
+    for key in ("inp_dir", "impact_coords_path", "acceleration_dir", "epochs", "batch_size", "lr",
+                "weight_decay", "seed", "max_train_time", "time_subsample_stride"):
         value = getattr(args, key)
         if value is not None:
             overrides[mapping.get(key, key)] = value
@@ -311,10 +195,7 @@ def build_config(args):
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     overrides["output_dir"] = str(Path(args.output_dir or Path("runs") / "mesh_impact_history" / stamp).resolve())
     config = Config(**overrides)
-    if config.mesh_nodes != "all" and config.data_format not in INP_MESH_FORMATS:
-        raise ValueError("--mesh-nodes inner_panel reads the panels from .inp decks; use --mesh-nodes all "
-                         "for CSV meshes")
-    for key in ("num_samples", "samples_per_design", "num_epochs", "batch_size", "time_subsample_stride"):
+    for key in ("num_epochs", "batch_size", "time_subsample_stride"):
         value = getattr(config, key)
         if not isinstance(value, int) or isinstance(value, bool) or value < 1:
             raise ValueError(f"{key} must be a positive integer; got {value!r}")
@@ -326,26 +207,6 @@ def build_config(args):
         raise ValueError("max_train_time must be finite and positive")
     if config.device.type == "cuda" and not torch.cuda.is_available():
         raise ValueError("CUDA was requested but is unavailable; use --device cpu")
-    if args.hic_range_threshold_percent is not None:
-        if not np.isfinite(args.hic_range_threshold_percent) or args.hic_range_threshold_percent < 0:
-            raise ValueError("HIC range threshold must be finite and nonnegative")
-        if config.data_format != "euroncap1704" or config.samples_per_design != 142 or config.num_samples != 1704:
-            raise ValueError("HIC location filtering requires the complete 12 x 142 euroncap1704 dataset")
-    if args.location_holdout is not None and (config.data_format != "euroncap1704" or config.samples_per_design != 142):
-        raise ValueError("The location holdout is defined on the 142-location euroncap1704 grid")
-    if args.design_change_nodes and (config.data_format not in ("euroncap1704", "localedits")
-                                     or config.samples_per_design != 142):
-        raise ValueError("Design-change nodes need the 142-location euroncap1704 decks or the localedits tables")
-    if config.data_format == "localedits":
-        if config.samples_per_design != 142:
-            raise ValueError("localedits numbers samples as 142 * design + location; keep --samples-per-design 142")
-        if config.mesh_nodes != "inner_panel":
-            raise ValueError("localedits builds only inner-panel meshes; use --mesh-nodes inner_panel")
-        if args.design_change_nodes and args.design_change_features not in ("xyz", "edit"):
-            raise ValueError("localedits change tables carry no panel gaps; use --design-change-features xyz or edit")
-    if args.reference_response and config.data_format != "localedits":
-        raise ValueError("--reference-response reads design 6's curves as the reference; it needs "
-                         "--data-format localedits")
     return config
 
 
@@ -353,7 +214,7 @@ def validate_data(data):
     """Catch malformed records before fitting scalers or launching training."""
     run_numbers = data["run_numbers"]
     if not run_numbers:
-        raise ValueError("No valid acceleration runs loaded. Check dataset paths and preprocessing warnings.")
+        raise ValueError("No valid acceleration runs loaded. Check dataset paths.")
     if len(set(run_numbers)) != len(run_numbers):
         raise ValueError("Run numbers must be unique")
     for key in ("mesh_geometries", "indentor_positions", "time_arrays", "accelerations"):
@@ -376,14 +237,14 @@ def validate_data(data):
             raise ValueError(f"Run {run}: sampled times must be strictly increasing")
 
 
-def resolve_splits(data, config, test_designs, val_designs):
-    """Validate design separation using runs that actually loaded successfully."""
+def resolve_splits(data, test_designs, val_designs):
+    """Design-wise train/validation/test split of the runs that actually loaded."""
     test_ids, val_ids = set(test_designs), set(val_designs)
     if not test_ids or not val_ids:
         raise ValueError("Validation and test design lists must both be nonempty")
     if test_ids & val_ids:
         raise ValueError(f"Validation and test design IDs overlap: {sorted(test_ids & val_ids)}")
-    design_ids = {run_to_design_id(run, config.samples_per_design) for run in data["run_numbers"]}
+    design_ids = {sample_design(run) for run in data["run_numbers"]}
     missing = (test_ids | val_ids) - design_ids
     if missing:
         raise ValueError(f"Requested held-out designs have no loaded runs: {sorted(missing)}; loaded designs: {sorted(design_ids)}")
@@ -393,7 +254,7 @@ def resolve_splits(data, config, test_designs, val_designs):
         "test": {"design_ids": sorted(test_ids), "run_numbers": []},
     }
     for run in data["run_numbers"]:
-        design = run_to_design_id(run, config.samples_per_design)
+        design = sample_design(run)
         name = "test" if design in test_ids else "validation" if design in val_ids else "train"
         split[name]["run_numbers"].append(int(run))
     for name, group in split.items():
@@ -403,39 +264,22 @@ def resolve_splits(data, config, test_designs, val_designs):
 
 
 def resolved_config(config, args, model_kwargs, prediction_grid):
-    data_keys = ["data_format", "num_samples", "samples_per_design"]
-    path_keys = (
-        ["mesh_geometry_dir", "doe_path", "acceleration_dir"] if config.data_format == "legacy"
-        else ["inp_dir", "impact_coords_path", "acceleration_dir"]
-    )
-    data_config = {key: getattr(config, key) for key in data_keys}
-    data_config.update({key: str(Path(getattr(config, key)).resolve()) for key in path_keys})
-    data_config["mesh_nodes"] = config.mesh_nodes
-    if config.data_format == "localedits":
-        data_config["local_edits"] = {
-            "sample_number": "142 * n + location for design Nn (design ID n)",
-            "base_design": "D6, excluded from training, validation, test and scalers; its true curves are "
-                           + ("the model's reference input and output base (reference_response) and "
-                              if getattr(args, "reference_response", False) else "only ")
-                           + "the reference for local_edit_metrics.json",
-            "mesh": "inner panel of one design-6 deck plus dz from design_changes/<design>_changed_nodes.csv",
-            "samples_file": "local_edit_samples.csv",
-        }
-    architecture = "DesignChangeHistoryNet" if getattr(args, "design_change_nodes", False) else "MeshImpactHistoryNet"
-    teacher_forcing = None
-    if model_kwargs.get("teacher_forcing_chunks"):
-        teacher_forcing = {
-            "chunks": model_kwargs["teacher_forcing_chunks"],
-            "training_input": "true accelerations of the earlier chunks",
-            "validation_and_test_input": "the model's own predictions of the earlier chunks (rollout)",
-            "checkpoint_selection": "rollout validation loss",
-        }
+    data_config = {"data_format": "localedits",
+                   **{key: str(Path(getattr(config, key)).resolve())
+                      for key in ("inp_dir", "impact_coords_path", "acceleration_dir")}}
+    data_config["local_edits"] = {
+        "excluded_impact_roles": ["far"],
+        "sample_number": "142 * n + location for design Nn (design ID n)",
+        "base_design": "D6, excluded from training, validation, test and scalers; its geometry is the "
+                       "mesh every design is built on, and its true curves are read only after training, "
+                       "as the reference for local_edit_metrics.json (never a network input)",
+        "mesh": "inner panel of one design-6 deck plus dz from design_changes/<design>_changed_nodes.csv",
+        "samples_file": "local_edit_samples.csv",
+    }
     return {
-        "format_version": 1,
-        "architecture": {"name": architecture, "kwargs": model_kwargs},
+        "format_version": CONFIG_FORMAT_VERSION,
+        "architecture": {"name": ARCHITECTURE, "kwargs": model_kwargs},
         "data": data_config,
-        "location_filter": getattr(args, "location_filter_report", None),
-        "location_holdout": getattr(args, "location_holdout_report", None),
         "preprocessing": {
             "prediction_target": "acceleration",
             "time_subsample_stride": config.time_subsample_stride,
@@ -455,7 +299,6 @@ def resolved_config(config, args, model_kwargs, prediction_grid):
             "batch_sampling": "shuffle",
             "scheduler": "CosineAnnealingLR",
             "gradient_clip_norm": 1.0,
-            "teacher_forcing": teacher_forcing,
         },
         "prediction_grid": prediction_grid,
         "wandb": {
@@ -504,8 +347,7 @@ def initialize_wandb(args, initial_config, output_dir, logger):
                                attempt, attempts, exc, WANDB_RETRY_DELAY_SECONDS)
                 time.sleep(WANDB_RETRY_DELAY_SECONDS)
         run.define_metric("epoch")
-        for metric in ("train/loss", "val/loss", "val/mae_g", "lr",
-                       "val/teacher_forced_loss", "val/teacher_forced_mae_g"):
+        for metric in ("train/loss", "val/loss", "val/mae_g", "lr"):
             run.define_metric(metric, step_metric="epoch")
         actual_mode = run.settings.mode
         metadata = {
@@ -551,59 +393,71 @@ def export_predictions(path, dataset, predictions, targets):
     }).to_csv(path, index=False)
 
 
+def export_training_history_plot(history, output_dir):
+    """Save training_history.png: train/validation normalized MSE, marking the best epoch."""
+    train = np.asarray(history["train_losses"], dtype=np.float64)
+    validation = np.asarray(history["val_losses"], dtype=np.float64)
+    if train.ndim != 1 or not train.size or train.shape != validation.shape:
+        raise ValueError("Train and validation losses must be nonempty vectors of equal length")
+    if not np.isfinite(train).all() or not np.isfinite(validation).all():
+        raise ValueError("Train and validation losses must be finite")
+    epochs = np.arange(1, len(train) + 1)
+    best = int(np.argmin(validation))
+    path = Path(output_dir) / "training_history.png"
+    fig, ax = plt.subplots(figsize=(9, 5.3))
+    try:
+        ax.plot(epochs, train, color="#1965b0", linewidth=1.8, label="Training")
+        ax.plot(epochs, validation, color="#dc7014", linewidth=1.8, label="Validation")
+        ax.axvline(best + 1, color="#686868", linestyle="--", linewidth=1,
+                   label=f"Best validation: epoch {best + 1} ({validation[best]:.5f})")
+        ax.scatter([best + 1], [validation[best]], color="#dc7014", s=28, zorder=3)
+        ax.set(xlabel="Epoch", ylabel="Normalized acceleration MSE", title=f"{ARCHITECTURE} — training history")
+        ax.set_xlim(1 if len(train) > 1 else 0.5, len(train) if len(train) > 1 else 1.5)
+        ax.grid(alpha=0.2)
+        ax.legend(frameon=False)
+        fig.tight_layout()
+        fig.savefig(path, dpi=200, bbox_inches="tight")
+    finally:
+        plt.close(fig)
+    return path
+
+
 class HistoryPredictor:
     """Inference from raw geometry and impact coordinates, with saved output times.
 
     ``predict(mesh_xyz, impact_xy)`` returns acceleration in g at
     ``predictor.time_points``. Optional time points must already be subsampled.
+    A hood that was not part of the training run must first be registered with
+    its change nodes: ``predictor.model.design_changes`` (DesignChangeTable).
     """
 
-    def __init__(self, model, preprocessor, time_points, device="cpu", mesh_nodes="all"):
+    def __init__(self, model, preprocessor, time_points, device="cpu"):
         self.device = torch.device(device)
         self.model = model.to(self.device).eval()
         self.preprocessor = preprocessor
         self.time_points = np.asarray(time_points, dtype=np.float32).copy()
-        # The node set predict() expects meshes in (utils.utils.MESH_NODE_SETS).
-        self.mesh_nodes = mesh_nodes
 
     @classmethod
     def from_run(cls, output_dir, device="cpu", neighbor_cache_dir=None):
         run_dir = Path(output_dir)
         saved = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
-        architecture_name = saved.get("architecture", {}).get("name")
-        if saved.get("format_version") != 1 or architecture_name not in (*ARCHITECTURES, "MeshChangeAttentionNet"):
-            raise ValueError("This directory is not a supported mesh history run")
-        # Callers pass meshes loaded with the run's mesh_nodes (DataPreprocessor does this).
-        mesh_nodes = saved["data"].get("mesh_nodes", "all")
-        config = SimpleNamespace(**saved["preprocessing"], mesh_nodes=mesh_nodes, device=torch.device(device))
-        preprocessor = DataPreprocessor(config)
+        if saved.get("format_version") not in (1, 2) or saved.get("architecture", {}).get("name") != ARCHITECTURE:
+            raise ValueError(f"This directory is not a saved {ARCHITECTURE} run")
+        preprocessor = DataPreprocessor(SimpleNamespace(**saved["preprocessing"]))
         preprocessor.load_scalers(str(run_dir / "scalers.joblib"))
-        model_class = MeshImpactHistoryNet
-        if architecture_name == "MeshChangeAttentionNet":
-            from mesh_change_attention import MeshChangeAttentionNet
-            model_class = MeshChangeAttentionNet
-        model_kwargs = saved_model_kwargs(saved["architecture"]["kwargs"])
-        if architecture_name == "DesignChangeHistoryNet":
-            from mesh_design_change import DesignChangeHistoryNet, saved_design_change_kwargs
-            model_class, model_kwargs = DesignChangeHistoryNet, saved_design_change_kwargs(model_kwargs)
-        model = model_class(**model_kwargs)
+        model = DesignChangeHistoryNet(**saved_design_change_kwargs(saved["architecture"]["kwargs"],
+                                                                    format_version=saved["format_version"]))
         checkpoint = torch.load(run_dir / CHECKPOINT_NAME, map_location="cpu", weights_only=True)
         model.load_state_dict(checkpoint["model_state_dict"], strict=True)
-        if architecture_name == "DesignChangeHistoryNet":
-            # Only hoods saved with the run are known; DesignChangeTable.register adds others.
-            from mesh_design_change import TABLE_FILE, DesignChangeTable
-            model.design_changes = DesignChangeTable.load(run_dir / TABLE_FILE)
-        if getattr(model, "reference_response", False):
-            # Predictions exist only at the load cases of the saved reference runs.
-            from reference_response import TABLE_FILE as REFERENCE_FILE, ReferenceResponseTable
-            model.reference_table = ReferenceResponseTable.load(run_dir / REFERENCE_FILE)
+        # Only hoods saved with the run are known; DesignChangeTable.register adds others.
+        model.design_changes = DesignChangeTable.load(run_dir / TABLE_FILE)
         if model.neighborhood_blocks:
-            from mesh_neighborhood import default_neighbor_cache_directory
             stored = (saved.get("neighbor_graph_cache") or {}).get("directory")
             directory = neighbor_cache_dir or (stored if stored and Path(stored).is_dir() else None)
-            model.neighbor_cache.directory = Path(directory).expanduser() if directory else default_neighbor_cache_directory(saved["data"]["data_format"])
+            model.neighbor_cache.directory = (Path(directory).expanduser() if directory
+                                              else default_neighbor_cache_directory())
         times = np.load(run_dir / "prediction_times.npy", allow_pickle=False)
-        return cls(model, preprocessor, times, device=device, mesh_nodes=mesh_nodes)
+        return cls(model, preprocessor, times, device=device)
 
     @torch.no_grad()
     def predict(self, mesh_xyz, impact_xy, sampled_time_points=None):
@@ -625,9 +479,8 @@ class HistoryPredictor:
         # Time slicing occurs only while loading training data, never here.
         normalized_mesh = tensor(self.preprocessor.transform_mesh(mesh))
         if self.model.neighborhood_blocks:
-            start = self.model.impactor_nodes
             self.model.neighbor_cache.register_geometry(
-                mesh[start:], normalized_mesh[start:] * self.model.mesh_scale, self.model.neighborhood_k,
+                mesh, normalized_mesh * self.model.mesh_scale, self.model.neighborhood_k,
             )
         normalized_impact = tensor(self.preprocessor.transform_indentor(impact)).unsqueeze(0)
         normalized_times = tensor(self.preprocessor.transform_time(times))
@@ -642,49 +495,8 @@ class HistoryPredictor:
         return self.preprocessor.inverse_transform_acceleration(prediction.cpu().numpy())
 
 
-def attach_reference_responses(model, preprocessor, train_dataset, output_dir, source_dir, logger):
-    """Give the model design 6's curves and the output scale s; save the table beside the run.
-
-    Both come from fitted training scalers and training runs only: s is the RMS of
-    (a - a_D6) over the training runs, i.e. the training RMSE of copying design 6.
-    """
-    from local_edits_data import base_reference_runs
-    from reference_response import TABLE_FILE as REFERENCE_FILE, ReferenceResponseTable, residual_rms
-
-    locations, loads, times, curves = base_reference_runs(preprocessor)
-    table = ReferenceResponseTable(
-        loads, preprocessor.transform_time(np.asarray(times, dtype=np.float32)),
-        np.stack([preprocessor.transform_acceleration(np.asarray(curve, dtype=np.float32)) for curve in curves]),
-        labels=locations,
-    )
-    if source_dir is not None and not table.same_as(ReferenceResponseTable.load(source_dir / REFERENCE_FILE)):
-        raise ValueError("The reference responses differ from the resume run's; the data or scalers changed")
-    scale = residual_rms(
-        table, train_dataset.indentor_positions,
-        [preprocessor.transform_time(np.asarray(t, dtype=np.float32)) for t in train_dataset.time_arrays],
-        [preprocessor.transform_acceleration(np.asarray(a, dtype=np.float32)) for a in train_dataset.accelerations],
-    )
-    model.reference_table = table
-    model.set_reference_delta_scale(scale)
-    table.save(output_dir / REFERENCE_FILE)
-    scale_g = scale * float(preprocessor.accel_scaler.scale_[0])
-    logger.info("Reference response: design 6 at %s locations | output = a_D6 + s * network, s = %.4f "
-                "(normalized) = %.2f g, the training RMSE of copying design 6", len(locations), scale, scale_g)
-    return {
-        "file": REFERENCE_FILE,
-        "reference": "design 6 (D6): its own simulated curve at the same impact location",
-        "output": "a_D6(t) + s * network(t) in normalized units; every time query also reads a_D6(t)",
-        "load_cases": int(len(locations)),
-        "delta_scale_normalized": scale,
-        "delta_scale_g": scale_g,
-        "delta_scale_definition": "RMS of (a - a_D6) over the training runs = training RMSE of copying design 6",
-        "initialization": "the output head's last layer is zero, so the untrained model returns a_D6",
-    }
-
-
 def main(argv=None):
     args = parse_args(argv)
-    validate_location_shortcuts(args.impactor_nodes, args.pool_impactor_nodes, args.mesh_nodes)
     config = build_config(args)
     output_dir = Path(config.output_dir)
     # A new run cannot accidentally evaluate a leftover checkpoint from old work.
@@ -720,102 +532,46 @@ def main(argv=None):
     run = None
     try:
         model_kwargs = {key: getattr(args, key) for key in MODEL_DEFAULTS}
-        if args.design_change_nodes:
-            from mesh_design_change import DesignChangeHistoryNet
-            model_kwargs.update({key: getattr(args, key) for key in DESIGN_CHANGE_DEFAULTS})
-            model = DesignChangeHistoryNet(**model_kwargs)
-        else:
-            model = MeshImpactHistoryNet(**model_kwargs)
-        logger.info("%s: %s", type(model).__name__, model_kwargs)
+        model = DesignChangeHistoryNet(**model_kwargs)
+        logger.info("%s: %s", ARCHITECTURE, model_kwargs)
         if source_dir is not None:
             logger.info("Resume: %s | completed epochs: %s | next epoch: %s/%s",
                         args.resume_from, completed, completed + 1, config.num_epochs)
         logger.info("Output: %s | device: %s | configured time stride: %s", output_dir, config.device, config.time_subsample_stride)
-        if args.location_holdout is not None:
-            # Read before the long data load; a resume reuses its saved lists.
-            from location_holdout import load_split
-            args.location_holdout_report = (args.resume_config["location_holdout"] if source_dir is not None
-                                            else load_split(args.location_holdout))
-            write_json(output_dir / "location_holdout.json", args.location_holdout_report)
         run = initialize_wandb(
             args, resolved_config(config, args, model_kwargs, prediction_grid=None), output_dir, logger,
         )
-        local_edits = config.data_format == "localedits"
-        if args.design_change_nodes and local_edits:
-            # Every edited design's moved nodes, listed exactly by the generator.
-            from local_edits_data import BASE_DESIGN, load_design_changes, load_manifest
-            manifest = load_manifest(config.impact_coords_path)
-            design_changes, design_change_report = load_design_changes(
-                config.impact_coords_path, config.inp_dir,
-                sorted(manifest.loc[manifest["design"] != BASE_DESIGN, "design_id"].unique()),
-                mesh_nodes=config.mesh_nodes,
-            )
-            counts = [len(change["rows"]) for change in design_changes.values()]
-            logger.info("Design-change nodes: %s edited designs | %s-%s moved nodes each | base %s",
-                        len(counts), min(counts), max(counts), design_change_report["base_deck"])
-        elif args.design_change_nodes:
-            # Geometry only, from every deck (held-out designs included, as their
-            # change nodes come from their near-clones); no history is read.
-            from design_change_nodes import find_design_changes
-            design_changes, design_change_report = find_design_changes(
-                Path(config.inp_dir).parent, range(config.num_samples // config.samples_per_design),
-                config.samples_per_design, mesh_nodes=config.mesh_nodes,
-            )
-            for cluster in design_change_report["clusters"]:
-                logger.info("Design-change nodes: cluster %s | base %s | %s nodes, %s in the mesh",
-                            cluster["designs"], cluster["base"], cluster["change_nodes"],
-                            cluster["change_nodes_in_mesh"])
+        # Every edited design's moved nodes, listed exactly by the generator.
+        manifest = load_manifest(config.impact_coords_path)
+        design_changes, design_change_report = load_design_changes(
+            config.impact_coords_path, config.inp_dir,
+            sorted(manifest.loc[manifest["design"] != BASE_DESIGN, "design_id"].unique()),
+        )
+        counts = [len(change["rows"]) for change in design_changes.values()]
+        logger.info("Design-change nodes: %s edited designs | %s-%s moved nodes each | base %s",
+                    len(counts), min(counts), max(counts), design_change_report["base_deck"])
         preprocessor = DataPreprocessor(config)
         data = preprocessor.load_all_data()
         validate_data(data)
-        logger.info("Mesh nodes: %s | %s rows in run %s | network impactor_nodes=%s", config.mesh_nodes,
-                    len(data["mesh_geometries"][0]), data["run_numbers"][0], model.impactor_nodes)
-        if len(data["run_numbers"]) != config.num_samples:
-            logger.warning("Loaded %s of %s runs; see preprocessing warnings for missing files.", len(data["run_numbers"]), config.num_samples)
-        if args.hic_range_threshold_percent is not None:
-            from hic_location_filter import analyze, filter_data
-            if set(data["run_numbers"]) != set(range(1, 1705)):
-                raise ValueError("HIC location filtering requires all 1704 runs to load successfully")
-            if source_dir is not None:
-                report = args.resume_config["location_filter"]
-                shutil.copy2(source_dir / "hic_location_variation.csv", output_dir / "hic_location_variation.csv")
-            else:
-                table, report = analyze(config.acceleration_dir, args.hic_range_threshold_percent)
-                table.to_csv(output_dir / "hic_location_variation.csv", index=False)
-            args.location_filter_report = report
-            write_json(output_dir / "hic_location_filter.json", report)
-            data = filter_data(data, report["selected_locations"])
-            logger.info("HIC range >= %s%% across all 12 designs: %s/142 locations; %s retained runs",
-                        report["threshold_percent"], len(report["selected_locations"]), len(data["run_numbers"]))
-        if args.location_holdout is not None:
-            from location_holdout import apply_split, describe
-            report = args.location_holdout_report
-            data = apply_split(data, report, args.test_designs, config.samples_per_design)
-            logger.info("Location split (%s); %s retained runs", describe(report), len(data["run_numbers"]))
-        splits = resolve_splits(data, config, args.test_designs, args.val_designs)
+        logger.info("Mesh: inner panel, %s nodes | %s runs loaded", len(data["mesh_geometries"][0]),
+                    len(data["run_numbers"]))
+        splits = resolve_splits(data, args.test_designs, args.val_designs)
         if source_dir is not None and splits != args.resume_splits:
             raise ValueError("Loaded train/validation/test runs differ from the saved resume split")
-        if local_edits:
-            from local_edits_data import design_name, sample_design, sample_location
-            split_of = {run: name for name, group in splits.items() for run in group["run_numbers"]}
-            pd.DataFrame({
-                "sample": data["run_numbers"], "source_run": data["source_runs"],
-                "design": [design_name(sample_design(s)) for s in data["run_numbers"]],
-                "location": [sample_location(s) for s in data["run_numbers"]],
-                "split": [split_of[s] for s in data["run_numbers"]],
-            }).to_csv(output_dir / "local_edit_samples.csv", index=False)
-            logger.info("Local edits: test %s (%s runs) | validation %s (%s runs) | training %s designs (%s runs) "
-                        "| design 6 not trained on", [design_name(d) for d in splits["test"]["design_ids"]],
-                        len(splits["test"]["run_numbers"]),
-                        [design_name(d) for d in splits["validation"]["design_ids"]],
-                        len(splits["validation"]["run_numbers"]), len(splits["train"]["design_ids"]),
-                        len(splits["train"]["run_numbers"]))
-        loaders = create_data_loaders(
-            data, preprocessor, config,
-            test_design_ids=splits["test"]["design_ids"],
-            val_design_id=splits["validation"]["design_ids"],
-        )
-        train_loader, val_loader, test_loader, test_dataset = loaders
+        split_of = {run: name for name, group in splits.items() for run in group["run_numbers"]}
+        pd.DataFrame({
+            "sample": data["run_numbers"], "source_run": data["source_runs"],
+            "design": [design_name(sample_design(s)) for s in data["run_numbers"]],
+            "location": [sample_location(s) for s in data["run_numbers"]],
+            "split": [split_of[s] for s in data["run_numbers"]],
+        }).to_csv(output_dir / "local_edit_samples.csv", index=False)
+        logger.info("Local edits: test %s (%s runs) | validation %s (%s runs) | training %s designs (%s runs) "
+                    "| design 6 not trained on", [design_name(d) for d in splits["test"]["design_ids"]],
+                    len(splits["test"]["run_numbers"]),
+                    [design_name(d) for d in splits["validation"]["design_ids"]],
+                    len(splits["validation"]["run_numbers"]), len(splits["train"]["design_ids"]),
+                    len(splits["train"]["run_numbers"]))
+        train_loader, val_loader, test_loader, test_dataset = create_data_loaders(data, preprocessor, config, splits)
         train_dataset = train_loader.dataset
         if source_dir is not None:
             preprocessor.load_scalers(str(source_dir / "scalers.joblib"))
@@ -831,72 +587,59 @@ def main(argv=None):
             preprocessor.indentor_scaler.mean_, preprocessor.indentor_scaler.scale_,
         )
         model.set_time_scaler(preprocessor.time_scaler.mean_[0], preprocessor.time_scaler.scale_[0])
-        if args.design_change_nodes:
-            from mesh_design_change import TABLE_FILE, DesignChangeTable, register_design_changes
-            design_change_report["registration"] = register_design_changes(
-                model, design_changes, data["mesh_geometries"],
-                [run_to_design_id(run, config.samples_per_design) for run in data["run_numbers"]],
-                preprocessor.transform_mesh,
-            )
-            if source_dir is not None and not model.design_changes.same_as(DesignChangeTable.load(source_dir / TABLE_FILE)):
-                raise ValueError("The design-change table differs from the resume run's; the decks or scalers changed")
-            if model.design_change_features == "edit":
-                from mesh_design_change import change_displacement_rms
-                scale = change_displacement_rms(design_changes, splits["train"]["design_ids"])
-                model.set_change_displacement_scale(scale)
-                design_change_report["registration"]["edit_displacement_scale_mm"] = scale
-                logger.info("Edit tokens: reference position + displacement / %.3f mm (RMS displacement length "
-                            "of the training designs' moved nodes)", scale)
-            model.design_changes.save(output_dir / TABLE_FILE)
-            write_json(output_dir / "design_change_nodes.json", design_change_report)
-            logger.info("Design-change table: %s", design_change_report["registration"])
-        reference_report = None
-        if model.reference_response:
-            reference_report = attach_reference_responses(model, preprocessor, train_dataset, output_dir,
-                                                          source_dir, logger)
-        first_times =np.asarray(train_dataset.time_arrays[0], dtype=np.float32)
+        design_change_report["registration"] = register_design_changes(
+            model, design_changes, data["mesh_geometries"],
+            [sample_design(run) for run in data["run_numbers"]], preprocessor.transform_mesh,
+        )
+        if source_dir is not None and not model.design_changes.same_as(DesignChangeTable.load(source_dir / TABLE_FILE)):
+            raise ValueError("The design-change table differs from the resume run's; the decks or scalers changed")
+        if model.design_change_features == "edit":
+            scale = change_displacement_rms(design_changes, splits["train"]["design_ids"])
+            model.set_change_displacement_scale(scale)
+            design_change_report["registration"]["edit_displacement_scale_mm"] = scale
+            logger.info("Edit tokens: reference position + displacement / %.3f mm (RMS displacement length "
+                        "of the training designs' moved nodes)", scale)
+        model.design_changes.save(output_dir / TABLE_FILE)
+        write_json(output_dir / "design_change_nodes.json", design_change_report)
+        logger.info("Design-change table: %s", design_change_report["registration"])
+        first_times = np.asarray(train_dataset.time_arrays[0], dtype=np.float32)
         if source_dir is not None and not np.array_equal(
                 first_times, np.load(source_dir / "prediction_times.npy", allow_pickle=False)):
             raise ValueError("Loaded prediction time grid differs from the resume run")
         matching_grid = all(np.array_equal(first_times, times) for times in data["time_arrays"])
+        nyquist = min((.5 / float(np.diff(times).max()) for times in data["time_arrays"] if len(times) > 1),
+                      default=None)
+        frequencies = model.time_frequencies_hz.tolist()
         prediction_grid = {
             "file": "prediction_times.npy",
             "reference_run_number": int(train_dataset.run_numbers[0]),
             "num_time_points": len(first_times),
             "same_grid_for_all_loaded_runs": matching_grid,
             "already_subsampled": True,
-            "time_units": "source Time column (seconds for the supplied datasets)",
-            "time_encoding": model.time_encoding,
+            "time_units": "source Time column (seconds)",
             "time_feature_count": model.time_feature_count,
-        }
-        if model.time_encoding == "fourier":
-            nyquist = min((.5 / float(np.diff(times).max()) for times in data["time_arrays"]
-                           if len(times) > 1), default=None)
-            frequencies = model.time_frequencies_hz.tolist()
-            prediction_grid["fourier"] = {
+            "fourier": {
                 "frequencies_hz": frequencies,
                 "feature_order": "sin(f0), cos(f0), sin(f1), cos(f1), ...",
                 "phase_definition": "2*pi*frequency_hz*(normalized_time*time_scale_seconds+time_mean_seconds)",
                 "time_mean_seconds": float(model.time_mean),
                 "time_scale_seconds": float(model.time_scale),
                 "minimum_sampled_nyquist_hz": nyquist,
-            }
-            logger.info("Fourier time encoding: %s Hz | %s features | minimum sampled Nyquist: %s Hz",
-                        frequencies, model.time_feature_count, nyquist)
-            if nyquist is not None and frequencies[-1] >= nyquist:
-                logger.warning("Fourier maximum frequency %s Hz reaches/exceeds sampled Nyquist %s Hz; "
-                               "use a lower --fourier-max-frequency-hz for this grid", frequencies[-1], nyquist)
+            },
+        }
+        logger.info("Fourier time encoding: %s Hz | %s features | minimum sampled Nyquist: %s Hz",
+                    frequencies, model.time_feature_count, nyquist)
+        if nyquist is not None and frequencies[-1] >= nyquist:
+            logger.warning("Fourier maximum frequency %s Hz reaches/exceeds sampled Nyquist %s Hz; "
+                           "use a lower --fourier-max-frequency-hz for this grid", frequencies[-1], nyquist)
         if not matching_grid:
             logger.warning("Loaded runs have different sampled time grids. Default inference uses training run %s; pass sampled_time_points for another already-subsampled grid.", train_dataset.run_numbers[0])
         saved_config = resolved_config(config, args, model_kwargs, prediction_grid)
-        if args.design_change_nodes:
-            saved_config["design_change"] = {key: design_change_report[key]
-                                             for key in ("rule", "static_channels", "clusters", "registration")}
-            saved_config["design_change"]["file"] = "design_change_nodes.json"
-            if model.design_change_features == "edit":
-                saved_config["design_change"]["edit_displacement_scale_mm"] = float(model.change_displacement_scale)
-        if reference_report is not None:
-            saved_config["reference_response"] = reference_report
+        saved_config["design_change"] = {key: design_change_report[key]
+                                         for key in ("rule", "static_channels", "registration")}
+        saved_config["design_change"]["file"] = "design_change_nodes.json"
+        if model.design_change_features == "edit":
+            saved_config["design_change"]["edit_displacement_scale_mm"] = float(model.change_displacement_scale)
         if source_dir is not None:
             saved_config["training"]["resumed_after_epoch"] = completed
         write_json(output_dir / "config.json", saved_config)
@@ -914,8 +657,7 @@ def main(argv=None):
             run.summary["best_val_loss"] = trainer.best_val_loss
             del restored
         if model.neighborhood_blocks:
-            from mesh_neighborhood import default_neighbor_cache_directory, prepare_model_neighbor_graphs
-            directory = args.neighbor_cache_dir or default_neighbor_cache_directory(config.data_format, config.inp_dir)
+            directory = args.neighbor_cache_dir or default_neighbor_cache_directory(config.inp_dir)
             saved_config["neighbor_graph_cache"] = prepare_model_neighbor_graphs(
                 model, preprocessor, data["mesh_geometries"], directory,
                 progress=lambda count, cache: logger.info(
@@ -927,12 +669,11 @@ def main(argv=None):
             run.config.update({"neighbor_graph_cache": saved_config["neighbor_graph_cache"]}, allow_val_change=True)
         history = trainer.train()
         write_json(output_dir / "training_history.json", history)
-        history_columns = {
+        pd.DataFrame({
             "epoch": np.arange(1, len(history["train_losses"]) + 1),
             "train_mse_normalized": history["train_losses"],
             "validation_mse_normalized": history["val_losses"],
-        }
-        pd.DataFrame(history_columns).to_csv(output_dir / "training_history.csv", index=False)
+        }).to_csv(output_dir / "training_history.csv", index=False)
         history_plot = export_training_history_plot(history, output_dir)
         logger.info("Saved training history plot: %s", history_plot)
         run.summary["best_epoch"] = int(np.argmin(history["val_losses"])) + 1
@@ -941,31 +682,15 @@ def main(argv=None):
         checkpoint_path = output_dir / CHECKPOINT_NAME
         if not checkpoint_path.exists():
             raise RuntimeError("Training produced no finite best validation checkpoint; inspect losses and input data")
-        from torch.utils.data import DataLoader
-        from evaluate_design_difference_r2 import (
-            design_difference_report, difference_log_values, write_design_difference_report,
-        )
-        from mesh_change_metrics import time_window_metrics
         evaluator = Evaluator(model, config, preprocessor)
         # The training loader shuffles; export train histories in dataset order.
         train_eval_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=False,
                                        collate_fn=train_loader.collate_fn)
-        if local_edits:
-            # Design 6 enters only here, as the reference the edit effects are measured from.
-            from local_edits_data import base_reference_curves
-            from local_edit_metrics import local_edit_log_values, local_edit_report, write_local_edit_report
-            base_curves, base_times = base_reference_curves(preprocessor)
+        # Design 6 enters only here, as the reference the edit effects are measured from.
+        base_curves, base_times = base_reference_curves(preprocessor)
 
         def evaluate_checkpoint(path, directory, prefix=""):
-            """Test metrics, train/test histories, design-difference R2 and time windows of one checkpoint.
-
-            The difference R2 is near-clone pairs on the 1704 set and the edit
-            effect against design 6 on the local-edit set (local_edit_metrics.json,
-            with train, validation and test). A teacher-forcing model is scored as
-            it is used, rolling out from its own predictions. Its test set is
-            scored again fed the true earlier chunks, into
-            ``directory/teacher_forced``: the best case for rollout.
-            """
+            """Test metrics, train/validation/test histories, edit-effect report and time windows of one checkpoint."""
             checkpoint = torch.load(path, map_location=config.device, weights_only=True)
             model.load_state_dict(checkpoint["model_state_dict"], strict=True)
             metrics, predictions, targets = evaluator.evaluate(test_loader)
@@ -974,110 +699,60 @@ def main(argv=None):
             _, train_predictions, train_targets = evaluator.evaluate(train_eval_loader)
             export_predictions(directory / "train_acceleration_histories.csv", train_dataset,
                                train_predictions, train_targets)
-            values, forced = {}, None
-            if local_edits:
-                val_dataset = val_loader.dataset
-                _, val_predictions, val_targets = evaluator.evaluate(val_loader)
-                export_predictions(directory / "validation_acceleration_histories.csv", val_dataset,
-                                   val_predictions, val_targets)
-                difference, local_runs, local_curves = local_edit_report({
-                    "train": (train_dataset, train_predictions, train_targets),
-                    "validation": (val_dataset, val_predictions, val_targets),
-                    "test": (test_dataset, predictions, targets),
-                }, base_curves, base_times, config.impact_coords_path)
-                figures = write_local_edit_report(directory, difference, local_runs, local_curves, base_times)
-                values.update(local_edit_log_values(difference))
-                if args.wandb_mode != "disabled":
-                    run.log({f"{prefix}local_edits/{Path(figure).stem}": wandb.Image(str(figure))
-                             for figure in figures})
-                for split in ("train", "validation", "test"):
-                    entry = difference["splits"][split]
-                    sibling = entry["baselines"]["sibling_copy"]
-                    logger.info("%s%s edit-effect difference R2 %s (windows 0-5/5-12/12+ ms %s) | sibling copy %s vs "
-                                "model %s on its %s runs | location mean %s | HIC change MAE %s pct points "
-                                "(copy design 6 %s)", prefix, split, entry["difference_r2"],
-                                entry["windows_difference_r2"], sibling["difference_r2"],
-                                sibling["model_r2_same_runs"], sibling["runs"],
-                                entry["baselines"]["location_mean"]["difference_r2"],
-                                entry["hic15_sampled"]["change_mae_pct_points"]["model"],
-                                entry["hic15_sampled"]["change_mae_pct_points"]["copy_d6"])
-            else:
-                difference = design_difference_report(config.data_format, config.samples_per_design, {
-                    "train": (train_dataset, train_predictions, train_targets),
-                    "test": (test_dataset, predictions, targets),
-                })
-                write_design_difference_report(directory, difference)
-            if model.teacher_forcing_chunks:
-                forced_dir = directory / "teacher_forced"
-                forced_dir.mkdir(exist_ok=True)
-                forced_metrics, forced, _ = evaluator.evaluate(test_loader, teacher_forced=True)
-                write_json(forced_dir / "metrics.json", forced_metrics)
-                export_predictions(forced_dir / "test_acceleration_histories.csv", test_dataset, forced, targets)
-                values.update({f"teacher_forced/test/{key}": value for key, value in forced_metrics.items()
-                               if np.isfinite(value)})
-                logger.info("%sTest metrics fed the true earlier chunks (acceleration in g): %s", prefix, forced_metrics)
+            val_dataset = val_loader.dataset
+            _, val_predictions, val_targets = evaluator.evaluate(val_loader)
+            export_predictions(directory / "validation_acceleration_histories.csv", val_dataset,
+                               val_predictions, val_targets)
+            difference, local_runs, local_curves = local_edit_report({
+                "train": (train_dataset, train_predictions, train_targets),
+                "validation": (val_dataset, val_predictions, val_targets),
+                "test": (test_dataset, predictions, targets),
+            }, base_curves, base_times, config.impact_coords_path)
+            figures = write_local_edit_report(directory, difference, local_runs, local_curves, base_times)
+            values = local_edit_log_values(difference)
+            if args.wandb_mode != "disabled":
+                run.log({f"{prefix}local_edits/{Path(figure).stem}": wandb.Image(str(figure)) for figure in figures})
+            for split in ("train", "validation", "test"):
+                entry = difference["splits"][split]
+                sibling = entry["baselines"]["sibling_copy"]
+                logger.info("%s%s edit-effect difference R2 %s (windows 0-5/5-12/12+ ms %s) | sibling copy %s vs "
+                            "model %s on its %s runs | location mean %s | HIC change MAE %s pct points "
+                            "(copy design 6 %s)", prefix, split, entry["difference_r2"],
+                            entry["windows_difference_r2"], sibling["difference_r2"],
+                            sibling["model_r2_same_runs"], sibling["runs"],
+                            entry["baselines"]["location_mean"]["difference_r2"],
+                            entry["hic15_sampled"]["change_mae_pct_points"]["model"],
+                            entry["hic15_sampled"]["change_mae_pct_points"]["copy_d6"])
             if matching_grid:
                 windows = time_window_metrics((train_dataset, train_predictions, train_targets),
-                                              (test_dataset, predictions, targets), config.samples_per_design,
-                                              model.teacher_forcing_chunks or TIME_WINDOWS, teacher_forced=forced)
+                                              (test_dataset, predictions, targets), TIME_WINDOWS)
                 write_json(directory / "time_windows.json", windows)
-                names = ("model_rmse_g", "teacher_forced_rmse_g", "location_mean_rmse_g")
+                names = ("model_rmse_g", "location_mean_rmse_g")
                 for name in names:
                     for index, value in enumerate(windows[name] or ()):
                         values[f"time_windows/{name}/window_{index + 1}"] = value
-                logger.info("%sTest RMSE (g) per time window %s ms: model %s | fed the true earlier chunks %s | "
-                            "location mean of the training designs %s", prefix, windows["window_ms"],
+                logger.info("%sTest RMSE (g) per time window %s ms: model %s | location mean of the training "
+                            "designs %s", prefix, windows["window_ms"],
                             *(np.round(windows[name], 2).tolist() if windows[name] else None for name in names))
             values = {prefix + key: value for key, value in values.items()}
             run.summary.update(values)
             run.log(values)
-            return metrics, predictions, targets, difference
+            return metrics, difference
 
-        metrics, predictions, targets, difference = evaluate_checkpoint(checkpoint_path, output_dir)
-        if not local_edits:
-            # Matched-location comparisons across test designs and near-clone pairs (1704 set).
-            from mesh_change_metrics import design_sensitivity_metrics
-            from evaluate_design_sensitivity import write_sensitivity_report, sensitivity_log_values
-            sensitivity = design_sensitivity_metrics(test_dataset, predictions, targets, config.samples_per_design)
-            write_sensitivity_report(output_dir, sensitivity)
-            sensitivity_values = sensitivity_log_values(sensitivity)
-            run.summary.update(sensitivity_values)
-            run.log(sensitivity_values)
-            logger.info("Matched-location design sensitivity: skill=%s, amplitude ratio=%s, alignment=%s; "
-                        "HIC15 skill=%s", sensitivity["design_difference_skill"],
-                        sensitivity["difference_amplitude_ratio"], sensitivity["difference_alignment_cosine"],
-                        sensitivity["hic15"]["design_difference_skill"])
-            difference_values = difference_log_values(difference)
-            run.summary.update(difference_values)
-            run.log(difference_values)
-            logger.info("Near-clone design-difference R2 (acceleration): train=%s, test=%s",
-                        difference["train"]["r2"], difference["test"]["r2"])
-            logger.info("Test designs vs their training siblings: difference R2=%s | test RMSE model=%s g, "
-                        "sibling mean=%s g", difference["test_vs_train"]["r2"],
-                        difference["test_vs_train"]["model_rmse_g"],
-                        difference["test_vs_train"]["sibling_mean_rmse_g"])
+        metrics, _ = evaluate_checkpoint(checkpoint_path, output_dir)
         wandb.log({f"test/{key}": value for key, value in metrics.items() if np.isfinite(value)})
         logger.info("Best-checkpoint test metrics (acceleration in g): %s", metrics)
         # A long run's best validation epoch can come early, so the final epoch's
         # network is scored too, in its own folder (same file names).
         last_dir = output_dir / "last_checkpoint"
         last_dir.mkdir(exist_ok=True)
-        last_metrics, _, _, last_difference = evaluate_checkpoint(output_dir / LAST_CHECKPOINT_NAME, last_dir,
-                                                                  prefix="last_checkpoint/")
+        last_metrics, last_difference = evaluate_checkpoint(output_dir / LAST_CHECKPOINT_NAME, last_dir,
+                                                            prefix="last_checkpoint/")
         last_values = {f"last_checkpoint/test/{key}": value for key, value in last_metrics.items()
                        if np.isfinite(value)}
-        if local_edits:
-            logger.info("Last-checkpoint (epoch %s) test metrics (acceleration in g): %s | edit-effect difference "
-                        "R2: train=%s, validation=%s, test=%s", len(history["train_losses"]), last_metrics,
-                        *(last_difference["splits"][split]["difference_r2"]
-                          for split in ("train", "validation", "test")))
-        else:
-            last_values.update({f"last_checkpoint/{key}": value
-                                for key, value in difference_log_values(last_difference).items()})
-            logger.info("Last-checkpoint (epoch %s) test metrics (acceleration in g): %s | design-difference R2: "
-                        "train=%s, test=%s, test vs training siblings=%s", len(history["train_losses"]),
-                        last_metrics, last_difference["train"]["r2"], last_difference["test"]["r2"],
-                        last_difference["test_vs_train"]["r2"])
+        logger.info("Last-checkpoint (epoch %s) test metrics (acceleration in g): %s | edit-effect difference "
+                    "R2: train=%s, validation=%s, test=%s", len(history["train_losses"]), last_metrics,
+                    *(last_difference["splits"][split]["difference_r2"] for split in ("train", "validation", "test")))
         run.summary.update(last_values)
         run.log(last_values)
         logger.info("Finished. Run artifacts: %s", output_dir)

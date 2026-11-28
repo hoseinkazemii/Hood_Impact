@@ -3,8 +3,8 @@ apply_node_edits.py
 ===================
 Patch edited node coordinates into an ORIGINAL flat HoodImpact deck.
 
-Input is a CSV "label,x,y,z" (for example the full-part export written by
-cae_inner_panel_dip.py inside Abaqus/CAE). Only the node lines whose
+Input is a CSV "label,x,y,z" (for example a full-part node export written
+inside Abaqus/CAE). Only the node lines whose
 coordinates moved by more than --tol mm are rewritten; every other byte of the
 deck stays identical, so node and element IDs, fasteners, couplings, contact
 pairs, BCs and output requests are exactly those of the delivered deck.
@@ -36,8 +36,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-from inp_geom import Deck, OuterSurface, HOOD_OUTER_ELSET  # noqa: E402
-from generate_impact_decks import format_node_line  # noqa: E402
+from inp_geom import Deck, OuterSurface, HOOD_OUTER_ELSET, format_node_line  # noqa: E402
 
 SHELL_ELSETS = ["Hood_Outer-1-2", "Hood_Inner-1-2", "Hinges-1-2"]
 

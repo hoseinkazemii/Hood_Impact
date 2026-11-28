@@ -1,17 +1,16 @@
 """
 batch_generate.py
 =================
-Production driver for the 600-sample dataset: solve the generated
-HoodImpact_<run>.inp decks with Abaqus/Explicit, extract the headform
-acceleration, SAE1000-filter it, compute HIC15, and keep only the small
-result files. There is no reference comparison for the new runs.
+Production driver: solve the generated HoodImpact_<run>.inp decks with
+Abaqus/Explicit, extract the headform acceleration, SAE1000-filter it, compute
+HIC15, and keep only the small result files. There is no reference comparison
+for the new runs.
 
 Parallelisation: --lanes concurrent solves of --cpus cores each. On Delta the
 constraint is the FlexNet license pool (65 "abaqus" tokens). A solve checks out
 floor(5 * cpus**0.422) tokens (1 -> 5, 8 -> 12, 16 -> 16), so single-core lanes
 cap the job at 13 cores, while multi-core lanes use far more cores for the same
-tokens: faster in wall time, at some cost in core-hours. Measure before choosing
-(cpus_scaling_test.py, delta/hood_cpus_test.sbatch). Defaults (12 x cpus=1)
+tokens: faster in wall time, at some cost in core-hours. Defaults (12 x cpus=1)
 are the original single-core layout; the local-edit campaign
 (delta/hood_local_edits.sbatch) runs 5 x cpus=8 with --mp-mode threads.
 
@@ -41,12 +40,12 @@ Outputs (dataset layout mirrors the delivered 60-sample set):
     <work-dir>/run_<n>/HoodImpact_<n>_raw_acc.csv       (full-precision raw)
     <work-dir>/generation_metrics.csv                    (per-run status/HIC)
 
-Usage on Delta (inside the Slurm job; see delta/hood600.sbatch):
+Usage on Delta (inside the Slurm job; see delta/hood_local_edits.sbatch):
     python -u abaqus_scripts/batch_generate.py \
-        --inp-dir  <...>/HoodImpact_600_EuroNCAP/inp_files \
+        --inp-dir  <...>/HoodImpact_LocalEdits/inp_files \
         --work-dir <...>/work --scratch-dir <...>/abaqus_scratch \
-        --out-dir <...>/HoodImpact_600_EuroNCAP \
-        --runs 1-600 --lanes 12
+        --out-dir <...>/HoodImpact_LocalEdits \
+        --runs 1-1582 --lanes 5 --cpus 8 --mp-mode threads
 """
 import os
 import re

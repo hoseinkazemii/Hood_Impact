@@ -1,11 +1,10 @@
-"""Physical Fourier phases, gradients, and historical checkpoint compatibility."""
+"""Physical Fourier phases of the time queries, their gradients and strict reload."""
 import math
 
-import numpy as np
 import pytest
 import torch
 
-from mesh_impact_history import MeshImpactHistoryNet, saved_model_kwargs
+from mesh_impact_history import MeshImpactHistoryNet
 
 
 def small_model(**options):
@@ -52,31 +51,7 @@ def test_feature_derivative_includes_the_physical_time_scale():
     torch.testing.assert_close(derivative, torch.tensor([-2*math.pi*40*.007]))
 
 
-@pytest.mark.parametrize("impact_conditioning", ["film", "legacy_additive"])
-def test_historical_configs_without_time_encoding_replay_the_five_feature_model(impact_conditioning):
-    kwargs = dict(width=16, num_heads=2, num_latents=4, latent_layers=1,
-                  temporal_layers=1, dropout=0, impact_conditioning=impact_conditioning)
-    # Pre-Fourier networks also predate the location-shortcut switches.
-    old = MeshImpactHistoryNet(time_encoding="legacy_five", pooling_query_residual=True,
-                               pool_impactor_nodes=True, **kwargs).eval()
-    restored = MeshImpactHistoryNet(**saved_model_kwargs(kwargs)).eval()
-    restored.load_state_dict(old.state_dict(), strict=True)
-    assert restored.time_encoding == "legacy_five"
-    assert restored.time_embedding[0].in_features == 5
-    assert not any(key.startswith(("time_mean", "time_scale", "time_frequencies")) for key in restored.state_dict())
-    t = torch.tensor([-1., -.5, 0., .5, 1.])
-    expected = torch.stack((t, t.square(), t.pow(3), t.tanh(), torch.exp(-t.square())), -1)
-    torch.testing.assert_close(restored.time_features(t), expected, atol=0, rtol=0)
-    mesh, impact = torch.randn(8, 3), torch.randn(1, 2)
-    membership = torch.zeros(8, dtype=torch.long)
-    time_batch = torch.zeros(5, dtype=torch.long)
-    with torch.no_grad():
-        torch.testing.assert_close(old(mesh, membership, impact, t, time_batch),
-                                   restored(mesh, membership, impact, t, time_batch), atol=0, rtol=0)
-
-
 @pytest.mark.parametrize("options", [
-    {"time_encoding":"unknown"}, {"time_encoding":None}, {"time_encoding":["fourier"]},
     {"fourier_num_frequencies":0}, {"fourier_num_frequencies":True},
     {"fourier_min_frequency_hz":0}, {"fourier_min_frequency_hz":float("nan")},
     {"fourier_max_frequency_hz":float("inf")}, {"fourier_max_frequency_hz":10},

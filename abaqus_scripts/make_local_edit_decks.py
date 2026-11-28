@@ -42,8 +42,61 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import local_edit_doe as doe  # noqa: E402
-from inp_geom import Deck, HEADFORM_RADIUS, HOOD_OUTER_ELSET  # noqa: E402
-from make_solver_factorial_decks import fixed_increment_lines, format_node_line, write_lines  # noqa: E402
+from inp_geom import Deck, HEADFORM_RADIUS, HOOD_OUTER_ELSET, format_node_line  # noqa: E402
+
+
+def dynamic_card_index(lines):
+    """Index of the single *DYNAMIC, EXPLICIT card and of its data line."""
+    cards = [i for i, line in enumerate(lines)
+             if line.lstrip().upper().startswith("*DYNAMIC")]
+    if len(cards) != 1:
+        raise ValueError("expected exactly one *DYNAMIC card, found %d" % len(cards))
+    card = cards[0]
+    if "EXPLICIT" not in lines[card].upper():
+        raise ValueError("the *DYNAMIC card is not an explicit step: %r" % lines[card])
+    data = card + 1
+    while data < len(lines) and lines[data].lstrip().startswith("**"):
+        data += 1
+    if data >= len(lines) or lines[data].lstrip().startswith("*"):
+        raise ValueError("the *DYNAMIC card has no data line")
+    return card, data
+
+
+def fixed_increment_lines(lines, time_increment):
+    """Replacement {index: line} for a fixed user-controlled increment.
+
+    Automatic incrementation reads ``, period``; DIRECT USER CONTROL reads
+    ``increment, period`` and cannot be combined with SCALE FACTOR, so the
+    whole card is rewritten. The step period is kept from the original.
+    """
+    if not np.isfinite(time_increment) or time_increment <= 0:
+        raise ValueError("time increment must be finite and positive")
+    card, data = dynamic_card_index(lines)
+    fields = [field.strip() for field in lines[data].rstrip("\r\n").split(",")]
+    if len(fields) < 2 or not fields[1]:
+        raise ValueError("cannot read the step period from %r" % lines[data])
+    period = float(fields[1])
+    if time_increment >= period:
+        raise ValueError("time increment must be smaller than the step period")
+    terminator = lines[card][len(lines[card].rstrip("\r\n")):]
+    return {
+        card: "*DYNAMIC, EXPLICIT, DIRECT USER CONTROL" + terminator,
+        data: "%r, %r%s" % (float(time_increment), period,
+                            lines[data][len(lines[data].rstrip("\r\n")):]),
+    }
+
+
+def write_lines(lines, replaced, out_path):
+    """Write the deck atomically so an interrupted run cannot look complete."""
+    temporary = out_path + ".tmp"
+    try:
+        with open(temporary, "w", newline="") as handle:
+            for index, line in enumerate(lines):
+                handle.write(replaced.get(index, line))
+        os.replace(temporary, out_path)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
 
 
 def parse_runs(spec, n):

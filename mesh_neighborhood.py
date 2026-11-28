@@ -1,4 +1,4 @@
-"""Sparse geometric point attention before mesh-to-latent pooling."""
+"""Sparse kNN point attention before mesh-to-latent pooling, and the persistent kNN graph cache."""
 
 import hashlib
 import math
@@ -14,14 +14,11 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 
-def default_neighbor_cache_directory(data_format, inp_dir=None):
-    datasets = {"euroncap1704": "HoodImpact_1704_EuroNCAP", "industrylike": "HoodImpact_60_IndustryLike",
-                "localedits": "HoodImpact_LocalEdits"}
-    if inp_dir is not None and data_format in datasets:
+def default_neighbor_cache_directory(inp_dir=None):
+    """neighbor_graphs beside the dataset's inp_files (Data/HoodImpact_LocalEdits by default)."""
+    if inp_dir is not None:
         return Path(inp_dir).parent / "neighbor_graphs"
-    if data_format in datasets:
-        return Path("Data") / datasets[data_format] / "neighbor_graphs"
-    return Path("runs") / "mesh_neighbor_graphs"
+    return Path("Data") / "HoodImpact_LocalEdits" / "neighbor_graphs"
 
 
 def geometric_neighbors(coordinates, count):
@@ -173,13 +170,12 @@ def prepare_model_neighbor_graphs(model, preprocessor, mesh_geometries, director
         return None
     # Keep every training/validation/test hood resident: the local-edit set has
     # 72, and an evicted graph is reloaded from disk on its next batch.
-    distinct = {NeighborGraphCache.geometry_digest(NeighborGraphCache.points(mesh[model.impactor_nodes:]))
-                for mesh in mesh_geometries}
+    distinct = {NeighborGraphCache.geometry_digest(NeighborGraphCache.points(mesh)) for mesh in mesh_geometries}
     model.neighbor_cache = NeighborGraphCache(capacity=max(16, len(distinct)), directory=directory)
     cache = model.neighbor_cache
     seen = set()
     for mesh in mesh_geometries:
-        raw = cache.points(mesh[model.impactor_nodes:])
+        raw = cache.points(mesh)
         digest = cache.geometry_digest(raw)
         if digest in seen:
             continue
@@ -192,8 +188,7 @@ def prepare_model_neighbor_graphs(model, preprocessor, mesh_geometries, director
     return {
         "directory": str(cache.directory.resolve()) if cache.directory is not None else None,
         "algorithm": cache.ALGORITHM, "requested_k": model.neighborhood_k,
-        "impactor_nodes_excluded": model.impactor_nodes,
-        "unique_structural_geometries": len(seen), "built": cache.builds,
+        "unique_geometries": len(seen), "built": cache.builds,
         "loaded_from_disk": cache.disk_hits, "files_written": cache.writes,
         "invalid_files_rebuilt": cache.invalid_files,
         "key_uses": "raw physical XYZ in input row order, dtype, shape, k, algorithm version",

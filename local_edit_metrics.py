@@ -130,7 +130,6 @@ def local_edit_report(splits, base_curves, base_times, manifest_path):
     train_sign = np.array([classes.loc[n, "sign"] for n in train_names])
 
     records, plot_curves = [], {}
-    pools = {}
     for split, (dataset, predictions, targets) in splits.items():
         truth, predicted = _curves(targets, dataset, steps), _curves(predictions, dataset, steps)
         for index, sample in enumerate(dataset.run_numbers):
@@ -333,3 +332,52 @@ def write_local_edit_report(directory, report, runs, plot_curves, times):
     for name, (split, rows) in plot_curves.items():
         figures.append(plot_design_effects(name, split, rows, times, directory / f"local_edit_effects_{name}.png"))
     return figures
+
+
+def time_window_metrics(train, test, num_windows):
+    """Test RMSE (g) in each of ``num_windows`` contiguous windows of the time grid.
+
+    ``train`` and ``test`` are (dataset, predictions, targets), predictions and
+    targets flat in dataset order. Windows hold ceil(T / num_windows) times
+    each. Besides the model, each window scores the location mean: the mean
+    true training curve at the test curve's impact location, which ignores the
+    geometry. Location-mean RMSE uses only test curves whose location is in
+    training.
+    """
+    (train_set, _, train_targets), (test_set, predictions, targets) = train, test
+    grids = [*train_set.time_arrays, *test_set.time_arrays]
+    if any(not np.array_equal(grids[0], grid) for grid in grids):
+        raise ValueError("Time windows need one time grid shared by all training and test runs")
+    steps = len(grids[0])
+    size = -(-steps // num_windows)
+    edges = list(range(0, steps, size)) + [steps]
+
+    def curves(values, dataset):
+        return np.asarray(values, dtype=np.float64).reshape(len(dataset.run_numbers), steps)
+
+    truth = curves(targets, test_set)
+    training = curves(train_targets, train_set)
+    train_locations = np.array([sample_location(run) for run in train_set.run_numbers])
+    test_locations = np.array([sample_location(run) for run in test_set.run_numbers])
+    means = {place: training[train_locations == place].mean(axis=0) for place in set(train_locations.tolist())}
+    covered = np.array([place in means for place in test_locations.tolist()])
+    location_mean = np.array([means.get(place, np.zeros(steps)) for place in test_locations.tolist()])
+
+    def rmse(prediction, rows=None):
+        if rows is not None and not rows.any():
+            return None
+        error = curves(prediction, test_set) - truth
+        error = error if rows is None else error[rows]
+        return [float(np.sqrt(np.square(error[:, a:b]).mean())) for a, b in zip(edges[:-1], edges[1:])]
+
+    times_ms = 1e3 * np.asarray(grids[0], dtype=np.float64)
+    return {
+        "num_windows": len(edges) - 1,
+        "window_ms": [[float(times_ms[a]), float(times_ms[b - 1])] for a, b in zip(edges[:-1], edges[1:])],
+        "window_points": [b - a for a, b in zip(edges[:-1], edges[1:])],
+        "model_rmse_g": rmse(predictions),
+        "location_mean_rmse_g": rmse(location_mean, covered),
+        "test_signal_std_g": [float(truth[:, a:b].std()) for a, b in zip(edges[:-1], edges[1:])],
+        "num_test_curves": len(truth),
+        "num_test_curves_with_location_mean": int(covered.sum()),
+    }
